@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.log
+*:Zone.Identifier
+node_modules/
+dist/
+.DS_Store
