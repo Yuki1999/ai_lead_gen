@@ -78,6 +78,43 @@ npm run dev -- --host 0.0.0.0
 
 打开 Vite 输出的本地地址，默认 API 地址是 `http://localhost:8000`。如需修改，设置 `VITE_API_BASE_URL`。页面里的 Agent 面板会通过后端 `POST /agent/chat/stream` 调用 sidecar，实时显示会话开始、工具事件、模型增量输出和完成状态，不直接暴露 sidecar token。
 
+## Docker Compose 部署
+
+推荐用 Docker Compose 部署，仓库已经包含前端、后端和 Agent sidecar 的容器编排。前端容器用 Nginx 托管静态文件，并把浏览器里的 `/api/*` 同源反代到后端；后端通过容器网络访问 `http://agent:8011`；SQLite 数据持久化在 `medbot-data` volume。
+
+首次部署：
+
+```bash
+cp .env.deploy.example .env
+cp agent/.env.example agent/.env
+# 编辑 agent/.env，配置 OPENAI_API_KEY 或 DEEPSEEK_API_KEY、PI_PROVIDER、PI_MODEL
+./scripts/deploy.sh
+```
+
+脚本会检查 Docker/Compose、自动创建缺失的 `.env` 和 `agent/.env`，然后执行：
+
+```bash
+docker compose up -d --build
+```
+
+部署脚本还会自动生成并同步 `AGENT_TOKEN` 到 `.env` 和 `agent/.env`。这是后端容器调用 Agent sidecar 的内部 Bearer token；如果手动编辑其中一个文件，要保持两个文件里的 `AGENT_TOKEN` 一致。
+
+默认访问地址：
+
+- Web：`http://localhost:5173`
+- Backend health：`http://localhost:8000/health`
+
+常用运维命令：
+
+```bash
+docker compose ps
+docker compose logs -f backend agent frontend
+docker compose restart agent
+docker compose down
+```
+
+如果部署到服务器并使用域名，把 `.env` 里的 `PUBLIC_ORIGIN` 改为真实访问地址。Agent 配置仍写入 `agent/.env`，该文件被 `.gitignore` 排除，不会上传密钥。
+
 ## 运行流程
 
 1. 在前端确认产品画像，填写目标国家/地区、搜索关键词和返回数量，点击“实时搜索并入库”。
