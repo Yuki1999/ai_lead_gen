@@ -55,6 +55,7 @@ def init_db() -> None:
                 sent_to TEXT NOT NULL,
                 region TEXT NOT NULL,
                 status TEXT NOT NULL,
+                message_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (lead_id) REFERENCES leads(id)
             );
@@ -68,11 +69,30 @@ def init_db() -> None:
                 summary TEXT NOT NULL,
                 next_action TEXT NOT NULL,
                 requires_human INTEGER NOT NULL,
+                message_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (lead_id) REFERENCES leads(id)
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
             """
         )
+        # Migration: add message_id column if upgrading from older schema
+        try:
+            connection.execute(
+                "ALTER TABLE outreach_events ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass  # column already exists
+        try:
+            connection.execute(
+                "ALTER TABLE reply_analyses ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass  # column already exists
 
 
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
@@ -164,14 +184,20 @@ def update_lead(
         return get_lead(lead_id, connection=connection)
 
 
-def insert_outreach_event(lead_id: int, email: RenderedEmail) -> dict[str, Any]:
+def insert_outreach_event(
+    lead_id: int,
+    email: RenderedEmail,
+    *,
+    status: str = "recorded",
+    message_id: str = "",
+) -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, message_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (lead_id, email.subject, email.body, email.sent_to, email.region, "recorded", _now()),
+            (lead_id, email.subject, email.body, email.sent_to, email.region, status, message_id, _now()),
         )
         connection.execute(
             "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
@@ -189,15 +215,16 @@ def insert_reply_analysis(
     lead_id: int | None,
     reply_text: str,
     analysis: ReplyAnalysis,
+    message_id: str = "",
 ) -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO reply_analyses (
                 lead_id, reply_text, intent, confidence, summary, next_action,
-                requires_human, created_at
+                requires_human, message_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 lead_id,
@@ -207,6 +234,7 @@ def insert_reply_analysis(
                 analysis.summary,
                 analysis.next_action,
                 int(analysis.requires_human),
+                message_id,
                 _now(),
             ),
         )
@@ -218,6 +246,27 @@ def insert_reply_analysis(
     result = _row_to_dict(row)
     result["requires_human"] = bool(result["requires_human"])
     return result
+
+
+def list_outreach_events(lead_id: int) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM outreach_events WHERE lead_id = ? ORDER BY id DESC",
+            (lead_id,),
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
+def list_reply_analyses(lead_id: int) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM reply_analyses WHERE lead_id = ? ORDER BY id DESC",
+            (lead_id,),
+        ).fetchall()
+    results = [_row_to_dict(row) for row in rows]
+    for r in results:
+        r["requires_human"] = bool(r["requires_human"])
+    return results
 
 
 def metrics() -> dict[str, int]:
@@ -241,6 +290,33 @@ def metrics() -> dict[str, int]:
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
 
+
+# ── Settings ───────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def get_all_settings() -> dict[str, str]:
+    with connect() as connection:
+        rows = connection.execute("SELECT key, value FROM settings").fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+# ── Helpers ────────────────────────────────────────────
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()

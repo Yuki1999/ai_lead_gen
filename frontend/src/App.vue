@@ -102,6 +102,8 @@ interface EmailEvent {
   sent_to: string;
   region: string;
   status: string;
+  created_at?: string;
+  message_id?: string;
 }
 
 interface SendResponse {
@@ -111,11 +113,14 @@ interface SendResponse {
 
 interface ReplyAnalysis {
   id: number;
+  lead_id?: number;
+  reply_text?: string;
   intent: string;
   confidence: number;
   summary: string;
   next_action: string;
   requires_human: boolean;
+  created_at?: string;
 }
 
 interface ProductProfile {
@@ -154,6 +159,16 @@ interface AgentChatResponse {
   message: string;
   session_id: string;
   events: AgentEvent[];
+}
+
+interface SettingsResponse {
+  sync_enabled: boolean;
+  sync_interval_minutes: number;
+  agent_provider: string;
+  agent_model: string;
+  has_agent_key: boolean;
+  agent_key_preview: string;
+  backend_base_url: string;
 }
 
 interface AgentConfigResponse {
@@ -225,7 +240,15 @@ const sourcePreviewLoading = ref(false);
 const sourcePreviewError = ref("");
 const sourcePreviewMode = ref<"page" | "text">("page");
 const loading = ref(false);
-const currentAction = ref<"dashboard" | "search" | "outreach" | "reply" | "qualify" | null>(null);
+const currentAction = ref<"dashboard" | "search" | "outreach" | "reply" | "qualify" | "sync" | null>(null);
+
+// Lead detail panel
+const detailLeadId = ref<number | null>(null);
+const detailStatus = ref("");
+const detailNotes = ref("");
+const detailOutreach = ref<EmailEvent[]>([]);
+const detailReplies = ref<ReplyAnalysis[]>([]);
+const detailLoading = ref(false);
 const notice = ref("");
 const error = ref("");
 const agentPrompt = ref(
@@ -247,7 +270,21 @@ const agentConfigLoading = ref(false);
 const agentConfigSaving = ref(false);
 const agentConfigError = ref("");
 const agentConfigNotice = ref("");
-const activePage = ref<"workspace" | "agent">("workspace");
+
+// Settings page
+const settings = ref<SettingsResponse>({
+  sync_enabled: false,
+  sync_interval_minutes: 0,
+  agent_provider: "deepseek",
+  agent_model: "deepseek-v4-pro",
+  has_agent_key: false,
+  agent_key_preview: "",
+  backend_base_url: "http://localhost:8000",
+});
+const settingsAgentKeyInput = ref("");
+const settingsLoading = ref(false);
+const settingsSaving = ref(false);
+const activePage = ref<"workspace" | "agent" | "settings">("workspace");
 const editingSessionId = ref("");
 const editingSessionTitle = ref("");
 const agentConfigExpanded = ref(false);
@@ -263,19 +300,27 @@ let agentProcessId = 0;
 let agentGenerationStarted = false;
 
 const selectedCount = computed(() => selectedLeadIds.value.length);
-const topbarContent = computed(() =>
-  activePage.value === "agent"
-    ? {
-        eyebrow: "Pi / pi-mono Agent",
-        title: "渠道拓展 Agent",
-        copy: "默认使用 overseas-distributor-prospecting skill，支持实时输出、联网搜索和线索入库。",
-      }
-    : {
-        eyebrow: "微创畅行机器人 · 海外业务",
-        title: "海外渠道拓展系统",
-        copy: "面向 SkyWalker TKA 的代理商发现、邮箱证据审阅、触达记录和回复处理。",
-      },
-);
+const topbarContent = computed(() => {
+  if (activePage.value === "agent") {
+    return {
+      eyebrow: "Pi / pi-mono Agent",
+      title: "渠道拓展 Agent",
+      copy: "默认使用 overseas-distributor-prospecting skill，支持实时输出、联网搜索和线索入库。",
+    };
+  }
+  if (activePage.value === "settings") {
+    return {
+      eyebrow: "系统配置",
+      title: "设置",
+      copy: "邮件回复自动同步、Agent 模型与 API 配置。",
+    };
+  }
+  return {
+    eyebrow: "微创畅行机器人 · 海外业务",
+    title: "海外渠道拓展系统",
+    copy: "面向 SkyWalker TKA 的代理商发现、邮箱证据审阅、触达记录和回复处理。",
+  };
+});
 const agentProcessDisplay = computed(() => splitAgentProcessHistory(agentProcessItems.value));
 const currentAgentProcessItem = computed(() => agentProcessDisplay.value.current);
 const historicalAgentProcessItems = computed(() => agentProcessDisplay.value.history);
@@ -459,6 +504,24 @@ async function createOutreachRecords(): Promise<void> {
   });
 }
 
+async function syncReplies(): Promise<void> {
+  await runAction("sync", async () => {
+    const payload = await request<{
+      total_inbox: number;
+      synced: number;
+      skipped: number;
+      items: Array<{ lead_id: number; company: string; intent: string; auto_reply: boolean }>;
+    }>("/replies/sync", { method: "POST" });
+    if (payload.synced > 0) {
+      const companies = [...new Set(payload.items.map((i) => i.company))].join("、");
+      notice.value = `同步了 ${payload.synced} 条回复（${companies}），跳过 ${payload.skipped} 条`;
+    } else {
+      notice.value = `未发现新回复（扫描 ${payload.total_inbox} 封邮件）`;
+    }
+    await loadDashboard();
+  });
+}
+
 async function analyzeCurrentReply(): Promise<void> {
   await runAction("reply", async () => {
     analysis.value = await request<ReplyAnalysis>("/replies/analyze", {
@@ -557,6 +620,63 @@ async function markQualified(leadId: number): Promise<void> {
     });
     notice.value = "已标记为 qualified";
     await loadDashboard();
+  });
+}
+
+const detailLead = computed(() =>
+  detailLeadId.value ? leads.value.find((l) => l.id === detailLeadId.value) ?? null : null
+);
+
+async function openLeadDetail(leadId: number): Promise<void> {
+  detailLeadId.value = leadId;
+  detailLoading.value = true;
+  const lead = leads.value.find((l) => l.id === leadId);
+  detailStatus.value = lead?.status ?? "";
+  detailNotes.value = lead?.notes ?? "";
+  try {
+    const history = await request<{
+      lead: Lead;
+      outreach_events: EmailEvent[];
+      reply_analyses: ReplyAnalysis[];
+    }>(`/leads/${leadId}/history`);
+    detailOutreach.value = history.outreach_events;
+    detailReplies.value = history.reply_analyses;
+  } catch {
+    detailOutreach.value = [];
+    detailReplies.value = [];
+  } finally {
+    detailLoading.value = false;
+  }
+}
+
+function closeLeadDetail(): void {
+  detailLeadId.value = null;
+  detailOutreach.value = [];
+  detailReplies.value = [];
+}
+
+function goToReply(): void {
+  const leadId = detailLeadId.value;
+  closeLeadDetail();
+  if (leadId !== null) {
+    replyLeadId.value = leadId;
+  }
+  showPage('workspace', 'reply-title');
+}
+
+async function saveLeadDetail(): Promise<void> {
+  if (detailLeadId.value === null) return;
+  await runAction("qualify", async () => {
+    await request<Lead>(`/leads/${detailLeadId.value!}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: detailStatus.value || undefined,
+        notes: detailNotes.value || undefined,
+      }),
+    });
+    await loadDashboard();
+    notice.value = "线索已更新";
+    closeLeadDetail();
   });
 }
 
@@ -667,18 +787,63 @@ function applyAgentConfig(config: AgentConfigResponse): void {
   agentBackendBaseUrl.value = config.backend_base_url;
 }
 
-function showPage(page: "workspace" | "agent", sectionId?: string): void {
+function showPage(page: "workspace" | "agent" | "settings", sectionId?: string): void {
   activePage.value = page;
   agentGuideOpen.value = false;
   agentNotificationsOpen.value = false;
   sidebarUserMenuOpen.value = false;
-  const hash = page === "agent" ? "agent" : sectionId || "overview";
+  const hash = page === "agent" ? "agent" : page === "settings" ? "settings" : sectionId || "overview";
   globalThis.history?.replaceState(null, "", `#${hash}`);
+
+  if (page === "settings") {
+    loadSettings();
+    return;
+  }
   const targetId = sectionId || (page === "agent" ? "overview" : "");
   if (!targetId) return;
   globalThis.requestAnimationFrame?.(() => {
     globalThis.document?.getElementById(targetId)?.scrollIntoView({ block: "start" });
   });
+}
+
+async function loadSettings(): Promise<void> {
+  settingsLoading.value = true;
+  try {
+    settings.value = await request<SettingsResponse>("/settings");
+  } catch {
+    // use defaults
+  } finally {
+    settingsLoading.value = false;
+  }
+}
+
+async function saveSettings(): Promise<void> {
+  if (settingsSaving.value) return;
+  settingsSaving.value = true;
+  try {
+    const body: Record<string, unknown> = {
+      sync_enabled: settings.value.sync_enabled,
+      sync_interval_minutes: settings.value.sync_interval_minutes,
+      agent_provider: agentProviderName.value,
+      agent_model: agentModelName.value,
+      backend_base_url: agentBackendBaseUrl.value,
+    };
+    if (settingsAgentKeyInput.value.trim()) {
+      body.agent_key = settingsAgentKeyInput.value.trim();
+    }
+    settings.value = await request<SettingsResponse>("/settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    settingsAgentKeyInput.value = "";
+    // Also sync agent config
+    await saveAgentConfig();
+    notice.value = "设置已保存";
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : "设置保存失败";
+  } finally {
+    settingsSaving.value = false;
+  }
 }
 
 function toggleAgentGuide(): void {
@@ -1059,42 +1224,32 @@ onMounted(() => {
         </div>
       </div>
       <nav class="side-nav" aria-label="主导航">
-        <a
-          href="#overview"
+        <button
+          type="button"
           :class="{ active: activePage === 'workspace' }"
-          @click.prevent="showPage('workspace', 'overview')"
+          @click="showPage('workspace', 'overview')"
         >
           <span class="nav-icon"><Home :size="18" aria-hidden="true" /></span>
-          概览
-        </a>
-        <a href="#prospecting-title" @click.prevent="showPage('workspace', 'prospecting-title')">
-          <span class="nav-icon"><Search :size="18" aria-hidden="true" /></span>
-          获客搜索
-        </a>
-        <a href="#lead-list-title" @click.prevent="showPage('workspace', 'lead-list-title')">
-          <span class="nav-icon"><Database :size="18" aria-hidden="true" /></span>
-          线索库
-        </a>
-        <button type="button" :class="{ active: activePage === 'agent' }" @click="showPage('agent')">
+          线索管理
+        </button>
+        <button
+          type="button"
+          :class="{ active: activePage === 'agent' }"
+          @click="showPage('agent')"
+        >
           <span class="nav-icon"><Bot :size="18" aria-hidden="true" /></span>
           Agent
         </button>
-        <a href="#reply-title" @click.prevent="showPage('workspace', 'reply-title')">
-          <span class="nav-icon"><MailCheck :size="18" aria-hidden="true" /></span>
-          外联跟进
-        </a>
+        <button
+          type="button"
+          :class="{ active: activePage === 'settings' }"
+          @click="showPage('settings')"
+        >
+          <span class="nav-icon"><SlidersHorizontal :size="18" aria-hidden="true" /></span>
+          设置
+        </button>
       </nav>
       <div class="sidebar-footer">
-        <div class="sidebar-usage-card">
-          <div>
-            <strong>本月使用</strong>
-            <a href="#overview" @click.prevent="showPage('workspace', 'overview')">查看详情</a>
-          </div>
-          <span>额度</span>
-          <div class="usage-bar"><i></i></div>
-          <small>1,250 / 3,000 Credits</small>
-          <small>重置于 2026-06-01</small>
-        </div>
         <button
           class="sidebar-user-card"
           type="button"
@@ -1150,6 +1305,18 @@ onMounted(() => {
                 <n-icon><RefreshCw /></n-icon>
               </template>
               {{ currentAction === "dashboard" ? "刷新中..." : "刷新数据" }}
+            </n-button>
+            <n-button
+              class="ghost-button"
+              secondary
+              :loading="currentAction === 'sync'"
+              :disabled="loading"
+              @click="syncReplies"
+            >
+              <template #icon>
+                <n-icon><MailCheck /></n-icon>
+              </template>
+              同步回复
             </n-button>
           </template>
           <template v-else>
@@ -1934,8 +2101,13 @@ onMounted(() => {
             </template>
           </n-empty>
 
-          <article v-for="lead in leads" :key="lead.id" class="lead-row">
-            <label class="select-cell" :aria-label="`选择 ${lead.company_name}`">
+          <article
+            v-for="lead in leads"
+            :key="lead.id"
+            :class="['lead-row', { 'lead-row-selected': detailLeadId === lead.id }]"
+            @click="openLeadDetail(lead.id)"
+          >
+            <label class="select-cell" :aria-label="`选择 ${lead.company_name}`" @click.stop>
               <n-checkbox
                 :checked="selectedLeadIds.includes(lead.id)"
                 @update:checked="(checked) => setLeadSelection(lead.id, checked)"
@@ -1953,7 +2125,7 @@ onMounted(() => {
               <a :href="lead.website" target="_blank" rel="noreferrer">{{ lead.website }}</a>
             </div>
 
-            <div class="lead-contact">
+            <div class="lead-contact" @click.stop>
               <span>公开邮箱</span>
               <a v-if="lead.email" :href="`mailto:${lead.email}`">{{ lead.email }}</a>
               <span v-else class="muted">未发现公开邮箱</span>
@@ -1961,7 +2133,7 @@ onMounted(() => {
 
             <p class="lead-reason">{{ lead.match_reason }}</p>
 
-            <div class="lead-source">
+            <div class="lead-source" @click.stop>
               <span>来源 / 邮箱位置</span>
               <button class="source-link" type="button" @click="openSourcePreview(lead)">
                 {{ lead.source }}
@@ -1969,7 +2141,7 @@ onMounted(() => {
               <small v-if="lead.notes">{{ lead.notes }}</small>
             </div>
 
-            <div class="lead-meta">
+            <div class="lead-meta" @click.stop>
               <span class="score">{{ lead.score }}</span>
               <n-button class="icon-text-button" secondary size="small" @click="markQualified(lead.id)">
                 <template #icon>
@@ -1980,6 +2152,101 @@ onMounted(() => {
             </div>
           </article>
         </section>
+
+        <div
+          v-if="activePage === 'workspace' && detailLeadId !== null"
+          class="modal-backdrop"
+          role="presentation"
+          @click.self="closeLeadDetail"
+        >
+          <section
+            class="lead-detail-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lead-detail-title"
+          >
+            <header class="modal-header">
+              <div>
+                <p class="panel-label">线索管理</p>
+                <h2 id="lead-detail-title">{{ detailLead?.company_name }}</h2>
+                <span class="detail-meta">{{ detailLead?.country }} · {{ detailLead?.region }} · {{ detailLead?.email }}</span>
+              </div>
+              <button class="icon-only-button" type="button" aria-label="关闭详情" @click="closeLeadDetail">
+                <X :size="20" aria-hidden="true" />
+              </button>
+            </header>
+
+            <div class="detail-grid">
+              <div class="detail-form">
+                <label class="field">
+                  <span>状态</span>
+                  <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" />
+                </label>
+                <label class="field">
+                  <span>备注</span>
+                  <n-input
+                    v-model:value="detailNotes"
+                    type="textarea"
+                    :autosize="{ minRows: 2, maxRows: 5 }"
+                    placeholder="添加跟进备注..."
+                  />
+                </label>
+                <div class="detail-actions">
+                  <n-button class="ghost-button" secondary @click="closeLeadDetail">取消</n-button>
+                  <n-button class="ghost-button" secondary @click="goToReply">
+                    <template #icon>
+                      <n-icon><MailCheck /></n-icon>
+                    </template>
+                    回复处理
+                  </n-button>
+                  <n-button class="primary-button" type="primary" :loading="currentAction === 'qualify'" :disabled="loading" @click="saveLeadDetail">
+                    <template #icon>
+                      <n-icon><Save /></n-icon>
+                    </template>
+                    保存
+                  </n-button>
+                </div>
+              </div>
+
+              <div class="detail-history">
+                <div v-if="detailOutreach.length > 0">
+                  <p class="panel-label">外联记录</p>
+                  <article v-for="ev in detailOutreach" :key="ev.id" class="history-card">
+                    <div class="history-head">
+                      <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : 'info'" size="small" round :bordered="false">
+                        {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : '已记录' }}
+                      </n-tag>
+                      <small>{{ ev.created_at?.slice(0, 16) }}</small>
+                    </div>
+                    <strong>{{ ev.subject }}</strong>
+                    <span>收件人：{{ ev.sent_to }}</span>
+                    <p>{{ ev.body.slice(0, 200) }}{{ ev.body.length > 200 ? '...' : '' }}</p>
+                  </article>
+                </div>
+
+                <div v-if="detailReplies.length > 0">
+                  <p class="panel-label">回复记录</p>
+                  <article v-for="r in detailReplies" :key="r.id" class="history-card">
+                    <div class="history-head">
+                      <n-tag :type="statusTagType(r.requires_human ? 'human_review' : r.intent)" size="small" round :bordered="false">
+                        {{ r.requires_human ? '转人工' : formatStatus(r.intent) }}
+                      </n-tag>
+                      <small>{{ Math.round(r.confidence * 100) }}% · {{ r.created_at?.slice(0, 16) }}</small>
+                    </div>
+                    <blockquote v-if="r.reply_text" class="reply-quote">{{ r.reply_text }}</blockquote>
+                    <p>{{ r.summary }}</p>
+                    <p class="history-next">{{ r.next_action }}</p>
+                  </article>
+                </div>
+
+                <div v-if="detailOutreach.length === 0 && detailReplies.length === 0 && !detailLoading" class="history-empty">
+                  暂无外联或回复记录
+                </div>
+                <div v-if="detailLoading" class="history-empty">加载中...</div>
+              </div>
+            </div>
+          </section>
+        </div>
 
         <section v-if="activePage === 'workspace'" class="reply-panel" aria-labelledby="reply-title">
           <div class="section-title step-title">
@@ -2046,6 +2313,87 @@ onMounted(() => {
           </n-alert>
         </div>
       </section>
+
+        <section
+          v-if="activePage === 'settings'"
+          class="settings-page"
+          aria-labelledby="settings-title"
+        >
+          <div class="settings-grid">
+            <section class="settings-card">
+              <div class="settings-card-head">
+                <div>
+                  <p class="panel-label">邮件同步</p>
+                  <h3>自动同步回复</h3>
+                  <p>定期从 Exchange 收件箱拉取回复，匹配到对应线索并自动分析意向。</p>
+                </div>
+                <n-tag :type="settings.sync_enabled ? 'success' : 'default'" size="small" round :bordered="false">
+                  {{ settings.sync_enabled ? '已开启' : '已关闭' }}
+                </n-tag>
+              </div>
+              <label class="toggle-field">
+                <n-checkbox v-model:checked="settings.sync_enabled">启用自动同步</n-checkbox>
+              </label>
+              <label class="field" v-if="settings.sync_enabled">
+                <span>同步间隔（分钟）</span>
+                <n-input-number v-model:value="settings.sync_interval_minutes" :min="5" :max="1440" />
+              </label>
+              <p class="setting-hint" v-if="settings.sync_enabled && settings.sync_interval_minutes > 0">
+                每 {{ settings.sync_interval_minutes }} 分钟自动扫描收件箱，仅同步新回复。
+              </p>
+            </section>
+
+            <section class="settings-card">
+              <div class="settings-card-head">
+                <div>
+                  <p class="panel-label">AI Agent</p>
+                  <h3>模型与 API 配置</h3>
+                  <p>配置 Agent 使用的 AI 模型、API Key 和后端地址。</p>
+                </div>
+              </div>
+              <div class="settings-agent-grid">
+                <label class="field">
+                  <span>Provider</span>
+                  <n-select v-model:value="agentProviderName" :options="providerOptions" />
+                </label>
+                <label class="field">
+                  <span>API Key</span>
+                  <n-input
+                    v-model:value="settingsAgentKeyInput"
+                    autocomplete="off"
+                    :placeholder="settings.has_agent_key ? settings.agent_key_preview : 'sk-...'"
+                    type="password"
+                    show-password-on="click"
+                  />
+                </label>
+                <label class="field">
+                  <span>模型</span>
+                  <n-input v-model:value="agentModelName" placeholder="deepseek-v4-pro" />
+                </label>
+                <label class="field">
+                  <span>Backend URL</span>
+                  <n-input v-model:value="agentBackendBaseUrl" />
+                </label>
+              </div>
+            </section>
+          </div>
+
+          <div class="settings-actions">
+            <n-button
+              class="primary-button"
+              type="primary"
+              size="large"
+              :loading="settingsSaving"
+              :disabled="settingsLoading || settingsSaving"
+              @click="saveSettings"
+            >
+              <template #icon>
+                <n-icon><Save /></n-icon>
+              </template>
+              {{ settingsSaving ? '保存中...' : '保存设置' }}
+            </n-button>
+          </div>
+        </section>
       </main>
     </section>
 

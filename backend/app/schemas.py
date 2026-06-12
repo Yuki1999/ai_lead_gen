@@ -62,3 +62,9 @@ class AgentConfigResponse(BaseModel):
     backend_base_url: str
     agent_env_path: str
     restart_required: bool = False
+
+
+class EmailTestRequest(BaseModel):
+    to: str = Field(min_length=3, max_length=320)
+    subject: str = Field(default="[Medbot Test]", max_length=200)
+    body: str = Field(default="This is a test email from Medbot.", max_length=5000)
