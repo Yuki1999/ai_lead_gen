@@ -465,6 +465,11 @@ def _candidate_from_result(
     category = _category_from_evidence(evidence)
     score = _score(evidence=evidence, email=email, product_profile=product_profile)
     company_name = _clean_company_name(page.title, fallback=result.title)
+
+    # Reject results that look like dictionary/encyclopedia/wiki entries
+    if _is_low_value_title(company_name):
+        company_name = ""  # will be rejected below
+
     country = region
     match_reason = (
         f"Live web match for {product_profile.procedure}: {result.snippet or result.title}. "
@@ -596,6 +601,20 @@ def _choose_email(emails: list[str], url: str) -> str:
     return emails[0]
 
 
+def _is_low_value_title(name: str) -> bool:
+    """Reject titles that look like dictionary/encyclopedia/wiki/definition/translation entries."""
+    lowered = name.lower()
+    patterns = [
+        "是什么意思", "的翻译", "的读音", "的用法", "的例句",
+        "definition", "meaning of", "what is", "what are",
+        "how to", "how do", "why do", "why is",
+        " - wikipedia", "wikipedia, the free",
+        "dictionary", "encyclopedia", "thesaurus",
+        "翻译", "词典", "字典", "词霸", "爱词霸",
+    ]
+    return any(p in lowered for p in patterns)
+
+
 def _clean_company_name(title: str, *, fallback: str = "") -> str:
     cleaned = re.split(r"\s[-|–—]\s", title, maxsplit=1)[0].strip()
     if cleaned.lower() in {"", "contact", "contact us", "products", "home", "about us"}:
@@ -622,6 +641,46 @@ def _is_low_value_domain(domain: str) -> bool:
         "x.com",
         "twitter.com",
         "duckduckgo.com",
+        # Dictionary / encyclopedia / wiki / Q&A
+        "iciba.com",
+        "wikipedia.org",
+        "wiktionary.org",
+        "merriam-webster.com",
+        "dictionary.com",
+        "thefreedictionary.com",
+        "collinsdictionary.com",
+        "cambridge.org",
+        "oxfordlearnersdictionaries.com",
+        "macmillandictionary.com",
+        "ldoceonline.com",
+        "wordreference.com",
+        "quora.com",
+        "answers.com",
+        "britannica.com",
+        "encyclopedia.com",
+        # Translation / language
+        "translate.google",
+        "deepl.com",
+        "reverso.net",
+        "linguee.com",
+        "dict.cc",
+        "bab.la",
+        "glosbe.com",
+        # News / media aggregators
+        "reddit.com",
+        "medium.com",
+        "pinterest.com",
+        "tiktok.com",
+        # Code / dev
+        "github.com",
+        "stackoverflow.com",
+        "gitlab.com",
+        "bitbucket.org",
+        # Job / recruitment
+        "indeed.com",
+        "glassdoor.com",
+        "ziprecruiter.com",
+        "monster.com",
     }
     return any(domain == blocked_domain or domain.endswith(f".{blocked_domain}") for blocked_domain in blocked)
 

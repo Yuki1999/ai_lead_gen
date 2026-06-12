@@ -19,6 +19,18 @@ class WebFetchRequest(BaseModel):
     email: str = Field(default="", max_length=320)
 
 
+class LeadCreateRequest(BaseModel):
+    company_name: str = Field(min_length=1, max_length=200)
+    region: str = Field(min_length=1, max_length=100)
+    country: str = Field(min_length=1, max_length=100)
+    website: str = Field(default="", max_length=500)
+    contact_name: str = Field(default="", max_length=100)
+    email: str = Field(min_length=5, max_length=320)
+    category: str = Field(default="medical device distributor", max_length=200)
+    match_reason: str = Field(default="手动添加", max_length=1000)
+    source: str = Field(default="manual", max_length=500)
+
+
 class LeadUpdateRequest(BaseModel):
     status: str | None = Field(default=None, min_length=2, max_length=40)
     notes: str | None = Field(default=None, max_length=2000)
@@ -26,6 +38,8 @@ class LeadUpdateRequest(BaseModel):
 
 class OutreachRequest(BaseModel):
     lead_ids: list[int] = Field(min_length=1)
+    source: str = Field(default="manual", max_length=20)
+    custom_emails: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class ReplyAnalysisRequest(BaseModel):

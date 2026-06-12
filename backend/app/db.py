@@ -56,6 +56,7 @@ def init_db() -> None:
                 region TEXT NOT NULL,
                 status TEXT NOT NULL,
                 message_id TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'manual',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (lead_id) REFERENCES leads(id)
             );
@@ -93,6 +94,12 @@ def init_db() -> None:
             )
         except Exception:
             pass  # column already exists
+        try:
+            connection.execute(
+                "ALTER TABLE outreach_events ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'"
+            )
+        except Exception:
+            pass  # column already exists
 
 
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
@@ -115,11 +122,18 @@ def insert_lead(lead: CandidateLead) -> dict[str, Any]:
         return get_lead(cursor.lastrowid, connection=connection)
 
 
+_SORTABLE_COLUMNS = {
+    "company_name", "score", "category", "email", "source",
+    "country", "region", "status", "id",
+}
+
 def list_leads(
     *,
     region: str | None = None,
     status: str | None = None,
     q: str | None = None,
+    sort: str = "id",
+    order: str = "desc",
 ) -> list[dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
@@ -136,9 +150,14 @@ def list_leads(
         params["q"] = f"%{q}%"
 
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    sort_col = sort if sort in _SORTABLE_COLUMNS else "id"
+    sort_dir = "DESC" if order.lower() == "desc" else "ASC"
     with connect() as connection:
         rows = connection.execute(
-            f"SELECT * FROM leads {where} ORDER BY score DESC, id DESC",
+            f"""SELECT l.*,
+                (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) AS reply_count
+            FROM leads l
+            {where} ORDER BY {sort_col} {sort_dir}, l.id DESC""",
             params,
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
@@ -190,19 +209,21 @@ def insert_outreach_event(
     *,
     status: str = "recorded",
     message_id: str = "",
+    source: str = "manual",
 ) -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, message_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, message_id, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (lead_id, email.subject, email.body, email.sent_to, email.region, status, message_id, _now()),
+            (lead_id, email.subject, email.body, email.sent_to, email.region, status, message_id, source, _now()),
         )
-        connection.execute(
-            "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
-            ("emailed", _now(), lead_id),
-        )
+        if status == "sent":
+            connection.execute(
+                "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
+                ("emailed", _now(), lead_id),
+            )
         row = connection.execute(
             "SELECT * FROM outreach_events WHERE id = ?",
             (cursor.lastrowid,),
@@ -267,6 +288,70 @@ def list_reply_analyses(lead_id: int) -> list[dict[str, Any]]:
     for r in results:
         r["requires_human"] = bool(r["requires_human"])
     return results
+
+
+def list_draft_events() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT e.*, l.company_name, l.email AS lead_email, l.country
+            FROM outreach_events e
+            JOIN leads l ON e.lead_id = l.id
+            WHERE e.status = 'draft'
+            ORDER BY e.created_at DESC
+            """
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
+def approve_outreach_event(event_id: int) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ? AND status = 'draft'",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            "UPDATE outreach_events SET status = ?, message_id = ? WHERE id = ?",
+            ("sent", "", event_id),
+        )
+        connection.execute(
+            "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
+            ("emailed", _now(), row["lead_id"]),
+        )
+        updated = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        return _row_to_dict(updated)
+
+
+def reject_outreach_event(event_id: int) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ? AND status = 'draft'",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            "UPDATE outreach_events SET status = 'rejected' WHERE id = ?",
+            (event_id,),
+        )
+        updated = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        return _row_to_dict(updated)
+
+
+def delete_lead(lead_id: int) -> bool:
+    with connect() as connection:
+        cursor = connection.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
+        if cursor.rowcount == 0:
+            return False
+        connection.execute("DELETE FROM outreach_events WHERE lead_id = ?", (lead_id,))
+        connection.execute("DELETE FROM reply_analyses WHERE lead_id = ?", (lead_id,))
+        return True
 
 
 def metrics() -> dict[str, int]:

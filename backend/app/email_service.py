@@ -43,11 +43,12 @@ class EmailConfig:
 
 
 def _load_config() -> EmailConfig:
-    return EmailConfig(
-        server=_env("MEDBOT_EMAIL_SERVER", "mail.microport.com.cn"),
-        username=_env("MEDBOT_EMAIL_USER", "OB_OSD@microport.com"),
-        password=_env("MEDBOT_EMAIL_PASSWORD", "CDdeXHi9"),
-    )
+    # Try env vars first, then DB settings, then defaults
+    from app.db import get_setting
+    server = _env("MEDBOT_EMAIL_SERVER") or get_setting("email_server") or "mail.microport.com.cn"
+    username = _env("MEDBOT_EMAIL_USER") or get_setting("email_user") or ""
+    password = _env("MEDBOT_EMAIL_PASSWORD") or get_setting("email_password") or ""
+    return EmailConfig(server=server, username=username, password=password)
 
 
 _config: EmailConfig | None = None

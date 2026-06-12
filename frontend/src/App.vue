@@ -75,6 +75,7 @@ interface Lead {
   score: number;
   status: string;
   notes: string;
+  reply_count?: number;
 }
 
 interface Metrics {
@@ -104,6 +105,14 @@ interface EmailEvent {
   status: string;
   created_at?: string;
   message_id?: string;
+  source?: string;
+  company_name?: string;
+  country?: string;
+}
+
+interface DraftListResponse {
+  total: number;
+  drafts: EmailEvent[];
 }
 
 interface SendResponse {
@@ -169,6 +178,9 @@ interface SettingsResponse {
   has_agent_key: boolean;
   agent_key_preview: string;
   backend_base_url: string;
+  email_server: string;
+  email_user: string;
+  has_email_password: boolean;
 }
 
 interface AgentConfigResponse {
@@ -228,6 +240,8 @@ const requireEmail = ref(true);
 const filterRegion = ref("");
 const filterStatus = ref("");
 const query = ref("");
+const sortField = ref("id");
+const sortDir = ref<"asc" | "desc">("desc");
 const replyLeadId = ref<number | "">("");
 const replyText = ref(
   "We are interested. Please send product details, certificates, and partner requirements."
@@ -280,10 +294,23 @@ const settings = ref<SettingsResponse>({
   has_agent_key: false,
   agent_key_preview: "",
   backend_base_url: "http://localhost:8000",
+  email_server: "mail.microport.com.cn",
+  email_user: "",
+  has_email_password: false,
 });
 const settingsAgentKeyInput = ref("");
+const settingsEmailPasswordInput = ref("");
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
+const settingsTab = ref<"email" | "sync" | "agent">("email");
+const drafts = ref<EmailEvent[]>([]);
+const draftCount = ref(0);
+const showOutreachPreview = ref(false);
+const outreachLoading = ref(false);
+const outreachPreviews = ref<Array<{ lead_id: number; company_name: string; email: string; subject: string; body: string }>>([]);
+const showCreateLead = ref(false);
+const createError = ref("");
+const newLead = ref({ company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" });
 const activePage = ref<"workspace" | "agent" | "settings">("workspace");
 const editingSessionId = ref("");
 const editingSessionTitle = ref("");
@@ -440,6 +467,8 @@ async function loadDashboard(): Promise<void> {
   if (filterRegion.value) params.set("region", filterRegion.value);
   if (filterStatus.value) params.set("status", filterStatus.value);
   if (query.value) params.set("q", query.value);
+  params.set("sort", sortField.value);
+  params.set("order", sortDir.value);
 
   const [leadPayload, metricPayload] = await Promise.all([
     request<LeadListResponse>(`/leads?${params.toString()}`),
@@ -451,6 +480,124 @@ async function loadDashboard(): Promise<void> {
   if (replyLeadId.value === "" && leads.value.length > 0) {
     replyLeadId.value = leads.value[0].id;
   }
+  loadDrafts();
+}
+
+async function loadDrafts(): Promise<void> {
+  try {
+    const payload = await request<DraftListResponse>("/campaigns/drafts");
+    drafts.value = payload.drafts;
+    draftCount.value = payload.total;
+  } catch {
+    drafts.value = [];
+    draftCount.value = 0;
+  }
+}
+
+async function approveDraft(eventId: number): Promise<void> {
+  await runAction("outreach", async () => {
+    const result = await request<{ ok: boolean; sent: boolean; error?: string }>(
+      `/campaigns/drafts/${eventId}/approve`,
+      { method: "POST" }
+    );
+    notice.value = result.sent ? "已批准并发送" : result.ok ? "已批准" : "批准失败";
+    await loadDrafts();
+    await loadDashboard();
+  });
+}
+
+async function rejectDraft(eventId: number): Promise<void> {
+  await runAction("outreach", async () => {
+    await request(`/campaigns/drafts/${eventId}/reject`, { method: "POST" });
+    notice.value = "已拒绝";
+    await loadDrafts();
+  });
+}
+
+function openCreateLead(): void {
+  createError.value = "";
+  newLead.value = { company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" };
+  showCreateLead.value = true;
+}
+
+async function createLead(): Promise<void> {
+  createError.value = "";
+  if (!newLead.value.company_name.trim()) {
+    createError.value = "请填写公司名称";
+    return;
+  }
+  if (!newLead.value.region.trim()) {
+    createError.value = "请填写地区";
+    return;
+  }
+  if (!newLead.value.country.trim()) {
+    createError.value = "请填写国家";
+    return;
+  }
+  if (!newLead.value.email.trim()) {
+    createError.value = "请填写邮箱";
+    return;
+  }
+  try {
+    await request("/leads", {
+      method: "POST",
+      body: JSON.stringify(newLead.value),
+    });
+    showCreateLead.value = false;
+    notice.value = "线索已添加";
+    await loadDashboard();
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : "创建失败";
+    // Parse FastAPI validation errors into readable text
+    try {
+      const parsed = JSON.parse(msg);
+      if (parsed.detail && Array.isArray(parsed.detail)) {
+        createError.value = parsed.detail.map((e: { loc: string[]; msg: string }) => `${e.loc.slice(-1)[0]}: ${e.msg}`).join("; ");
+        return;
+      }
+    } catch {}
+    createError.value = msg;
+  }
+}
+
+async function batchDeleteLeads(): Promise<void> {
+  if (selectedLeadIds.value.length === 0) return;
+  const confirmed = globalThis.confirm?.(`确定删除选中的 ${selectedLeadIds.value.length} 条线索及其关联数据？`) ?? true;
+  if (!confirmed) return;
+  await runAction("qualify", async () => {
+    await request("/leads/batch-delete", {
+      method: "POST",
+      body: JSON.stringify({ lead_ids: selectedLeadIds.value }),
+    });
+    selectedLeadIds.value = [];
+    notice.value = "已批量删除";
+    await loadDashboard();
+  });
+}
+
+async function deleteLead(leadId: number): Promise<void> {
+  const confirmed = globalThis.confirm?.("确定删除这条线索及其关联的外联记录和回复分析？") ?? true;
+  if (!confirmed) return;
+  await runAction("qualify", async () => {
+    await request(`/leads/${leadId}`, { method: "DELETE" });
+    closeLeadDetail();
+    notice.value = "线索已删除";
+    await loadDashboard();
+  });
+}
+
+async function approveAllDrafts(): Promise<void> {
+  if (draftCount.value === 0) return;
+  await runAction("outreach", async () => {
+    const result = await request<{ total: number; results: Array<{ sent: boolean }> }>(
+      "/campaigns/drafts/approve-all",
+      { method: "POST" }
+    );
+    const sentCount = result.results.filter((r) => r.sent).length;
+    notice.value = `已批准 ${result.total} 条，成功发送 ${sentCount} 条`;
+    await loadDrafts();
+    await loadDashboard();
+  });
 }
 
 async function loadProductProfile(): Promise<void> {
@@ -612,6 +759,65 @@ async function saveAgentConfig(): Promise<void> {
   }
 }
 
+async function sendOutreachSingle(leadId: number): Promise<void> {
+  await fetchOutreachPreview([leadId]);
+}
+
+async function sendOutreachBatch(): Promise<void> {
+  await fetchOutreachPreview(selectedLeadIds.value);
+}
+
+async function fetchOutreachPreview(leadIds: number[]): Promise<void> {
+  if (leadIds.length === 0) return;
+  outreachPreviews.value = [];
+  outreachLoading.value = true;
+  showOutreachPreview.value = true;
+  try {
+    const payload = await request<{ previews: typeof outreachPreviews.value }>("/campaigns/outreach-preview", {
+      method: "POST",
+      body: JSON.stringify({ lead_ids: leadIds }),
+    });
+    outreachPreviews.value = payload.previews;
+  } catch (caught) {
+    error.value = "生成邮件失败";
+    showOutreachPreview.value = false;
+  } finally {
+    outreachLoading.value = false;
+  }
+}
+
+async function confirmSendOutreach(): Promise<void> {
+  const leadIds = outreachPreviews.value.map((p) => p.lead_id);
+  const customEmails: Record<string, { subject: string; body: string }> = {};
+  for (const p of outreachPreviews.value) {
+    customEmails[String(p.lead_id)] = { subject: p.subject, body: p.body };
+  }
+  await runAction("outreach", async () => {
+    const payload = await request<SendResponse>("/campaigns/outreach-records", {
+      method: "POST",
+      body: JSON.stringify({ lead_ids: leadIds, custom_emails: customEmails }),
+    });
+    showOutreachPreview.value = false;
+    notice.value = `已发送 ${payload.sent_count} 封外联`;
+    await loadDashboard();
+  });
+}
+
+function goToReplyForLead(leadId: number): void {
+  openLeadDetail(leadId);
+}
+
+async function reactivateLead(leadId: number): Promise<void> {
+  await runAction("qualify", async () => {
+    await request<Lead>(`/leads/${leadId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "new", notes: "重新激活" }),
+    });
+    notice.value = "线索已重新激活";
+    await loadDashboard();
+  });
+}
+
 async function markQualified(leadId: number): Promise<void> {
   await runAction("qualify", async () => {
     await request<Lead>(`/leads/${leadId}`, {
@@ -656,28 +862,23 @@ function closeLeadDetail(): void {
 }
 
 function goToReply(): void {
-  const leadId = detailLeadId.value;
-  closeLeadDetail();
-  if (leadId !== null) {
-    replyLeadId.value = leadId;
-  }
-  showPage('workspace', 'reply-title');
+  notice.value = "回复已自动同步和分析，点击行查看详情";
 }
 
 async function saveLeadDetail(): Promise<void> {
   if (detailLeadId.value === null) return;
-  await runAction("qualify", async () => {
-    await request<Lead>(`/leads/${detailLeadId.value!}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        status: detailStatus.value || undefined,
-        notes: detailNotes.value || undefined,
-      }),
-    });
-    await loadDashboard();
-    notice.value = "线索已更新";
-    closeLeadDetail();
+  const lead = leads.value.find((l) => l.id === detailLeadId.value);
+  if (lead && lead.status === detailStatus.value && (lead.notes || "") === (detailNotes.value || "")) {
+    return; // no change
+  }
+  await request<Lead>(`/leads/${detailLeadId.value!}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: detailStatus.value || undefined,
+      notes: detailNotes.value || undefined,
+    }),
   });
+  await loadDashboard();
 }
 
 async function openSourcePreview(lead: Lead): Promise<void> {
@@ -705,6 +906,24 @@ function closeSourcePreview(): void {
 
 function toggleLead(leadId: number, event: Event): void {
   setLeadSelection(leadId, (event.target as HTMLInputElement).checked);
+}
+
+function toggleSelectAll(checked: boolean): void {
+  if (checked) {
+    selectedLeadIds.value = leads.value.map((l) => l.id);
+  } else {
+    selectedLeadIds.value = [];
+  }
+}
+
+function toggleSort(field: string): void {
+  if (sortField.value === field) {
+    sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
+  } else {
+    sortField.value = field;
+    sortDir.value = "asc";
+  }
+  runAction("dashboard", loadDashboard);
 }
 
 function setLeadSelection(leadId: number, checked: boolean): void {
@@ -827,15 +1046,21 @@ async function saveSettings(): Promise<void> {
       agent_provider: agentProviderName.value,
       agent_model: agentModelName.value,
       backend_base_url: agentBackendBaseUrl.value,
+      email_server: settings.value.email_server,
+      email_user: settings.value.email_user,
     };
     if (settingsAgentKeyInput.value.trim()) {
       body.agent_key = settingsAgentKeyInput.value.trim();
+    }
+    if (settingsEmailPasswordInput.value.trim()) {
+      body.email_password = settingsEmailPasswordInput.value.trim();
     }
     settings.value = await request<SettingsResponse>("/settings", {
       method: "PUT",
       body: JSON.stringify(body),
     });
     settingsAgentKeyInput.value = "";
+    settingsEmailPasswordInput.value = "";
     // Also sync agent config
     await saveAgentConfig();
     notice.value = "设置已保存";
@@ -1057,6 +1282,17 @@ function shortAgentSessionId(sessionId: string): string {
   return sessionId.replace(/^agent-/, "").slice(0, 18);
 }
 
+function formatTime(iso?: string): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch {
+    return iso.slice(0, 16);
+  }
+}
+
 function formatAgentSessionTime(timestamp: number): string {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -1226,19 +1462,20 @@ onMounted(() => {
       <nav class="side-nav" aria-label="主导航">
         <button
           type="button"
+          :class="{ active: activePage === 'agent' }"
+          @click="showPage('agent')"
+        >
+          <span class="nav-icon"><Bot :size="18" aria-hidden="true" /></span>
+          渠道拓展Agent
+        </button>
+        <button
+          type="button"
           :class="{ active: activePage === 'workspace' }"
           @click="showPage('workspace', 'overview')"
         >
           <span class="nav-icon"><Home :size="18" aria-hidden="true" /></span>
           线索管理
-        </button>
-        <button
-          type="button"
-          :class="{ active: activePage === 'agent' }"
-          @click="showPage('agent')"
-        >
-          <span class="nav-icon"><Bot :size="18" aria-hidden="true" /></span>
-          Agent
+          <span v-if="draftCount > 0" class="nav-badge">{{ draftCount }}</span>
         </button>
         <button
           type="button"
@@ -1350,27 +1587,10 @@ onMounted(() => {
       </header>
 
       <section
-        v-if="activePage === 'agent' && (agentGuideOpen || agentNotificationsOpen)"
+        v-if="activePage === 'agent' && agentNotificationsOpen"
         class="agent-topbar-panels"
         aria-live="polite"
       >
-        <article v-if="agentGuideOpen" class="agent-guide-panel" aria-label="Agent 使用指南">
-          <div class="agent-panel-head">
-            <div>
-              <p class="panel-label">使用指南</p>
-              <strong>渠道拓展任务流</strong>
-            </div>
-            <button class="icon-only-button" type="button" aria-label="关闭使用指南" @click="toggleAgentGuide">
-              <X :size="16" aria-hidden="true" />
-            </button>
-          </div>
-          <ol class="agent-guide-steps">
-            <li>在任务框写清产品、国家、渠道类型和证据要求。</li>
-            <li>发送后右侧只显示最新执行步骤，历史记录默认折叠。</li>
-            <li>输出完成后可复制、导出 Markdown 或全屏审阅。</li>
-          </ol>
-        </article>
-
         <article
           v-if="agentNotificationsOpen"
           class="agent-notification-panel"
@@ -1396,7 +1616,7 @@ onMounted(() => {
 
       <main class="dashboard-grid" :class="{ 'agent-route': activePage === 'agent' }">
         <section
-          v-if="activePage === 'workspace'"
+          v-if="false"
           class="tool-panel workspace-ops-panel"
           aria-labelledby="prospecting-title"
         >
@@ -1504,68 +1724,6 @@ onMounted(() => {
         </section>
 
         <section class="content-area" aria-label="线索和回复工作区">
-          <div v-if="activePage === 'workspace'" class="metrics-row summary-strip">
-            <article class="metric-card">
-              <span class="metric-icon"><Database :size="19" aria-hidden="true" /></span>
-              <div>
-                <span>线索总数</span>
-                <strong>{{ metrics.total_leads }}</strong>
-              </div>
-            </article>
-            <article class="metric-card">
-              <span class="metric-icon success"><UserCheck :size="19" aria-hidden="true" /></span>
-              <div>
-                <span>有兴趣</span>
-                <strong>{{ metrics.interested_leads }}</strong>
-              </div>
-            </article>
-            <article class="metric-card">
-              <span class="metric-icon blue"><MailCheck :size="19" aria-hidden="true" /></span>
-              <div>
-                <span>已触达</span>
-                <strong>{{ metrics.sent_emails }}</strong>
-              </div>
-            </article>
-            <article class="metric-card warning">
-              <span class="metric-icon warning-icon"><AlertTriangle :size="19" aria-hidden="true" /></span>
-              <div>
-                <span>转人工</span>
-                <strong>{{ metrics.human_review }}</strong>
-              </div>
-            </article>
-          </div>
-
-          <div v-if="activePage === 'workspace'" class="pipeline-strip" aria-label="渠道工作流状态">
-            <article>
-              <span>01</span>
-              <div>
-                <strong>发现线索</strong>
-                <small>公开网页搜索</small>
-              </div>
-            </article>
-            <article>
-              <span>02</span>
-              <div>
-                <strong>审阅证据</strong>
-                <small>来源与邮箱位置</small>
-              </div>
-            </article>
-            <article>
-              <span>03</span>
-              <div>
-                <strong>渠道触达</strong>
-                <small>邮件草稿与记录</small>
-              </div>
-            </article>
-            <article>
-              <span>04</span>
-              <div>
-                <strong>回复分流</strong>
-                <small>意向与转人工</small>
-              </div>
-            </article>
-          </div>
-
           <section
             v-if="activePage === 'agent'"
             class="agent-panel agent-page-panel agent-console-layout agent-chat-shell agent-design-shell"
@@ -2048,31 +2206,81 @@ onMounted(() => {
             </aside>
           </section>
 
+        <section
+          v-if="activePage === 'workspace' && draftCount > 0"
+          class="draft-queue"
+          aria-label="待审核外联"
+        >
+          <div class="draft-queue-head">
+            <div>
+              <p class="panel-label">待审核</p>
+              <strong>Agent 生成了 {{ draftCount }} 条外联草稿</strong>
+              <span>审核后才会真实发送</span>
+            </div>
+            <n-button class="primary-button" type="primary" size="small" @click="approveAllDrafts">
+              <template #icon><n-icon><Check /></n-icon></template>
+              全部批准发送
+            </n-button>
+          </div>
+          <article v-for="draft in drafts" :key="draft.id" class="draft-card">
+            <div class="draft-card-body">
+              <div class="draft-meta">
+                <strong>{{ draft.company_name || 'Unknown' }}</strong>
+                <span>{{ draft.country }} · {{ draft.sent_to }}</span>
+              </div>
+              <p class="draft-subject">{{ draft.subject }}</p>
+              <p class="draft-preview">{{ draft.body.slice(0, 250) }}{{ draft.body.length > 250 ? '...' : '' }}</p>
+            </div>
+            <div class="draft-actions">
+              <n-button class="ghost-button" type="primary" size="small" @click="approveDraft(draft.id)">
+                <template #icon><n-icon><Check /></n-icon></template>
+                批准
+              </n-button>
+              <n-button class="ghost-button danger-action" size="small" @click="rejectDraft(draft.id)">
+                <template #icon><n-icon><X /></n-icon></template>
+                拒绝
+              </n-button>
+            </div>
+          </article>
+        </section>
+
         <div v-if="activePage === 'workspace'" class="toolbar" aria-label="筛选线索">
-          <label>
-            <span>地区</span>
-            <n-input v-model:value="filterRegion" clearable placeholder="Europe" />
-          </label>
-          <label>
-            <span>状态</span>
-            <n-select v-model:value="filterStatus" :options="statusFilterOptions" />
-          </label>
-          <label class="wide">
-            <span>关键词</span>
-            <n-input v-model:value="query" clearable placeholder="company / email / country" />
-          </label>
-          <n-button
-            class="ghost-button"
-            secondary
-            :loading="currentAction === 'dashboard'"
-            :disabled="loading"
-            @click="runAction('dashboard', loadDashboard)"
-          >
-            <template #icon>
-              <n-icon><Search /></n-icon>
-            </template>
-            {{ currentAction === "dashboard" ? "筛选中..." : "筛选" }}
-          </n-button>
+          <div class="toolbar-search">
+            <Search :size="15" class="toolbar-search-icon" aria-hidden="true" />
+            <input
+              v-model="query"
+              placeholder="搜索公司、邮箱、国家..."
+              class="toolbar-search-input"
+              @keyup.enter="runAction('dashboard', loadDashboard)"
+            />
+            <button
+              v-if="query"
+              class="toolbar-search-clear"
+              type="button"
+              aria-label="清除搜索"
+              @click="query = ''; runAction('dashboard', loadDashboard)"
+            >
+              <X :size="13" />
+            </button>
+          </div>
+
+          <div class="status-chips">
+            <button
+              v-for="opt in statusFilterOptions"
+              :key="String(opt.value)"
+              :class="['status-chip', { active: filterStatus === opt.value }]"
+              @click="filterStatus = filterStatus === opt.value ? '' : String(opt.value); runAction('dashboard', loadDashboard)"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+
+          <input
+            v-model="filterRegion"
+            placeholder="地区..."
+            class="toolbar-region-input"
+            @keyup.enter="runAction('dashboard', loadDashboard)"
+          />
         </div>
 
         <section
@@ -2081,17 +2289,53 @@ onMounted(() => {
           aria-labelledby="lead-list-title"
         >
           <div class="list-head">
-            <div>
-              <h2 id="lead-list-title">线索数据库</h2>
-              <p>公司、邮箱、公开来源证据、评分和管线状态</p>
+            <div class="list-head-left">
+              <label class="select-cell" @click.stop>
+                <n-checkbox
+                  :checked="selectedLeadIds.length === leads.length && leads.length > 0"
+                  :indeterminate="selectedLeadIds.length > 0 && selectedLeadIds.length < leads.length"
+                  @update:checked="toggleSelectAll"
+                />
+              </label>
+              <div>
+                <h2 id="lead-list-title">线索数据库</h2>
+                <p>公司、邮箱、公开来源证据、评分和管线状态</p>
+              </div>
             </div>
-            <span>{{ leads.length }} 条</span>
+            <div class="list-head-right">
+              <n-button class="ghost-button" secondary size="small" @click="openCreateLead">
+                <template #icon><n-icon><Plus /></n-icon></template>
+                添加线索
+              </n-button>
+              <template v-if="selectedLeadIds.length > 0">
+                <span class="selection-count">已选 {{ selectedLeadIds.length }} 条</span>
+                <n-button
+                  class="primary-button"
+                  type="primary"
+                  size="small"
+                  :loading="currentAction === 'outreach'"
+                  :disabled="loading"
+                  @click.stop="sendOutreachBatch"
+                >
+                  <template #icon><n-icon><Send /></n-icon></template>
+                  发送外联
+                </n-button>
+                <n-button class="ghost-button danger-action" secondary size="small" @click.stop="batchDeleteLeads">
+                  <template #icon><n-icon><Trash2 /></n-icon></template>
+                  删除
+                </n-button>
+                <n-button class="ghost-button" secondary size="small" @click.stop="selectedLeadIds = []">
+                  取消
+                </n-button>
+              </template>
+              <span v-else>{{ leads.length }} 条</span>
+            </div>
           </div>
 
           <n-empty
             v-if="leads.length === 0"
             class="empty-state"
-            description="点击左侧“实时搜索并入库”后，结果会显示在这里。"
+            description="点击左侧'实时搜索并入库'后，结果会显示在这里。"
           >
             <template #icon>
               <n-icon><Globe2 /></n-icon>
@@ -2114,41 +2358,30 @@ onMounted(() => {
               />
             </label>
 
-            <div class="lead-main">
-              <div class="lead-title-line">
-                <strong>{{ lead.company_name }}</strong>
+            <div class="lead-body">
+              <div class="lead-top">
+                <strong class="lead-name">{{ lead.company_name }}</strong>
                 <n-tag :type="statusTagType(lead.status)" size="small" round :bordered="false">
                   {{ formatStatus(lead.status) }}
                 </n-tag>
+                <span class="lead-region">{{ lead.country === lead.region ? lead.country : `${lead.country} · ${lead.region}` }}</span>
+                <span class="lead-category">{{ lead.category }}</span>
               </div>
-              <span>{{ lead.country }} · {{ lead.region }} · {{ lead.category }}</span>
-              <a :href="lead.website" target="_blank" rel="noreferrer">{{ lead.website }}</a>
+              <div class="lead-bottom">
+                <a v-if="lead.email" :href="`mailto:${lead.email}`" class="lead-email" @click.stop>{{ lead.email }}</a>
+                <span v-else class="muted">—</span>
+                <span class="lead-score-badge">{{ lead.score }}</span>
+                <button class="source-link" type="button" @click.stop="openSourcePreview(lead)">{{ lead.source }}</button>
+                <span class="lead-reason-inline">{{ lead.match_reason }}</span>
+              </div>
             </div>
 
-            <div class="lead-contact" @click.stop>
-              <span>公开邮箱</span>
-              <a v-if="lead.email" :href="`mailto:${lead.email}`">{{ lead.email }}</a>
-              <span v-else class="muted">未发现公开邮箱</span>
-            </div>
-
-            <p class="lead-reason">{{ lead.match_reason }}</p>
-
-            <div class="lead-source" @click.stop>
-              <span>来源 / 邮箱位置</span>
-              <button class="source-link" type="button" @click="openSourcePreview(lead)">
-                {{ lead.source }}
-              </button>
-              <small v-if="lead.notes">{{ lead.notes }}</small>
-            </div>
-
-            <div class="lead-meta" @click.stop>
-              <span class="score">{{ lead.score }}</span>
-              <n-button class="icon-text-button" secondary size="small" @click="markQualified(lead.id)">
-                <template #icon>
-                  <n-icon><UserCheck /></n-icon>
-                </template>
-                确认
-              </n-button>
+            <div class="lead-tools" @click.stop>
+              <button v-if="lead.status === 'new'" class="lead-action-btn primary" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
+              <button v-if="lead.status === 'emailed' && (lead.reply_count || 0) > 0" class="lead-action-btn" @click="goToReplyForLead(lead.id)"><MailCheck :size="13" />回复</button>
+              <button v-if="['new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
+              <button v-if="lead.status === 'rejected'" class="lead-action-btn" @click="reactivateLead(lead.id)"><RefreshCw :size="13" />激活</button>
+              <button class="lead-action-btn danger" @click="deleteLead(lead.id)"><Trash2 :size="13" /></button>
             </div>
           </article>
         </section>
@@ -2169,18 +2402,37 @@ onMounted(() => {
               <div>
                 <p class="panel-label">线索管理</p>
                 <h2 id="lead-detail-title">{{ detailLead?.company_name }}</h2>
-                <span class="detail-meta">{{ detailLead?.country }} · {{ detailLead?.region }} · {{ detailLead?.email }}</span>
+                <span class="detail-meta">{{ detailLead?.country === detailLead?.region ? detailLead?.country : `${detailLead?.country} · ${detailLead?.region}` }} · {{ detailLead?.email }}</span>
               </div>
               <button class="icon-only-button" type="button" aria-label="关闭详情" @click="closeLeadDetail">
                 <X :size="20" aria-hidden="true" />
               </button>
             </header>
 
+            <div class="detail-summary">
+              <div class="detail-summary-row">
+                <span class="detail-summary-label">匹配理由</span>
+                <span>{{ detailLead?.match_reason }}</span>
+              </div>
+              <div class="detail-summary-row">
+                <span class="detail-summary-label">来源</span>
+                <a :href="detailLead?.source" target="_blank" rel="noreferrer">{{ detailLead?.source }}</a>
+              </div>
+              <div class="detail-summary-row">
+                <span class="detail-summary-label">网站</span>
+                <a :href="detailLead?.website" target="_blank" rel="noreferrer">{{ detailLead?.website }}</a>
+              </div>
+              <div class="detail-summary-row">
+                <span class="detail-summary-label">类别</span>
+                <span>{{ detailLead?.category }}</span>
+              </div>
+            </div>
+
             <div class="detail-grid">
               <div class="detail-form">
                 <label class="field">
                   <span>状态</span>
-                  <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" />
+                  <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
                 </label>
                 <label class="field">
                   <span>备注</span>
@@ -2189,21 +2441,17 @@ onMounted(() => {
                     type="textarea"
                     :autosize="{ minRows: 2, maxRows: 5 }"
                     placeholder="添加跟进备注..."
+                    @blur="saveLeadDetail"
                   />
                 </label>
                 <div class="detail-actions">
-                  <n-button class="ghost-button" secondary @click="closeLeadDetail">取消</n-button>
-                  <n-button class="ghost-button" secondary @click="goToReply">
-                    <template #icon>
-                      <n-icon><MailCheck /></n-icon>
-                    </template>
-                    回复处理
+                  <n-button class="ghost-button danger-action" secondary @click="deleteLead(detailLeadId!)">
+                    <template #icon><n-icon><Trash2 /></n-icon></template>
+                    删除
                   </n-button>
-                  <n-button class="primary-button" type="primary" :loading="currentAction === 'qualify'" :disabled="loading" @click="saveLeadDetail">
-                    <template #icon>
-                      <n-icon><Save /></n-icon>
-                    </template>
-                    保存
+                  <n-button class="ghost-button" secondary @click="goToReply">
+                    <template #icon><n-icon><MailCheck /></n-icon></template>
+                    回复处理
                   </n-button>
                 </div>
               </div>
@@ -2216,7 +2464,7 @@ onMounted(() => {
                       <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : 'info'" size="small" round :bordered="false">
                         {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : '已记录' }}
                       </n-tag>
-                      <small>{{ ev.created_at?.slice(0, 16) }}</small>
+                      <small>{{ formatTime(ev.created_at) }}</small>
                     </div>
                     <strong>{{ ev.subject }}</strong>
                     <span>收件人：{{ ev.sent_to }}</span>
@@ -2231,7 +2479,7 @@ onMounted(() => {
                       <n-tag :type="statusTagType(r.requires_human ? 'human_review' : r.intent)" size="small" round :bordered="false">
                         {{ r.requires_human ? '转人工' : formatStatus(r.intent) }}
                       </n-tag>
-                      <small>{{ Math.round(r.confidence * 100) }}% · {{ r.created_at?.slice(0, 16) }}</small>
+                      <small>{{ Math.round(r.confidence * 100) }}% · {{ formatTime(r.created_at) }}</small>
                     </div>
                     <blockquote v-if="r.reply_text" class="reply-quote">{{ r.reply_text }}</blockquote>
                     <p>{{ r.summary }}</p>
@@ -2248,62 +2496,6 @@ onMounted(() => {
           </section>
         </div>
 
-        <section v-if="activePage === 'workspace'" class="reply-panel" aria-labelledby="reply-title">
-          <div class="section-title step-title">
-            <span class="step-index">3</span>
-            <div>
-              <h2 id="reply-title">回复理解</h2>
-              <p>判断意向、资料需求和转人工风险</p>
-            </div>
-          </div>
-
-          <div class="reply-grid">
-            <label class="field">
-              <span>关联线索</span>
-              <n-select v-model:value="replyLeadId" :options="replyLeadOptions" filterable />
-            </label>
-
-            <label class="field reply-text">
-              <span>邮件回复</span>
-              <n-input
-                v-model:value="replyText"
-                type="textarea"
-                :autosize="{ minRows: 5, maxRows: 9 }"
-              />
-            </label>
-          </div>
-
-          <n-button
-            class="primary-button"
-            type="primary"
-            size="large"
-            :loading="currentAction === 'reply'"
-            :disabled="loading"
-            @click="analyzeCurrentReply"
-          >
-            <template #icon>
-              <n-icon><MailCheck /></n-icon>
-            </template>
-            {{ currentAction === "reply" ? "理解中..." : "理解回复" }}
-          </n-button>
-
-          <article v-if="analysis" class="analysis-result">
-            <div>
-              <n-tag
-                :type="statusTagType(analysis.requires_human ? 'human_review' : analysis.intent)"
-                round
-                :bordered="false"
-              >
-                {{ analysis.requires_human ? "转人工" : formatStatus(analysis.intent) }}
-              </n-tag>
-              <strong>{{ Math.round(analysis.confidence * 100) }}%</strong>
-            </div>
-            <p>{{ analysis.summary }}</p>
-            <p>{{ analysis.next_action }}</p>
-            <small v-if="selectedLead">关联：{{ selectedLead.company_name }}</small>
-          </article>
-        </section>
-
         <div class="feedback" aria-live="polite">
           <n-alert v-if="notice" class="notice" type="success" :show-icon="false">
             {{ notice }}
@@ -2319,64 +2511,61 @@ onMounted(() => {
           class="settings-page"
           aria-labelledby="settings-title"
         >
-          <div class="settings-grid">
-            <section class="settings-card">
-              <div class="settings-card-head">
-                <div>
-                  <p class="panel-label">邮件同步</p>
-                  <h3>自动同步回复</h3>
-                  <p>定期从 Exchange 收件箱拉取回复，匹配到对应线索并自动分析意向。</p>
-                </div>
-                <n-tag :type="settings.sync_enabled ? 'success' : 'default'" size="small" round :bordered="false">
-                  {{ settings.sync_enabled ? '已开启' : '已关闭' }}
-                </n-tag>
-              </div>
-              <label class="toggle-field">
-                <n-checkbox v-model:checked="settings.sync_enabled">启用自动同步</n-checkbox>
-              </label>
-              <label class="field" v-if="settings.sync_enabled">
-                <span>同步间隔（分钟）</span>
-                <n-input-number v-model:value="settings.sync_interval_minutes" :min="5" :max="1440" />
-              </label>
-              <p class="setting-hint" v-if="settings.sync_enabled && settings.sync_interval_minutes > 0">
-                每 {{ settings.sync_interval_minutes }} 分钟自动扫描收件箱，仅同步新回复。
-              </p>
-            </section>
-
-            <section class="settings-card">
-              <div class="settings-card-head">
-                <div>
-                  <p class="panel-label">AI Agent</p>
-                  <h3>模型与 API 配置</h3>
-                  <p>配置 Agent 使用的 AI 模型、API Key 和后端地址。</p>
-                </div>
-              </div>
-              <div class="settings-agent-grid">
-                <label class="field">
-                  <span>Provider</span>
-                  <n-select v-model:value="agentProviderName" :options="providerOptions" />
-                </label>
-                <label class="field">
-                  <span>API Key</span>
-                  <n-input
-                    v-model:value="settingsAgentKeyInput"
-                    autocomplete="off"
-                    :placeholder="settings.has_agent_key ? settings.agent_key_preview : 'sk-...'"
-                    type="password"
-                    show-password-on="click"
-                  />
-                </label>
-                <label class="field">
-                  <span>模型</span>
-                  <n-input v-model:value="agentModelName" placeholder="deepseek-v4-pro" />
-                </label>
-                <label class="field">
-                  <span>Backend URL</span>
-                  <n-input v-model:value="agentBackendBaseUrl" />
-                </label>
-              </div>
-            </section>
+          <div class="settings-tabs">
+            <button :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
+            <button :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
+            <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
           </div>
+
+          <section v-if="settingsTab === 'email'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">邮箱配置</p>
+                <h3>Exchange 邮件服务</h3>
+                <p>配置 EWS 连接信息，用于发送外联和同步回复。</p>
+              </div>
+              <n-tag :type="settings.email_user ? 'success' : 'default'" size="small" round :bordered="false">
+                {{ settings.email_user ? '已配置' : '未配置' }}
+              </n-tag>
+            </div>
+            <div class="settings-agent-grid">
+              <label class="field"><span>SMTP 服务器</span><n-input v-model:value="settings.email_server" placeholder="mail.microport.com.cn" /></label>
+              <label class="field"><span>邮箱账号</span><n-input v-model:value="settings.email_user" placeholder="OB_OSD@microport.com" /></label>
+              <label class="field"><span>邮箱密码</span><n-input v-model:value="settingsEmailPasswordInput" autocomplete="off" :placeholder="settings.has_email_password ? '已设置 (不显示)' : '输入密码'" type="password" show-password-on="click" /></label>
+            </div>
+          </section>
+
+          <section v-if="settingsTab === 'sync'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">邮件同步</p>
+                <h3>自动同步回复</h3>
+                <p>定期从 Exchange 收件箱拉取回复，匹配到对应线索并自动分析意向。</p>
+              </div>
+              <n-tag :type="settings.sync_enabled ? 'success' : 'default'" size="small" round :bordered="false">
+                {{ settings.sync_enabled ? '已开启' : '已关闭' }}
+              </n-tag>
+            </div>
+            <label class="toggle-field"><n-checkbox v-model:checked="settings.sync_enabled">启用自动同步</n-checkbox></label>
+            <label class="field" v-if="settings.sync_enabled"><span>同步间隔（分钟）</span><n-input-number v-model:value="settings.sync_interval_minutes" :min="5" :max="1440" /></label>
+            <p class="setting-hint" v-if="settings.sync_enabled && settings.sync_interval_minutes > 0">每 {{ settings.sync_interval_minutes }} 分钟自动扫描收件箱，仅同步新回复。</p>
+          </section>
+
+          <section v-if="settingsTab === 'agent'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">AI Agent</p>
+                <h3>模型与 API 配置</h3>
+                <p>配置 Agent 使用的 AI 模型、API Key 和后端地址。</p>
+              </div>
+            </div>
+            <div class="settings-agent-grid">
+              <label class="field"><span>Provider</span><n-select v-model:value="agentProviderName" :options="providerOptions" /></label>
+              <label class="field"><span>API Key</span><n-input v-model:value="settingsAgentKeyInput" autocomplete="off" :placeholder="settings.has_agent_key ? settings.agent_key_preview : 'sk-...'" type="password" show-password-on="click" /></label>
+              <label class="field"><span>模型</span><n-input v-model:value="agentModelName" placeholder="deepseek-v4-pro" /></label>
+              <label class="field"><span>Backend URL</span><n-input v-model:value="agentBackendBaseUrl" /></label>
+            </div>
+          </section>
 
           <div class="settings-actions">
             <n-button
@@ -2387,15 +2576,97 @@ onMounted(() => {
               :disabled="settingsLoading || settingsSaving"
               @click="saveSettings"
             >
-              <template #icon>
-                <n-icon><Save /></n-icon>
-              </template>
+              <template #icon><n-icon><Save /></n-icon></template>
               {{ settingsSaving ? '保存中...' : '保存设置' }}
             </n-button>
           </div>
         </section>
       </main>
     </section>
+
+    <!-- Outreach Preview Modal -->
+    <div
+      v-if="showOutreachPreview"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="showOutreachPreview = false"
+    >
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="外联预览">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">确认发送</p>
+            <h2>外联邮件预览</h2>
+          </div>
+          <button class="icon-only-button" type="button" aria-label="关闭" @click="showOutreachPreview = false">
+            <X :size="20" aria-hidden="true" />
+          </button>
+        </header>
+        <div class="create-lead-body">
+          <div v-if="outreachLoading" class="outreach-loading">
+            <RefreshCw :size="28" class="spin" />
+            <span>AI 正在生成邮件...</span>
+          </div>
+          <article v-for="(p, idx) in outreachPreviews" :key="p.lead_id" class="outreach-preview-card">
+            <div class="outreach-preview-meta">
+              <strong>{{ p.company_name }}</strong>
+              <span>收件人：{{ p.email }}</span>
+            </div>
+            <label class="field"><span>主题</span><n-input v-model:value="outreachPreviews[idx].subject" /></label>
+            <label class="field"><span>正文</span><n-input v-model:value="outreachPreviews[idx].body" type="textarea" :autosize="{ minRows: 4, maxRows: 12 }" /></label>
+          </article>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showOutreachPreview = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :disabled="outreachLoading" :loading="currentAction === 'outreach'" @click="confirmSendOutreach">
+            <template #icon><n-icon><Send /></n-icon></template>
+            确认发送
+          </n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- Create Lead Modal -->
+    <div
+      v-if="showCreateLead"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="showCreateLead = false"
+    >
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="添加线索">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">线索管理</p>
+            <h2>添加线索</h2>
+          </div>
+          <button class="icon-only-button" type="button" aria-label="关闭" @click="showCreateLead = false">
+            <X :size="20" aria-hidden="true" />
+          </button>
+        </header>
+        <div class="create-lead-body">
+          <div class="create-lead-row">
+            <label class="field"><span>公司名称 *</span><n-input v-model:value="newLead.company_name" /></label>
+            <label class="field"><span>国家 *</span><n-input v-model:value="newLead.country" /></label>
+          </div>
+          <div class="create-lead-row">
+            <label class="field"><span>地区 *</span><n-input v-model:value="newLead.region" placeholder="如 Southeast Asia" /></label>
+            <label class="field"><span>网站</span><n-input v-model:value="newLead.website" placeholder="https://" /></label>
+          </div>
+          <div class="create-lead-row">
+            <label class="field"><span>邮箱 *</span><n-input v-model:value="newLead.email" /></label>
+            <label class="field"><span>联系人</span><n-input v-model:value="newLead.contact_name" /></label>
+          </div>
+          <label class="field"><span>类别</span><n-input v-model:value="newLead.category" /></label>
+        </div>
+        <p v-if="createError" class="create-error">{{ createError }}</p>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showCreateLead = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :loading="currentAction === 'search'" @click="createLead">
+            <template #icon><n-icon><Plus /></n-icon></template>
+            创建
+          </n-button>
+        </footer>
+      </section>
+    </div>
 
     <div
       v-if="sourcePreviewLead"
@@ -2494,6 +2765,47 @@ onMounted(() => {
             </template>
           </div>
         </template>
+      </section>
+    </div>
+
+    <!-- Agent Guide Modal -->
+    <div
+      v-if="agentGuideOpen"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="agentGuideOpen = false"
+    >
+      <section class="guide-modal" role="dialog" aria-modal="true" aria-label="使用指南">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">使用指南</p>
+            <h2>渠道拓展 Agent 工作流</h2>
+          </div>
+          <button class="icon-only-button" type="button" aria-label="关闭" @click="agentGuideOpen = false">
+            <X :size="20" aria-hidden="true" />
+          </button>
+        </header>
+        <div class="guide-body">
+          <div class="guide-section">
+            <h3>Step 1 — 建立线索库</h3>
+            <p>在任务框描述目标：产品、国家、渠道类型。Agent 会自动扩展搜索词、调用搜索引擎、提取公开邮箱，并去重入库。</p>
+            <p>示例：<code>帮我在德国和新加坡找骨科植入物经销商，要求有公开邮箱和官网证据</code></p>
+          </div>
+          <div class="guide-section">
+            <h3>Step 2 — 发送外联</h3>
+            <p>Agent 生成的邮件会进入<strong>线索管理 → 待审核队列</strong>，需人工预览和批准后才会真实发送。</p>
+            <p>也可手动勾选线索，点击「发送外联」预览 AI 生成的邮件模板，编辑后确认发送。</p>
+          </div>
+          <div class="guide-section">
+            <h3>Step 3 — 分析回复</h3>
+            <p>点击「同步回复」从收件箱拉取真实回复，AI 自动分析意图（感兴趣 / 拒绝 / 复杂 / 待审核）。</p>
+            <p>点击线索行查看完整沟通历史、回复原文和分析结果，可在详情中修改状态和备注。</p>
+          </div>
+          <div class="guide-section">
+            <h3>设置</h3>
+            <p>在「设置」页面配置邮箱连接、自动同步频率和 AI 模型参数。启用自动同步后，系统定期扫描收件箱。</p>
+          </div>
+        </div>
       </section>
     </div>
   </div>

@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 
 import type {
+  AddLeadsInput,
   AnalyzeReplyInput,
   BackendRequestOptions,
   BackendClient,
@@ -16,6 +17,35 @@ type ToolPayload = Record<string, unknown>;
 
 export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>) {
   return [
+    defineTool({
+      name: "add_leads",
+      label: "Add Leads",
+      description:
+        "Save manually discovered distributor leads to the database. Use when you found leads via web_search/fetch_url and want to persist them.",
+      parameters: Type.Object({
+        leads: Type.Array(
+          Type.Object({
+            company_name: Type.String({ description: "Company name" }),
+            region: Type.String({ description: "Region like Europe, North America" }),
+            country: Type.String({ description: "Country" }),
+            website: Type.Optional(Type.String({ description: "Website URL" })),
+            contact_name: Type.Optional(Type.String({ description: "Contact person or department" })),
+            email: Type.Optional(Type.String({ description: "Email address" })),
+            category: Type.Optional(Type.String({ description: "Distributor category" })),
+            match_reason: Type.Optional(Type.String({ description: "Why this lead matches" })),
+            source: Type.Optional(Type.String({ description: "Source URL or note" })),
+          }),
+          { description: "Array of leads to save" }
+        ),
+      }),
+      execute: async (_toolCallId, params, signal) =>
+        toolResult(
+          await client.addLeads(
+            params as unknown as AddLeadsInput,
+            signalOptions(signal),
+          ),
+        ),
+    }),
     defineTool({
       name: "get_product_profile",
       label: "Get Product Profile",
@@ -190,5 +220,6 @@ type BusinessMethod =
   | "fetchUrl"
   | "searchLeads"
   | "listLeads"
+  | "addLeads"
   | "createOutreachRecords"
   | "analyzeReply";

@@ -27,6 +27,7 @@ from app.schemas import (
     AgentChatRequest,
     AgentChatResponse,
     EmailTestRequest,
+    LeadCreateRequest,
     LeadUpdateRequest,
     OutreachRequest,
     ReplyAnalysisRequest,
@@ -36,6 +37,7 @@ from app.schemas import (
 )
 from app.services import (
     CandidateLead,
+    RenderedEmail,
     analyze_reply,
     generate_candidate_leads,
     render_email,
@@ -129,16 +131,82 @@ def create_app() -> FastAPI:
                 product_keywords=request.product_keywords,
                 max_results=request.max_results,
             )
+
+        # Dedup against existing leads
+        candidates = _filter_existing_leads(candidates)
+
         saved = [db.insert_lead(candidate) for candidate in candidates]
         return {"created_count": len(saved), "leads": saved}
+
+    @app.post("/leads/batch", status_code=201)
+    def batch_create_leads(request: list[LeadCreateRequest]) -> dict[str, object]:
+        """Batch create leads (used by Agent to save discovered leads)."""
+        created = []
+        for item in request:
+            lead = CandidateLead(
+                company_name=item.company_name,
+                region=item.region,
+                country=item.country,
+                website=item.website,
+                contact_name=item.contact_name,
+                email=item.email,
+                category=item.category,
+                match_reason=item.match_reason,
+                source=item.source,
+                score=50,
+                status="new",
+                notes="Agent discovered",
+            )
+            created.append(db.insert_lead(lead))
+        return {"created_count": len(created), "leads": created}
+
+    @app.post("/leads", status_code=201)
+    def create_lead(request: LeadCreateRequest) -> dict[str, object]:
+        """Manually create a lead."""
+        lead = CandidateLead(
+            company_name=request.company_name,
+            region=request.region,
+            country=request.country,
+            website=request.website,
+            contact_name=request.contact_name,
+            email=request.email,
+            category=request.category,
+            match_reason=request.match_reason,
+            source=request.source,
+            score=50,
+            status="new",
+            notes="",
+        )
+        return db.insert_lead(lead)
+
+    @app.delete("/leads/{lead_id}")
+    def delete_lead(lead_id: int) -> dict[str, object]:
+        """Delete a lead and its associated outreach events and reply analyses."""
+        if not db.delete_lead(lead_id):
+            raise HTTPException(status_code=404, detail="Lead not found")
+        return {"ok": True, "deleted": lead_id}
+
+    @app.post("/leads/batch-delete")
+    def batch_delete_leads(request: dict[str, object]) -> dict[str, object]:
+        """Delete multiple leads at once."""
+        lead_ids = request.get("lead_ids", [])
+        if not isinstance(lead_ids, list) or not lead_ids:
+            raise HTTPException(status_code=400, detail="lead_ids required")
+        deleted = 0
+        for lid in lead_ids:
+            if isinstance(lid, (int, float)) and db.delete_lead(int(lid)):
+                deleted += 1
+        return {"ok": True, "deleted": deleted}
 
     @app.get("/leads")
     def list_leads(
         region: str | None = Query(default=None),
         status: str | None = Query(default=None),
         q: str | None = Query(default=None),
+        sort: str = Query(default="id"),
+        order: str = Query(default="desc"),
     ) -> dict[str, object]:
-        leads = db.list_leads(region=region, status=status, q=q)
+        leads = db.list_leads(region=region, status=status, q=q, sort=sort, order=order)
         return {"total": len(leads), "leads": leads}
 
     @app.get("/sources/preview")
@@ -188,7 +256,100 @@ def create_app() -> FastAPI:
 
     @app.post("/campaigns/outreach-records", status_code=201)
     def create_outreach_records(request: OutreachRequest) -> dict[str, object]:
-        return _create_outreach_records(request)
+        return _create_outreach_records(request, source=request.source)
+
+    @app.post("/campaigns/outreach-preview")
+    def preview_outreach(request: OutreachRequest) -> dict[str, object]:
+        """Generate email previews without sending."""
+        previews: list[dict[str, object]] = []
+        for lead_id in request.lead_ids:
+            lead = db.get_lead(lead_id)
+            if lead is None:
+                raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+            rendered = render_email(_lead_from_record(lead))
+            previews.append({
+                "lead_id": lead_id,
+                "company_name": lead["company_name"],
+                "email": lead["email"],
+                "subject": rendered.subject,
+                "body": rendered.body,
+            })
+        return {"previews": previews}
+
+    @app.get("/campaigns/drafts")
+    def list_drafts() -> dict[str, object]:
+        """List all pending draft outreach events (created by Agent, awaiting approval)."""
+        drafts = db.list_draft_events()
+        return {"total": len(drafts), "drafts": drafts}
+
+    @app.post("/campaigns/drafts/{event_id}/approve")
+    def approve_draft(event_id: int) -> dict[str, object]:
+        """Approve a draft and send the email via EWS."""
+        event = db.approve_outreach_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+
+        # Actually send the email
+        if email_is_configured():
+            result = send_email(
+                to=str(event["sent_to"]),
+                subject=str(event["subject"]),
+                body=str(event["body"]),
+            )
+            if result.success:
+                db.approve_outreach_event(event_id)  # already approved, just re-read
+                return {"ok": True, "event": event, "sent": True}
+            else:
+                # Mark as send_failed
+                with db.connect() as conn:
+                    conn.execute(
+                        "UPDATE outreach_events SET status = 'send_failed' WHERE id = ?",
+                        (event_id,),
+                    )
+                return {"ok": False, "event": event, "sent": False, "error": result.error}
+
+        return {"ok": True, "event": event, "sent": False, "note": "Email not configured"}
+
+    @app.post("/campaigns/drafts/{event_id}/reject")
+    def reject_draft(event_id: int) -> dict[str, object]:
+        """Reject a draft without sending."""
+        event = db.reject_outreach_event(event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return {"ok": True, "event": event}
+
+    @app.post("/campaigns/drafts/approve-all")
+    def approve_all_drafts() -> dict[str, object]:
+        """Approve all pending drafts and send them."""
+        drafts = db.list_draft_events()
+        results: list[dict[str, object]] = []
+        for draft in drafts:
+            event_id = int(draft["id"])
+            db.approve_outreach_event(event_id)
+            sent = False
+            error = ""
+            if email_is_configured():
+                result = send_email(
+                    to=str(draft["sent_to"]),
+                    subject=str(draft["subject"]),
+                    body=str(draft["body"]),
+                )
+                sent = result.success
+                error = result.error
+                if not sent:
+                    with db.connect() as conn:
+                        conn.execute(
+                            "UPDATE outreach_events SET status = 'send_failed' WHERE id = ?",
+                            (event_id,),
+                        )
+            results.append({
+                "id": event_id,
+                "company": draft.get("company_name", ""),
+                "email": draft["sent_to"],
+                "sent": sent,
+                "error": error,
+            })
+        return {"ok": True, "total": len(results), "results": results}
 
     @app.post("/email/test")
     def email_test(request: EmailTestRequest) -> dict[str, object]:
@@ -224,12 +385,19 @@ def create_app() -> FastAPI:
 
     @app.post("/campaigns/send-demo", status_code=201, include_in_schema=False)
     def send_legacy_demo(request: OutreachRequest) -> dict[str, object]:
-        return _create_outreach_records(request)
+        return _create_outreach_records(request, source="manual")
 
-    def _create_outreach_records(request: OutreachRequest) -> dict[str, object]:
+    def _create_outreach_records(
+        request: OutreachRequest,
+        *,
+        source: str = "manual",
+    ) -> dict[str, object]:
         events = []
         send_enabled = email_is_configured()
         send_errors: list[dict[str, object]] = []
+
+        # Agent source: NEVER send, always draft
+        should_send = send_enabled and source != "agent"
 
         for lead_id in request.lead_ids:
             lead = db.get_lead(lead_id)
@@ -242,8 +410,18 @@ def create_app() -> FastAPI:
                 )
             rendered = render_email(_lead_from_record(lead))
 
-            # Record the outreach event
-            if send_enabled:
+            # Apply custom edits from preview
+            custom_key = str(lead_id)
+            if request.custom_emails and custom_key in request.custom_emails:
+                custom = request.custom_emails[custom_key]
+                rendered = RenderedEmail(
+                    sent_to=rendered.sent_to,
+                    subject=str(custom.get("subject", rendered.subject)),
+                    body=str(custom.get("body", rendered.body)),
+                    region=rendered.region,
+                )
+
+            if should_send:
                 send_result = send_email(
                     to=rendered.sent_to,
                     subject=rendered.subject,
@@ -251,11 +429,12 @@ def create_app() -> FastAPI:
                 )
                 if send_result.success:
                     event = db.insert_outreach_event(
-                        lead_id, rendered, status="sent", message_id=send_result.message_id
+                        lead_id, rendered, status="sent",
+                        message_id=send_result.message_id, source=source,
                     )
                 else:
                     event = db.insert_outreach_event(
-                        lead_id, rendered, status="send_failed"
+                        lead_id, rendered, status="send_failed", source=source,
                     )
                     send_errors.append({
                         "lead_id": lead_id,
@@ -263,15 +442,19 @@ def create_app() -> FastAPI:
                         "error": send_result.error,
                     })
             else:
-                event = db.insert_outreach_event(lead_id, rendered)
+                status = "draft" if source == "agent" else "recorded"
+                event = db.insert_outreach_event(lead_id, rendered, status=status, source=source)
 
             events.append(event)
 
         response: dict[str, object] = {
             "sent_count": len(events),
             "events": events,
-            "email_delivery": send_enabled,
+            "email_delivery": should_send,
+            "source": source,
         }
+        if source == "agent":
+            response["note"] = "Agent-created outreach saved as draft. Review and approve to send."
         if send_errors:
             response["send_errors"] = send_errors
         return response
@@ -399,7 +582,7 @@ def create_app() -> FastAPI:
 
     @app.get("/settings")
     def get_settings() -> dict[str, object]:
-        """Return all settings including sync frequency and agent config."""
+        """Return all settings including sync frequency, agent config, and email."""
         settings = db.get_all_settings()
         return {
             "sync_enabled": settings.get("sync_enabled", "false") == "true",
@@ -409,18 +592,26 @@ def create_app() -> FastAPI:
             "has_agent_key": bool(settings.get("agent_key", "")),
             "agent_key_preview": _mask_key(settings.get("agent_key", "")),
             "backend_base_url": settings.get("backend_base_url", "http://localhost:8000"),
+            "email_server": settings.get("email_server", "mail.microport.com.cn"),
+            "email_user": settings.get("email_user", ""),
+            "has_email_password": bool(settings.get("email_password", "")),
         }
 
     @app.put("/settings")
     def save_settings(request: dict[str, object]) -> dict[str, object]:
-        """Save settings. Accepts partial updates."""
+        """Save settings. Accepts partial updates. Applies email config immediately."""
         for key in (
             "sync_enabled", "sync_interval_minutes",
             "agent_provider", "agent_model", "agent_key", "backend_base_url",
+            "email_server", "email_user", "email_password",
         ):
             if key in request:
                 val = request[key]
                 db.set_setting(key, str(val).lower() if isinstance(val, bool) else str(val))
+
+        # Reload email config so changes take effect immediately
+        from app.email_service import reload_config
+        reload_config()
 
         return get_settings()
 
@@ -526,6 +717,45 @@ def _reply_already_synced(message_id: str) -> bool:
             (message_id,),
         ).fetchone()
         return bool(row and row[0] > 0)
+
+
+def _filter_existing_leads(candidates: list[CandidateLead]) -> list[CandidateLead]:
+    """Remove candidates that already exist in the database (by domain or email)."""
+    existing = db.list_leads()
+    existing_domains: set[str] = set()
+    existing_emails: set[str] = set()
+    existing_names: set[str] = set()
+
+    for lead in existing:
+        email = str(lead.get("email", "")).strip().lower()
+        website = str(lead.get("website", "")).strip().lower()
+        name = str(lead.get("company_name", "")).strip().lower()
+
+        if email:
+            existing_emails.add(email)
+        if website:
+            domain = website.split("://")[-1].split("/")[0].removeprefix("www.")
+            if domain:
+                existing_domains.add(domain)
+        if name:
+            existing_names.add(name)
+
+    filtered: list[CandidateLead] = []
+    for c in candidates:
+        c_email = c.email.strip().lower()
+        c_domain = c.website.split("://")[-1].split("/")[0].removeprefix("www.").lower() if c.website else ""
+        c_name = c.company_name.strip().lower()
+
+        if c_email and c_email in existing_emails:
+            continue
+        if c_domain and c_domain in existing_domains:
+            continue
+        if c_name and c_name in existing_names:
+            continue
+
+        filtered.append(c)
+
+    return filtered
 
 
 def _is_auto_reply(subject: str, body: str) -> bool:

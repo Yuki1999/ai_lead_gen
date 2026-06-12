@@ -22,6 +22,20 @@ export interface ListLeadsInput {
   q?: string;
 }
 
+export interface AddLeadsInput {
+  leads: Array<{
+    company_name: string;
+    region: string;
+    country: string;
+    website?: string;
+    contact_name?: string;
+    email?: string;
+    category?: string;
+    match_reason?: string;
+    source?: string;
+  }>;
+}
+
 export interface CreateOutreachRecordsInput {
   lead_ids: number[];
 }
@@ -98,7 +112,17 @@ export class BackendClient {
     input: CreateOutreachRecordsInput,
     options: BackendRequestOptions = {},
   ): Promise<JsonObject> {
-    return this.#request("POST", "/campaigns/outreach-records", input, options);
+    return this.#request("POST", "/campaigns/outreach-records", {
+      ...input,
+      source: "agent",
+    }, options);
+  }
+
+  addLeads(
+    input: AddLeadsInput,
+    options: BackendRequestOptions = {},
+  ): Promise<JsonObject> {
+    return this.#request("POST", "/leads/batch", input.leads, options);
   }
 
   analyzeReply(

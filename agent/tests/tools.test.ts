@@ -19,6 +19,7 @@ type MockClient = Pick<
   | "fetchUrl"
   | "searchLeads"
   | "listLeads"
+  | "addLeads"
   | "createOutreachRecords"
   | "analyzeReply"
 >;
@@ -271,6 +272,7 @@ function mockClient(overrides: Partial<MockClient> = {}): MockClient {
     searchLeads: async () => ({ created_count: 0 }),
     listLeads: async () => ({ leads: [] }),
     createOutreachRecords: async () => ({ created_count: 0 }),
+    addLeads: async () => ({ created_count: 0 }),
     analyzeReply: async () => ({ intent: "unknown" }),
     ...overrides,
   };
