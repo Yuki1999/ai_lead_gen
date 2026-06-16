@@ -13,11 +13,12 @@ from app import db
 from app.auth import require_auth, verify_credentials, create_access_token, decode_access_token, SERVICE_TOKEN
 
 _logger = logging.getLogger("medbot")
-from app.agent_config import agent_config_status, update_agent_config
+from app.agent_config import agent_config_status, test_agent_connection, update_agent_config
 from app.agent_proxy import AgentProxyError, forward_agent_chat, forward_agent_chat_stream
 from app.email_service import (
     fetch_inbox_replies,
     is_configured as email_is_configured,
+    list_attachments,
     send_batch,
     send_email,
     test_connection,
@@ -28,6 +29,8 @@ from app.schemas import (
     AgentConfigUpdate,
     AgentChatRequest,
     AgentChatResponse,
+    AgentTestConnectionRequest,
+    AgentTestConnectionResponse,
     AuthVerifyResponse,
     EmailTestRequest,
     LeadCreateRequest,
@@ -41,10 +44,12 @@ from app.schemas import (
     WebSearchRequest,
 )
 from app.services import (
+    DEFAULT_EMAIL_TEMPLATE,
     CandidateLead,
     RenderedEmail,
     analyze_reply,
     generate_candidate_leads,
+    generate_followup,
     render_email,
 )
 from app.web_search import discover_real_prospects, fetch_source_preview, search_web
@@ -90,6 +95,10 @@ def create_app() -> FastAPI:
 
         # Skip auth if disabled (e.g., for tests)
         if _AUTH_DISABLED:
+            return await call_next(request)
+
+        # Allow CORS preflight requests without authentication
+        if request.method == "OPTIONS":
             return await call_next(request)
 
         # Allow public paths without authentication
@@ -184,7 +193,17 @@ def create_app() -> FastAPI:
             api_key=request.api_key,
             openai_api_key=request.openai_api_key,
             model_name=request.model_name,
+            api_base_url=request.api_base_url,
             backend_base_url=request.backend_base_url,
+        )
+
+    @app.post("/agent/test-connection", response_model=AgentTestConnectionResponse)
+    def agent_test_connection(request: AgentTestConnectionRequest) -> dict[str, object]:
+        return test_agent_connection(
+            provider_name=request.provider_name,
+            api_key=request.api_key,
+            model_name=request.model_name,
+            api_base_url=request.api_base_url,
         )
 
     @app.post("/leads/search", status_code=201)
@@ -277,9 +296,12 @@ def create_app() -> FastAPI:
         q: str | None = Query(default=None),
         sort: str = Query(default="id"),
         order: str = Query(default="desc"),
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=20, ge=1, le=100),
     ) -> dict[str, object]:
-        leads = db.list_leads(region=region, status=status, q=q, sort=sort, order=order)
-        return {"total": len(leads), "leads": leads}
+        total = db.count_leads(region=region, status=status, q=q)
+        leads = db.list_leads(region=region, status=status, q=q, sort=sort, order=order, limit=limit, offset=offset)
+        return {"total": total, "leads": leads}
 
     @app.get("/sources/preview")
     def source_preview(
@@ -319,12 +341,84 @@ def create_app() -> FastAPI:
             "reply_analyses": replies,
         }
 
+    @app.get("/leads/{lead_id}")
+    def get_lead(lead_id: int) -> dict[str, object]:
+        lead = db.get_lead(lead_id)
+        if lead is None:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        return lead
+
     @app.patch("/leads/{lead_id}")
     def update_lead(lead_id: int, request: LeadUpdateRequest) -> dict[str, object]:
-        updated = db.update_lead(lead_id, status=request.status, notes=request.notes)
+        updated = db.update_lead(
+            lead_id,
+            company_name=request.company_name,
+            region=request.region,
+            country=request.country,
+            website=request.website,
+            contact_name=request.contact_name,
+            email=request.email,
+            category=request.category,
+            match_reason=request.match_reason,
+            source=request.source,
+            score=request.score,
+            status=request.status,
+            notes=request.notes,
+        )
         if updated is None:
             raise HTTPException(status_code=404, detail="Lead not found")
         return updated
+
+    @app.post("/campaigns/custom-send", status_code=201)
+    def custom_send(request: dict[str, object]) -> dict[str, object]:
+        """Send a single custom email (自拟定) to a lead — no template, user-written content."""
+        lead_id = request.get("lead_id")
+        subject = str(request.get("subject", "")).strip()
+        body = str(request.get("body", "")).strip()
+        attach_names = request.get("attachments") or []
+
+        if not lead_id or not subject or not body:
+            raise HTTPException(status_code=422, detail="lead_id, subject, body are required")
+
+        lead = db.get_lead(int(lead_id))
+        if lead is None:
+            raise HTTPException(status_code=404, detail=f"Lead {lead_id} not found")
+        if not str(lead["email"]).strip():
+            raise HTTPException(status_code=422, detail=f"Lead {lead_id} has no email")
+
+        rendered = RenderedEmail(
+            sent_to=str(lead["email"]),
+            subject=subject,
+            body=body,
+            region=str(lead.get("region", "")),
+        )
+
+        send_enabled = email_is_configured()
+        if send_enabled:
+            send_result = send_email(
+                to=rendered.sent_to, subject=rendered.subject, body=rendered.body,
+                attachments=list(attach_names) if attach_names else None,
+            )
+            if send_result.success:
+                event = db.insert_outreach_event(
+                    int(lead_id), rendered, status="sent",
+                    message_id=send_result.message_id, source="custom",
+                )
+            else:
+                event = db.insert_outreach_event(
+                    int(lead_id), rendered, status="send_failed", source="custom",
+                )
+        else:
+            event = db.insert_outreach_event(int(lead_id), rendered, status="draft", source="custom")
+
+        return {
+            "ok": True,
+            "sent_count": 1,
+            "events": [event],
+            "email_delivery": send_enabled,
+            "source": "custom",
+            "note": "Custom email sent" if send_enabled else "Custom email saved as draft",
+        }
 
     @app.post("/campaigns/outreach-records", status_code=201)
     def create_outreach_records(request: OutreachRequest) -> dict[str, object]:
@@ -439,6 +533,12 @@ def create_app() -> FastAPI:
             "message_id": result.message_id,
             "error": result.error,
         }
+
+    @app.get("/attachments")
+    def get_attachments() -> dict[str, object]:
+        """List available standard attachment files for follow-up emails."""
+        from app.email_service import ATTACHMENTS_DIR
+        return {"files": list_attachments(), "dir": str(ATTACHMENTS_DIR)}
 
     @app.get("/email/status")
     def email_status() -> dict[str, object]:
@@ -652,6 +752,26 @@ def create_app() -> FastAPI:
             analysis=analysis,
         )
 
+    @app.post("/replies/followup", status_code=201)
+    def generate_followup_endpoint(request: ReplyAnalysisRequest) -> dict[str, object]:
+        """Generate a follow-up email draft based on a customer reply."""
+        lead_id = request.lead_id
+        lead = db.get_lead(lead_id) if lead_id else None
+        if lead_id is not None and lead is None:
+            raise HTTPException(status_code=404, detail="Lead not found")
+
+        candidate = _lead_from_record(lead) if lead else CandidateLead(
+            company_name="Unknown", region="", country="", website="",
+            contact_name="", email="", category="", match_reason="",
+            source="", score=0, status="new", notes="",
+        )
+
+        result = generate_followup(candidate, request.reply_text)
+        if result is None:
+            raise HTTPException(status_code=503, detail="AI follow-up generation unavailable")
+
+        return {"subject": result.subject, "body": result.body, "sent_to": result.sent_to}
+
     @app.get("/settings")
     def get_settings() -> dict[str, object]:
         """Return all settings including sync frequency, agent config, and email."""
@@ -663,10 +783,12 @@ def create_app() -> FastAPI:
             "agent_model": settings.get("agent_model", ""),
             "has_agent_key": bool(settings.get("agent_key", "")),
             "agent_key_preview": _mask_key(settings.get("agent_key", "")),
+            "api_base_url": settings.get("api_base_url", ""),
             "backend_base_url": settings.get("backend_base_url", "http://localhost:8000"),
             "email_server": settings.get("email_server", "mail.microport.com.cn"),
             "email_user": settings.get("email_user", ""),
             "has_email_password": bool(settings.get("email_password", "")),
+            "email_template": settings.get("email_template", "") or DEFAULT_EMAIL_TEMPLATE,
         }
 
     @app.put("/settings")
@@ -674,8 +796,8 @@ def create_app() -> FastAPI:
         """Save settings. Accepts partial updates. Applies email config immediately."""
         for key in (
             "sync_enabled", "sync_interval_minutes",
-            "agent_provider", "agent_model", "agent_key", "backend_base_url",
-            "email_server", "email_user", "email_password",
+            "agent_provider", "agent_model", "agent_key", "api_base_url", "backend_base_url",
+            "email_server", "email_user", "email_password", "email_template",
         ):
             if key in request:
                 val = request[key]

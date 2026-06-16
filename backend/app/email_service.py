@@ -16,16 +16,21 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from exchangelib import (
     Account,
     Configuration,
     Credentials,
     DELEGATE,
+    FileAttachment,
     HTMLBody,
     Mailbox,
     Message,
 )
+
+# Directory for standard marketing attachments
+ATTACHMENTS_DIR = Path(__file__).resolve().parent.parent / "attachments"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -134,6 +139,7 @@ def send_email(
     body: str,
     html: bool = False,
     cc: list[str] | None = None,
+    attachments: list[str] | None = None,
 ) -> SendResult:
     """Send a single email via Exchange EWS.
 
@@ -143,6 +149,7 @@ def send_email(
         body: Plain-text or HTML body.
         html: If True, treat body as HTML.
         cc: Optional list of CC recipients.
+        attachments: Optional list of filenames to attach (looked up in ATTACHMENTS_DIR).
 
     Returns:
         SendResult with success status and error details.
@@ -165,6 +172,21 @@ def send_email(
             kwargs["cc_recipients"] = cc
 
         msg = Message(**kwargs)
+
+        # Attach files
+        if attachments:
+            for filename in attachments:
+                filepath = (ATTACHMENTS_DIR / filename).resolve()
+                # Security: only allow files within ATTACHMENTS_DIR
+                if not str(filepath).startswith(str(ATTACHMENTS_DIR.resolve())):
+                    continue
+                if not filepath.is_file():
+                    continue
+                with open(filepath, "rb") as fh:
+                    content = fh.read()
+                attachment = FileAttachment(name=filename, content=content)
+                msg.attach(attachment)
+
         msg.send()
 
         return SendResult(
@@ -328,6 +350,16 @@ def fetch_inbox_replies(*, max_count: int = 30) -> list[InboxReply]:
         )
 
     return replies
+
+
+def list_attachments() -> list[str]:
+    """Return a sorted list of available attachment filenames."""
+    if not ATTACHMENTS_DIR.is_dir():
+        return []
+    return sorted(
+        f.name for f in ATTACHMENTS_DIR.iterdir()
+        if f.is_file() and not f.name.startswith(".")
+    )
 
 
 class EmailNotConfiguredError(RuntimeError):

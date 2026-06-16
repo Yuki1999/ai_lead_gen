@@ -32,6 +32,16 @@ class LeadCreateRequest(BaseModel):
 
 
 class LeadUpdateRequest(BaseModel):
+    company_name: str | None = Field(default=None, min_length=1, max_length=200)
+    region: str | None = Field(default=None, min_length=1, max_length=100)
+    country: str | None = Field(default=None, min_length=1, max_length=100)
+    website: str | None = Field(default=None, max_length=500)
+    contact_name: str | None = Field(default=None, max_length=100)
+    email: str | None = Field(default=None, max_length=320)
+    category: str | None = Field(default=None, max_length=200)
+    match_reason: str | None = Field(default=None, max_length=1000)
+    source: str | None = Field(default=None, max_length=500)
+    score: int | None = Field(default=None, ge=0, le=100)
     status: str | None = Field(default=None, min_length=2, max_length=40)
     notes: str | None = Field(default=None, max_length=2000)
 
@@ -63,6 +73,7 @@ class AgentConfigUpdate(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     openai_api_key: str | None = Field(default=None, max_length=4096)
     model_name: str | None = Field(default=None, min_length=2, max_length=120)
+    api_base_url: str | None = Field(default=None, max_length=500)
     backend_base_url: str | None = Field(default=None, min_length=8, max_length=500)
 
 
@@ -73,6 +84,7 @@ class AgentConfigResponse(BaseModel):
     has_openai_api_key: bool
     openai_api_key_preview: str | None = None
     model_name: str
+    api_base_url: str
     backend_base_url: str
     agent_env_path: str
     restart_required: bool = False
@@ -92,6 +104,22 @@ class LoginResponse(BaseModel):
 class AuthVerifyResponse(BaseModel):
     username: str
     valid: bool = True
+
+
+class AgentTestConnectionRequest(BaseModel):
+    provider_name: str = Field(min_length=2, max_length=80)
+    api_key: str = Field(min_length=3, max_length=4096)
+    model_name: str = Field(min_length=2, max_length=120)
+    api_base_url: str | None = Field(default=None, max_length=500)
+
+
+class AgentTestConnectionResponse(BaseModel):
+    ok: bool
+    latency_ms: int
+    provider: str
+    model: str
+    message: str
+    error: str | None = None
 
 
 class EmailTestRequest(BaseModel):

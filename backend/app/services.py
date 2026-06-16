@@ -1,6 +1,28 @@
 from dataclasses import dataclass
 from itertools import cycle
 
+DEFAULT_EMAIL_TEMPLATE = """\
+Subject: [Role] Introduction – MEDBOT NaviBot Skywalker Orthopedic Robot for [Target Market]
+
+Dear [Name],
+
+[IfDistributor]We understand you have strong relationships with high-volume orthopedic centers and KOLs in [Target Market]. MEDBOT is seeking regional distribution partners to introduce the NaviBot Skywalker into the [Target Market] market.[/IfDistributor]
+
+[IfBuyer]We understand your center is committed to improving joint replacement outcomes. MEDBOT's NaviBot Skywalker is a surgical robotics platform designed for high-compatibility joint reconstruction.[/IfBuyer]
+
+Common product description (for both):
+The system offers:
+- Sub-millimeter accuracy
+- Personalized preoperative planning (CT-based)
+- Integrated cutting block for efficient osteotomy
+
+If you are interested, please reply to this email and a dedicated person will contact you. We can then learn about the current joint replacement landscape in [Target Market], your clinical training workflows and KOL networks, and explore potential distribution or collaboration models.
+
+Thank you for your time.
+Best regards,
+SkyWalker Sales Team
+MEDBOT"""
+
 
 @dataclass(frozen=True)
 class CandidateLead:
@@ -83,31 +105,71 @@ def generate_candidate_leads(
 
 
 def render_email(lead: CandidateLead) -> RenderedEmail:
-    """Generate outreach email. Uses AI if agent is configured, otherwise falls back to template."""
-    ai_result = _try_ai_email(lead)
+    """Generate outreach email using template + LLM variable filling."""
+    from app.db import get_all_settings
+    settings = get_all_settings()
+    template = settings.get("email_template", "").strip() or DEFAULT_EMAIL_TEMPLATE
+
+    ai_result = _fill_template_with_llm(lead, template)
     if ai_result:
         return ai_result
-    return _render_template_email(lead)
+    return _fill_template_simple(lead, template)
 
 
-def _render_template_email(lead: CandidateLead) -> RenderedEmail:
-    subject = f"{lead.region} partnership discussion for SkyWalker TKA robotics"
-    body = (
-        f"Hi {lead.contact_name},\n\n"
-        f"I am reaching out because {lead.company_name} appears active in {lead.country}'s "
-        f"{lead.category} channel. We are mapping overseas partners for the SkyWalker Robotic "
-        "Platform Total Knee Application, a CT-based orthopedic robotics system for TKA workflows, "
-        "patient-specific planning, intra-op adjustment, and robotically located cutting planes.\n\n"
-        "If this is relevant, we can share an introductory product brief, product video, regulatory "
-        "status overview, and a short partner qualification form.\n\n"
-        "Best regards,\n"
-        "Overseas Business Development Team"
-    )
+def _fill_template_simple(lead: CandidateLead, template: str) -> RenderedEmail:
+    """Fill template variables without LLM (fallback when AI unavailable)."""
+    import re
+
+    category_lower = lead.category.lower() if lead.category else ""
+    is_distributor = any(kw in category_lower for kw in ["distributor", "dealer", "reseller", "distribution", "代理"])
+
+    role = "Distributor" if is_distributor else "Buyer"
+
+    # Remove condition blocks for the irrelevant role
+    if is_distributor:
+        template = re.sub(r"\[IfBuyer\].*?\[/IfBuyer\]", "", template, flags=re.DOTALL)
+        template = re.sub(r"\[/IfDistributor\]", "", template)
+        template = re.sub(r"\[IfDistributor\]", "", template)
+    else:
+        template = re.sub(r"\[IfDistributor\].*?\[/IfDistributor\]", "", template, flags=re.DOTALL)
+        template = re.sub(r"\[/IfBuyer\]", "", template)
+        template = re.sub(r"\[IfBuyer\]", "", template)
+
+    name = lead.contact_name.strip() if lead.contact_name else "Sir/Madam"
+    country = lead.country or lead.region
+    company = lead.company_name
+
+    template = template.replace("[Name]", name)
+    template = template.replace("[Role]", role)
+    template = template.replace("[Target Market]", country)
+    template = template.replace("[Company]", company)
+
+    subject = ""
+    body = template
+    if template.lower().startswith("subject:"):
+        lines = template.split("\n", 1)
+        subject = lines[0][8:].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+
     return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
 
 
-def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
-    """Generate email using the configured AI agent. Returns None on failure."""
+def _resolve_llm_api_url(settings: dict[str, str]) -> str | None:
+    """Resolve the chat completions endpoint. Uses api_base_url if configured, otherwise provider default."""
+    provider = settings.get("agent_provider", "").lower()
+    custom_base = settings.get("api_base_url", "").strip().rstrip("/")
+    if custom_base:
+        return f"{custom_base}/chat/completions"
+
+    if provider == "openai":
+        return "https://api.openai.com/v1/chat/completions"
+    if provider == "deepseek" or provider:
+        return "https://api.deepseek.com/chat/completions"
+    return None
+
+
+def _fill_template_with_llm(lead: CandidateLead, template: str) -> RenderedEmail | None:
+    """Use LLM to fill template variables (including [Role] determination). Returns None on failure."""
     try:
         from app.db import get_all_settings
         settings = get_all_settings()
@@ -118,19 +180,43 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
         if not api_key or not provider:
             return None
 
-        if provider == "deepseek":
-            api_url = "https://api.deepseek.com/v1/chat/completions"
-            # deepseek-chat is more reliable for structured JSON output
-            if "v4" in model or "pro" in model:
-                model = "deepseek-chat"
-        elif provider == "openai":
-            api_url = "https://api.openai.com/v1/chat/completions"
-        else:
-            api_url = f"https://api.deepseek.com/v1/chat/completions"
+        api_url = _resolve_llm_api_url(settings)
+        if not api_url:
+            return None
+
+        if provider == "deepseek" and ("v4" in model or "pro" in model):
             model = "deepseek-chat"
 
-        import requests
-        prompt = _build_email_prompt(lead)
+        import requests, json as json_mod, re as re_mod
+
+        system_prompt = (
+            "You are an overseas BD email assistant for MEDBOT. "
+            "Given a lead profile and an email template with placeholders, fill in the template to produce a complete, ready-to-send cold outreach email.\n\n"
+            "RULES:\n"
+            "1. Replace [Name] with the contact name. If empty, use 'Sir/Madam'.\n"
+            "2. Replace [Target Market] with the lead's country.\n"
+            "3. Replace [Company] with the lead's company name.\n"
+            "4. Determine [Role] from the lead's 'category' field:\n"
+            "   - If category suggests a distributor/dealer/reseller -> use 'Distributor'\n"
+            "   - Otherwise -> use 'Buyer' (hospital, clinic, procurement)\n"
+            "5. Remove the irrelevant [IfDistributor]...[/IfDistributor] or [IfBuyer]...[/IfBuyer] block based on the determined role.\n"
+            "   - If role is Distributor, keep the [IfDistributor] block content and remove the [IfBuyer] tags and content entirely.\n"
+            "   - If role is Buyer, keep the [IfBuyer] block content and remove the [IfDistributor] tags and content entirely.\n"
+            "6. Keep all other text exactly as-is. NEVER add content not in the template.\n\n"
+            "Return ONLY a JSON object: {\"subject\": \"...\", \"body\": \"...\"}, no other text."
+        )
+
+        user_prompt = (
+            f"LEAD PROFILE:\n"
+            f"company_name: {lead.company_name}\n"
+            f"contact_name: {lead.contact_name or 'N/A'}\n"
+            f"country: {lead.country}\n"
+            f"region: {lead.region}\n"
+            f"category: {lead.category}\n"
+            f"website: {lead.website}\n\n"
+            f"TEMPLATE:\n{template}"
+        )
+
         resp = requests.post(
             api_url,
             headers={
@@ -140,13 +226,13 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
             json={
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You are an overseas BD assistant. Write concise, professional cold outreach emails in English. Return ONLY a JSON object with 'subject' and 'body' fields, no other text."},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
-                "temperature": 0.7,
-                "max_tokens": 600,
+                "temperature": 0.4,
+                "max_tokens": 800,
             },
-            timeout=20,
+            timeout=25,
         )
 
         if resp.status_code != 200:
@@ -155,12 +241,9 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
         data = resp.json()
         content = data["choices"][0]["message"]["content"].strip()
 
-        # Parse JSON from response
-        import json, re
-        # Strip markdown code fences if present
-        content = re.sub(r"^```(?:json)?\s*", "", content)
-        content = re.sub(r"\s*```$", "", content)
-        parsed = json.loads(content)
+        content = re_mod.sub(r"^```(?:json)?\s*", "", content)
+        content = re_mod.sub(r"\s*```$", "", content)
+        parsed = json_mod.loads(content)
 
         subject = str(parsed.get("subject", "")).strip()
         body = str(parsed.get("body", "")).strip()
@@ -171,27 +254,6 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
 
     except Exception:
         return None
-
-
-def _build_email_prompt(lead: CandidateLead) -> str:
-    return f"""Write a brief cold outreach email for:
-
-Company: {lead.company_name}
-Contact: {lead.contact_name}
-Country: {lead.country}
-Region: {lead.region}
-Category: {lead.category}
-Match reason: {lead.match_reason}
-
-Product: SkyWalker Robotic Platform Total Knee Application — CT-based orthopedic robotics system for TKA workflows, patient-specific planning, intra-op adjustment, and robotically located cutting planes.
-
-Requirements:
-- Short greeting with contact name
-- One sentence why they were selected
-- Brief product intro
-- Call to action: offer product brief and qualification call
-- Professional, not salesy
-- Return JSON: {{"subject": "...", "body": "..."}}"""
 
 
 def _strip_quoted_reply(text: str) -> str:
@@ -286,11 +348,8 @@ def _try_ai_reply_analysis(reply_text: str) -> ReplyAnalysis | None:
         if not api_key or not provider:
             return None
 
-        if provider == "deepseek":
-            api_url = "https://api.deepseek.com/v1/chat/completions"
-        elif provider == "openai":
-            api_url = "https://api.openai.com/v1/chat/completions"
-        else:
+        api_url = _resolve_llm_api_url(settings)
+        if not api_url:
             return None
 
         import requests, json, re
@@ -382,6 +441,87 @@ REQUIRES_HUMAN (be strict):
             next_action=str(parsed.get("next_action", ""))[:500],
             requires_human=requires_human,
         )
+
+    except Exception:
+        return None
+
+
+def generate_followup(lead: CandidateLead, reply_text: str) -> RenderedEmail | None:
+    """Generate a follow-up email based on a customer reply. Returns None on failure."""
+    try:
+        from app.db import get_all_settings
+        settings = get_all_settings()
+        provider = settings.get("agent_provider", "").lower()
+        api_key = settings.get("agent_key", "")
+        model = settings.get("agent_model", "deepseek-v4-pro")
+
+        if not api_key or not provider:
+            return None
+
+        api_url = _resolve_llm_api_url(settings)
+        if not api_url:
+            return None
+
+        if provider == "deepseek" and ("v4" in model or "pro" in model):
+            model = "deepseek-chat"
+
+        import requests, json as json_mod, re as re_mod
+
+        system_prompt = (
+            "You are an overseas BD assistant for MEDBOT (SkyWalker TKA surgical robot). "
+            "A prospect has replied to our cold outreach email. Based on their reply, write a professional follow-up email.\n\n"
+            "RULES:\n"
+            "- If they show interest: thank them, provide the requested info (brochure, certificates, pricing, demo), and suggest a call.\n"
+            "- If they ask questions: answer concisely and offer to connect them with a specialist.\n"
+            "- If they say no / not interested: politely thank them and leave the door open.\n"
+            "- If ambiguous / auto-reply: keep it short, ask if they'd like more information.\n"
+            "- Sign as 'SkyWalker Sales Team / MEDBOT'.\n"
+            "- Keep it under 200 words, professional and warm.\n\n"
+            "Return ONLY a JSON object: {\"subject\": \"...\", \"body\": \"...\"}, no other text."
+        )
+
+        user_prompt = (
+            f"LEAD:\n"
+            f"Company: {lead.company_name}\n"
+            f"Contact: {lead.contact_name or 'N/A'}\n"
+            f"Country: {lead.country}\n"
+            f"Category: {lead.category}\n\n"
+            f"CUSTOMER REPLY:\n{reply_text[:2000]}"
+        )
+
+        resp = requests.post(
+            api_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 600,
+            },
+            timeout=25,
+        )
+
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"].strip()
+        content = re_mod.sub(r"^```(?:json)?\s*", "", content)
+        content = re_mod.sub(r"\s*```$", "", content)
+        parsed = json_mod.loads(content)
+
+        subject = str(parsed.get("subject", "")).strip()
+        body = str(parsed.get("body", "")).strip()
+        if not subject or not body:
+            return None
+
+        return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
 
     except Exception:
         return None

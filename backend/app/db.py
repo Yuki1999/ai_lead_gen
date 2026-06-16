@@ -134,6 +134,8 @@ def list_leads(
     q: str | None = None,
     sort: str = "id",
     order: str = "desc",
+    limit: int | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
@@ -158,10 +160,37 @@ def list_leads(
                 (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) AS reply_count,
                 (SELECT COUNT(*) FROM outreach_events WHERE lead_id = l.id AND status = 'draft') AS draft_count
             FROM leads l
-            {where} ORDER BY {sort_col} {sort_dir}, l.id DESC""",
-            params,
+            {where} ORDER BY {sort_col} {sort_dir}, l.id DESC
+            {"LIMIT :__limit" if limit is not None else ""}
+            {"OFFSET :__offset" if limit is not None else ""}""",
+            {**params, **({"__limit": limit, "__offset": offset} if limit is not None else {})},
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
+
+
+def count_leads(
+    *,
+    region: str | None = None,
+    status: str | None = None,
+    q: str | None = None,
+) -> int:
+    filters: list[str] = []
+    params: dict[str, Any] = {}
+    if region:
+        filters.append("region = :region")
+        params["region"] = region
+    if status:
+        filters.append("status = :status")
+        params["status"] = status
+    if q:
+        filters.append(
+            "(company_name LIKE :q OR email LIKE :q OR country LIKE :q OR category LIKE :q)"
+        )
+        params["q"] = f"%{q}%"
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with connect() as connection:
+        row = connection.execute(f"SELECT COUNT(*) FROM leads {where}", params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def get_lead(
@@ -183,6 +212,16 @@ def get_lead(
 def update_lead(
     lead_id: int,
     *,
+    company_name: str | None = None,
+    region: str | None = None,
+    country: str | None = None,
+    website: str | None = None,
+    contact_name: str | None = None,
+    email: str | None = None,
+    category: str | None = None,
+    match_reason: str | None = None,
+    source: str | None = None,
+    score: int | None = None,
     status: str | None = None,
     notes: str | None = None,
 ) -> dict[str, Any] | None:
@@ -190,16 +229,36 @@ def update_lead(
     if current is None:
         return None
 
-    updated_status = status if status is not None else current["status"]
-    updated_notes = notes if notes is not None else current["notes"]
+    fields: dict[str, Any] = {
+        "company_name": company_name,
+        "region": region,
+        "country": country,
+        "website": website,
+        "contact_name": contact_name,
+        "email": email,
+        "category": category,
+        "match_reason": match_reason,
+        "source": source,
+        "score": score,
+        "status": status,
+        "notes": notes,
+    }
+
+    setters: list[str] = []
+    params: list[Any] = []
+    for col, val in fields.items():
+        if val is not None:
+            setters.append(f"{col} = ?")
+            params.append(val)
+
+    if not setters:
+        return current
+
+    params.extend([_now(), lead_id])
     with connect() as connection:
         connection.execute(
-            """
-            UPDATE leads
-            SET status = ?, notes = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (updated_status, updated_notes, _now(), lead_id),
+            f"UPDATE leads SET {', '.join(setters)}, updated_at = ? WHERE id = ?",
+            params,
         )
         return get_lead(lead_id, connection=connection)
 

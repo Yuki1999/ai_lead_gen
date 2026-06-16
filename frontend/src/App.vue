@@ -10,6 +10,7 @@ import {
   ChevronDown,
   Clock3,
   Database,
+  Edit3,
   ExternalLink,
   FileText,
   Globe2,
@@ -26,6 +27,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Trash2,
+  Zap,
   UserCheck,
   X,
 } from "lucide-vue-next";
@@ -179,10 +181,12 @@ interface SettingsResponse {
   agent_model: string;
   has_agent_key: boolean;
   agent_key_preview: string;
+  api_base_url: string;
   backend_base_url: string;
   email_server: string;
   email_user: string;
   has_email_password: boolean;
+  email_template: string;
 }
 
 interface AgentConfigResponse {
@@ -192,6 +196,7 @@ interface AgentConfigResponse {
   has_openai_api_key: boolean;
   openai_api_key_preview: string | null;
   model_name: string;
+  api_base_url: string;
   backend_base_url: string;
   agent_env_path: string;
   restart_required: boolean;
@@ -244,10 +249,7 @@ const filterStatus = ref("");
 const query = ref("");
 const sortField = ref("id");
 const sortDir = ref<"asc" | "desc">("desc");
-const replyLeadId = ref<number | "">("");
-const replyText = ref(
-  "We are interested. Please send product details, certificates, and partner requirements."
-);
+const replyText = ref("");
 const lastEmail = ref<EmailEvent | null>(null);
 const analysis = ref<ReplyAnalysis | null>(null);
 const sourcePreview = ref<SourcePreview | null>(null);
@@ -256,7 +258,28 @@ const sourcePreviewLoading = ref(false);
 const sourcePreviewError = ref("");
 const sourcePreviewMode = ref<"page" | "text">("page");
 const loading = ref(false);
-const currentAction = ref<"dashboard" | "search" | "outreach" | "reply" | "qualify" | "sync" | null>(null);
+const currentAction = ref<"dashboard" | "search" | "outreach" | "reply" | "qualify" | "sync" | "followup" | null>(null);
+
+// Pagination
+const leadPage = ref(1);
+const leadPageSize = ref(20);
+const leadTotal = ref(0);
+
+// Custom email (自拟定)
+const showCustomEmail = ref(false);
+const customEmail = ref({ lead_id: 0, company_name: "", email: "", subject: "", body: "" });
+const customEmailSending = ref(false);
+const availableAttachments = ref<string[]>([]);
+const customEmailAttachments = ref<string[]>([]);
+
+// Edit lead
+const showEditLead = ref(false);
+const editLead = ref({
+  id: 0, company_name: "", region: "", country: "", website: "",
+  contact_name: "", email: "", category: "", match_reason: "",
+  source: "", score: 50, status: "", notes: "",
+});
+const editLeadSaving = ref(false);
 
 // Lead detail panel
 const detailLeadId = ref<number | null>(null);
@@ -279,11 +302,14 @@ const agentLoading = ref(false);
 const agentError = ref("");
 const agentConfig = ref<AgentConfigResponse | null>(null);
 const agentApiKeyInput = ref("");
-const agentProviderName = ref("openai");
-const agentModelName = ref("gpt-5-mini");
+const agentProviderName = ref("deepseek");
+const agentModelName = ref("deepseek-v4-pro");
 const agentBackendBaseUrl = ref("http://localhost:8000");
+const agentApiBaseUrl = ref("");
 const agentConfigLoading = ref(false);
 const agentConfigSaving = ref(false);
+const agentConfigTesting = ref(false);
+const agentTestResult = ref<null | { ok: boolean; latency_ms: number; message: string; error?: string }>(null);
 const agentConfigError = ref("");
 const agentConfigNotice = ref("");
 
@@ -295,16 +321,19 @@ const settings = ref<SettingsResponse>({
   agent_model: "deepseek-v4-pro",
   has_agent_key: false,
   agent_key_preview: "",
+  api_base_url: "",
   backend_base_url: "http://localhost:8000",
   email_server: "mail.microport.com.cn",
   email_user: "",
   has_email_password: false,
+  email_template: "",
 });
 const settingsAgentKeyInput = ref("");
 const settingsEmailPasswordInput = ref("");
+const settingsEmailTemplate = ref("");
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
-const settingsTab = ref<"email" | "sync" | "agent">("email");
+const settingsTab = ref<"email" | "sync" | "agent" | "template">("email");
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -446,13 +475,6 @@ const agentLogRows = computed(() => {
   }));
   return [...processRows, ...eventRows].slice(-60).reverse();
 });
-const selectedLead = computed(() =>
-  leads.value.find((lead) => lead.id === Number(replyLeadId.value))
-);
-const replyLeadOptions = computed<SelectOption[]>(() => [
-  { label: "不关联", value: "" },
-  ...leads.value.map((lead) => ({ label: lead.company_name, value: lead.id })),
-]);
 const highlightedSourceText = computed(() => {
   if (!sourcePreview.value) return [] as HighlightChunk[];
   return buildHighlightedChunks(sourcePreview.value.text, sourcePreview.value.email);
@@ -603,13 +625,16 @@ function onLoginKeydown(event: KeyboardEvent): void {
   }
 }
 
-async function loadDashboard(): Promise<void> {
+async function loadDashboard(resetPage: boolean = true): Promise<void> {
+  if (resetPage) leadPage.value = 1;
   const params = new URLSearchParams();
   if (filterRegion.value) params.set("region", filterRegion.value);
   if (filterStatus.value) params.set("status", filterStatus.value);
   if (query.value) params.set("q", query.value);
   params.set("sort", sortField.value);
   params.set("order", sortDir.value);
+  params.set("offset", String((leadPage.value - 1) * leadPageSize.value));
+  params.set("limit", String(leadPageSize.value));
 
   const [leadPayload, metricPayload] = await Promise.all([
     request<LeadListResponse>(`/leads?${params.toString()}`),
@@ -617,10 +642,8 @@ async function loadDashboard(): Promise<void> {
   ]);
 
   leads.value = leadPayload.leads;
+  leadTotal.value = leadPayload.total;
   metrics.value = metricPayload;
-  if (replyLeadId.value === "" && leads.value.length > 0) {
-    replyLeadId.value = leads.value[0].id;
-  }
   loadDrafts();
 }
 
@@ -815,12 +838,37 @@ async function analyzeCurrentReply(): Promise<void> {
     analysis.value = await request<ReplyAnalysis>("/replies/analyze", {
       method: "POST",
       body: JSON.stringify({
-        lead_id: replyLeadId.value === "" ? null : Number(replyLeadId.value),
+        lead_id: detailLeadId.value || null,
         reply_text: replyText.value,
       }),
     });
-    notice.value = "回复已完成理解";
+    showReplyAnalyzer.value = true;
     await loadDashboard();
+  });
+}
+
+async function generateFollowupAndOpen(): Promise<void> {
+  if (!detailLeadId.value || !replyText.value.trim()) return;
+  await runAction("followup", async () => {
+    const result = await request<{ subject: string; body: string; sent_to: string }>("/replies/followup", {
+      method: "POST",
+      body: JSON.stringify({
+        lead_id: detailLeadId.value,
+        reply_text: replyText.value,
+      }),
+    });
+    // Pre-fill the custom email modal with the AI-generated follow-up
+    const lead = leads.value.find((l) => l.id === detailLeadId.value);
+    if (lead) {
+      customEmail.value = {
+        lead_id: lead.id,
+        company_name: lead.company_name,
+        email: lead.email,
+        subject: result.subject,
+        body: result.body,
+      };
+      showCustomEmail.value = true;
+    }
   });
 }
 
@@ -889,6 +937,7 @@ async function saveAgentConfig(): Promise<void> {
         provider_name: agentProviderName.value.trim() || undefined,
         api_key: agentApiKeyInput.value.trim() || undefined,
         model_name: agentModelName.value.trim() || undefined,
+        api_base_url: agentApiBaseUrl.value.trim() || undefined,
         backend_base_url: agentBackendBaseUrl.value.trim() || undefined,
       }),
     });
@@ -904,8 +953,146 @@ async function saveAgentConfig(): Promise<void> {
   }
 }
 
+async function testAgentConnection(): Promise<void> {
+  if (agentConfigTesting.value) return;
+  agentConfigTesting.value = true;
+  agentTestResult.value = null;
+  agentConfigError.value = "";
+  try {
+    // Use entered key if provided, otherwise fall back to saved key status
+    const apiKey = agentApiKeyInput.value.trim() || settingsAgentKeyInput.value.trim();
+    if (!apiKey) {
+      agentTestResult.value = { ok: false, latency_ms: 0, message: "请先输入 API Key", error: "未提供 API Key" };
+      return;
+    }
+    const result = await request<{
+      ok: boolean;
+      latency_ms: number;
+      provider: string;
+      model: string;
+      message: string;
+      error?: string;
+    }>("/agent/test-connection", {
+      method: "POST",
+      body: JSON.stringify({
+        provider_name: agentProviderName.value.trim(),
+        api_key: apiKey,
+        model_name: agentModelName.value.trim(),
+        api_base_url: agentApiBaseUrl.value.trim() || undefined,
+      }),
+    });
+    agentTestResult.value = {
+      ok: result.ok,
+      latency_ms: result.latency_ms,
+      message: result.message,
+      error: result.error || undefined,
+    };
+  } catch (caught) {
+    agentTestResult.value = {
+      ok: false,
+      latency_ms: 0,
+      message: "测试请求失败",
+      error: caught instanceof Error ? caught.message : "网络错误",
+    };
+  } finally {
+    agentConfigTesting.value = false;
+  }
+}
+
 async function sendOutreachSingle(leadId: number): Promise<void> {
   await fetchOutreachPreview([leadId]);
+}
+
+async function openCustomEmail(leadId: number): Promise<void> {
+  const lead = leads.value.find((l) => l.id === leadId);
+  if (!lead) return;
+  customEmail.value = {
+    lead_id: leadId,
+    company_name: lead.company_name,
+    email: lead.email,
+    subject: "",
+    body: "",
+  };
+  customEmailAttachments.value = [];
+  // Load available attachments
+  try {
+    const result = await request<{ files: string[] }>("/attachments");
+    availableAttachments.value = result.files.filter((f) => f !== "README.txt");
+  } catch {
+    availableAttachments.value = [];
+  }
+  showCustomEmail.value = true;
+}
+
+async function openEditLead(leadId: number): Promise<void> {
+  try {
+    const lead = await request<Lead>(`/leads/${leadId}`);
+    editLead.value = {
+      id: lead.id, company_name: lead.company_name, region: lead.region,
+      country: lead.country, website: lead.website || "",
+      contact_name: lead.contact_name || "", email: lead.email || "",
+      category: lead.category || "", match_reason: lead.match_reason || "",
+      source: lead.source || "", score: lead.score,
+      status: lead.status, notes: lead.notes || "",
+    };
+    showEditLead.value = true;
+  } catch {
+    error.value = "加载线索详情失败";
+  }
+}
+
+async function saveEditLead(): Promise<void> {
+  if (editLeadSaving.value) return;
+  editLeadSaving.value = true;
+  try {
+    await request(`/leads/${editLead.value.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        company_name: editLead.value.company_name,
+        region: editLead.value.region,
+        country: editLead.value.country,
+        website: editLead.value.website || undefined,
+        contact_name: editLead.value.contact_name || undefined,
+        email: editLead.value.email || undefined,
+        category: editLead.value.category || undefined,
+        match_reason: editLead.value.match_reason || undefined,
+        source: editLead.value.source || undefined,
+        score: editLead.value.score,
+        status: editLead.value.status || undefined,
+        notes: editLead.value.notes || undefined,
+      }),
+    });
+    showEditLead.value = false;
+    notice.value = "线索已更新";
+    await loadDashboard(false); // keep current page
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : "保存失败";
+  } finally {
+    editLeadSaving.value = false;
+  }
+}
+
+async function sendCustomEmail(): Promise<void> {
+  if (customEmailSending.value) return;
+  customEmailSending.value = true;
+  try {
+    await request("/campaigns/custom-send", {
+      method: "POST",
+      body: JSON.stringify({
+        lead_id: customEmail.value.lead_id,
+        subject: customEmail.value.subject,
+        body: customEmail.value.body,
+        attachments: customEmailAttachments.value,
+      }),
+    });
+    showCustomEmail.value = false;
+    notice.value = "自定义邮件已发送";
+    await loadDashboard(true);
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : "发送失败";
+  } finally {
+    customEmailSending.value = false;
+  }
 }
 
 async function sendOutreachBatch(): Promise<void> {
@@ -948,8 +1135,12 @@ async function confirmSendOutreach(): Promise<void> {
   });
 }
 
-function goToReplyForLead(leadId: number): void {
-  openLeadDetail(leadId);
+const showReplyAnalyzer = ref(false);
+
+function openReplyAnalyzer(replyTextContent?: string): void {
+  replyText.value = replyTextContent || "";
+  analysis.value = null;
+  showReplyAnalyzer.value = true;
 }
 
 async function reactivateLead(leadId: number): Promise<void> {
@@ -1004,10 +1195,6 @@ function closeLeadDetail(): void {
   detailLeadId.value = null;
   detailOutreach.value = [];
   detailReplies.value = [];
-}
-
-function goToReply(): void {
-  notice.value = "回复已自动同步和分析，点击行查看详情";
 }
 
 async function saveLeadDetail(): Promise<void> {
@@ -1068,7 +1255,12 @@ function toggleSort(field: string): void {
     sortField.value = field;
     sortDir.value = "asc";
   }
-  runAction("dashboard", loadDashboard);
+  runAction("dashboard", () => loadDashboard(true));
+}
+
+function onLeadPageChange(page: number): void {
+  leadPage.value = page;
+  runAction("dashboard", () => loadDashboard(false));
 }
 
 function setLeadSelection(leadId: number, checked: boolean): void {
@@ -1148,6 +1340,7 @@ function applyAgentConfig(config: AgentConfigResponse): void {
   agentConfig.value = config;
   agentProviderName.value = config.provider_name;
   agentModelName.value = config.model_name;
+  agentApiBaseUrl.value = config.api_base_url || "";
   agentBackendBaseUrl.value = config.backend_base_url;
 }
 
@@ -1174,6 +1367,8 @@ async function loadSettings(): Promise<void> {
   settingsLoading.value = true;
   try {
     settings.value = await request<SettingsResponse>("/settings");
+    agentApiBaseUrl.value = settings.value.api_base_url || "";
+    settingsEmailTemplate.value = settings.value.email_template || "";
   } catch {
     // use defaults
   } finally {
@@ -1190,6 +1385,7 @@ async function saveSettings(): Promise<void> {
       sync_interval_minutes: settings.value.sync_interval_minutes,
       agent_provider: agentProviderName.value,
       agent_model: agentModelName.value,
+      api_base_url: agentApiBaseUrl.value,
       backend_base_url: agentBackendBaseUrl.value,
       email_server: settings.value.email_server,
       email_user: settings.value.email_user,
@@ -1199,6 +1395,9 @@ async function saveSettings(): Promise<void> {
     }
     if (settingsEmailPasswordInput.value.trim()) {
       body.email_password = settingsEmailPasswordInput.value.trim();
+    }
+    if (settingsEmailTemplate.value.trim()) {
+      body.email_template = settingsEmailTemplate.value.trim();
     }
     settings.value = await request<SettingsResponse>("/settings", {
       method: "PUT",
@@ -2272,21 +2471,45 @@ onMounted(async () => {
                     <n-input v-model:value="agentModelName" />
                   </label>
                   <label class="field">
+                    <span>API Base URL</span>
+                    <n-input v-model:value="agentApiBaseUrl" placeholder="留空使用默认" />
+                  </label>
+                  <label class="field">
                     <span>Backend URL</span>
                     <n-input v-model:value="agentBackendBaseUrl" />
                   </label>
-                  <n-button
-                    class="ghost-button"
-                    secondary
-                    :loading="agentConfigSaving"
-                    :disabled="agentConfigLoading || agentConfigSaving"
-                    @click="saveAgentConfig"
-                  >
-                    <template #icon>
-                      <n-icon><Save /></n-icon>
-                    </template>
-                    {{ agentConfigSaving ? "保存中..." : "保存配置" }}
-                  </n-button>
+                  <div class="agent-config-actions">
+                    <n-button
+                      class="ghost-button"
+                      secondary
+                      :loading="agentConfigSaving"
+                      :disabled="agentConfigLoading || agentConfigSaving || agentConfigTesting"
+                      @click="saveAgentConfig"
+                    >
+                      <template #icon>
+                        <n-icon><Save /></n-icon>
+                      </template>
+                      {{ agentConfigSaving ? "保存中..." : "保存配置" }}
+                    </n-button>
+                    <n-button
+                      class="ghost-button"
+                      secondary
+                      :loading="agentConfigTesting"
+                      :disabled="agentConfigLoading || agentConfigSaving || agentConfigTesting"
+                      @click="testAgentConnection"
+                    >
+                      <template #icon>
+                        <n-icon><Zap /></n-icon>
+                      </template>
+                      {{ agentConfigTesting ? "测试中..." : "测试连接" }}
+                    </n-button>
+                  </div>
+                  <div v-if="agentTestResult" :class="['agent-test-result', agentTestResult.ok ? 'success' : 'error']">
+                    <span class="agent-test-status">{{ agentTestResult.ok ? '✅' : '❌' }}</span>
+                    <span class="agent-test-message">{{ agentTestResult.message }}</span>
+                    <span v-if="agentTestResult.latency_ms > 0" class="agent-test-latency">{{ agentTestResult.latency_ms }}ms</span>
+                    <p v-if="agentTestResult.error" class="agent-test-error">{{ agentTestResult.error }}</p>
+                  </div>
                 </div>
 
                 <p v-if="agentConfigNotice" class="notice">{{ agentConfigNotice }}</p>
@@ -2536,7 +2759,7 @@ onMounted(async () => {
                   取消
                 </n-button>
               </template>
-              <span v-else>{{ leads.length }} 条</span>
+              <span v-else>{{ leadTotal }} 条</span>
             </div>
           </div>
 
@@ -2585,14 +2808,28 @@ onMounted(async () => {
             </div>
 
             <div class="lead-tools" @click.stop>
-              <button v-if="lead.status === 'new' && !(lead.draft_count && lead.draft_count > 0)" class="lead-action-btn primary" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
+              <button v-if="lead.status === 'new' && !(lead.draft_count && lead.draft_count > 0)" class="lead-action-btn" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
+              <button v-if="lead.email" class="lead-action-btn primary" @click="openCustomEmail(lead.id)"><Edit3 :size="13" />自拟定</button>
               <span v-if="lead.status === 'new' && lead.draft_count && lead.draft_count > 0" class="draft-indicator">📝 {{ lead.draft_count }}条待审</span>
-              <button v-if="lead.status === 'emailed' && (lead.reply_count || 0) > 0" class="lead-action-btn" @click="goToReplyForLead(lead.id)"><MailCheck :size="13" />回复</button>
               <button v-if="['new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
               <button v-if="lead.status === 'rejected'" class="lead-action-btn" @click="reactivateLead(lead.id)"><RefreshCw :size="13" />激活</button>
+              <button class="lead-action-btn" @click="openEditLead(lead.id)"><Pencil :size="13" /></button>
               <button class="lead-action-btn danger" @click="deleteLead(lead.id)"><Trash2 :size="13" /></button>
             </div>
           </article>
+
+          <div v-if="leadTotal > leadPageSize" class="pagination-bar">
+            <n-pagination
+              :page="leadPage"
+              :page-size="leadPageSize"
+              :item-count="leadTotal"
+              :page-slot="7"
+              show-size-picker
+              :page-sizes="[10, 20, 50]"
+              @update:page="onLeadPageChange"
+              @update:page-size="(size: number) => { leadPageSize = size; leadPage = 1; loadDashboard(false); }"
+            />
+          </div>
         </section>
 
         <div
@@ -2658,9 +2895,9 @@ onMounted(async () => {
                     <template #icon><n-icon><Trash2 /></n-icon></template>
                     删除
                   </n-button>
-                  <n-button class="ghost-button" secondary @click="goToReply">
-                    <template #icon><n-icon><MailCheck /></n-icon></template>
-                    回复处理
+                  <n-button class="ghost-button" secondary @click="showReplyAnalyzer = !showReplyAnalyzer">
+                    <template #icon><n-icon><Search /></n-icon></template>
+                    {{ showReplyAnalyzer ? '收起分析' : '回复分析' }}
                   </n-button>
                 </div>
               </div>
@@ -2683,7 +2920,7 @@ onMounted(async () => {
                 </div>
 
                 <div v-if="detailReplies.length > 0">
-                  <p class="panel-label">回复记录</p>
+                  <p class="panel-label">回复记录（{{ detailReplies.length }} 条）</p>
                   <article v-for="r in detailReplies" :key="r.id" class="history-card">
                     <div class="history-head">
                       <n-tag :type="statusTagType(r.requires_human ? 'human_review' : r.intent)" size="small" round :bordered="false">
@@ -2694,7 +2931,68 @@ onMounted(async () => {
                     <blockquote v-if="r.reply_text" class="reply-quote">{{ r.reply_text }}</blockquote>
                     <p>{{ r.summary }}</p>
                     <p class="history-next">{{ r.next_action }}</p>
+                    <div class="history-actions">
+                      <n-button class="ghost-button" size="tiny" secondary @click="openReplyAnalyzer(r.reply_text); showReplyAnalyzer = true;">
+                        <template #icon><n-icon><RefreshCw /></n-icon></template>
+                        重新分析
+                      </n-button>
+                    </div>
                   </article>
+                </div>
+
+                <!-- Inline reply analyzer -->
+                <div v-if="showReplyAnalyzer" class="reply-analyzer-inline">
+                  <p class="panel-label">回复分析</p>
+                  <label class="field">
+                    <span>回复原文</span>
+                    <n-input v-model:value="replyText" type="textarea" :autosize="{ minRows: 3, maxRows: 6 }" placeholder="粘贴客户回复原文..." />
+                  </label>
+                  <div class="analyzer-actions">
+                    <n-button
+                      class="primary-button"
+                      type="primary"
+                      size="small"
+                      :loading="currentAction === 'reply'"
+                      :disabled="!replyText.trim()"
+                      @click="analyzeCurrentReply"
+                    >
+                      <template #icon><n-icon><Search /></n-icon></template>
+                      {{ currentAction === 'reply' ? '分析中...' : '分析' }}
+                    </n-button>
+                    <n-button class="ghost-button" size="small" secondary @click="showReplyAnalyzer = false">收起</n-button>
+                  </div>
+                  <div v-if="analysis && showReplyAnalyzer" class="reply-analysis-result" style="margin-top:12px">
+                    <div class="analysis-row">
+                      <span class="analysis-label">意图</span>
+                      <n-tag :type="analysis.intent === 'interested' ? 'success' : analysis.intent === 'rejected' ? 'error' : 'info'" size="small" round :bordered="false">
+                        {{ analysis.intent === 'interested' ? '感兴趣' : analysis.intent === 'rejected' ? '拒绝' : analysis.intent === 'needs_review' ? '待审核' : analysis.intent }}
+                      </n-tag>
+                      <span class="analysis-confidence">{{ Math.round(analysis.confidence * 100) }}%</span>
+                    </div>
+                    <div class="analysis-row">
+                      <span class="analysis-label">总结</span>
+                      <span>{{ analysis.summary }}</span>
+                    </div>
+                    <div class="analysis-row">
+                      <span class="analysis-label">建议</span>
+                      <span>{{ analysis.next_action }}</span>
+                    </div>
+                    <div v-if="analysis.requires_human" class="analysis-row human-alert">
+                      ⚠️ 需要转人工处理
+                    </div>
+                    <div v-if="analysis.intent !== 'rejected'" class="analyzer-actions" style="margin-top:4px">
+                      <n-button
+                        class="primary-button"
+                        type="primary"
+                        size="small"
+                        :loading="currentAction === 'followup'"
+                        @click="generateFollowupAndOpen"
+                      >
+                        <template #icon><n-icon><Send /></n-icon></template>
+                        生成跟进邮件
+                      </n-button>
+                    </div>
+                  </div>
                 </div>
 
                 <div v-if="detailOutreach.length === 0 && detailReplies.length === 0 && !detailLoading" class="history-empty">
@@ -2725,7 +3023,26 @@ onMounted(async () => {
             <button :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
             <button :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
             <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
+            <button :class="['settings-tab', { active: settingsTab === 'template' }]" @click="settingsTab = 'template'">模板</button>
           </div>
+
+          <section v-if="settingsTab === 'template'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">邮件模板</p>
+                <h3>广撒网外发模板</h3>
+                <p>批量发送外联时的基础邮件模板。变量：<code>[Name]</code> <code>[Role]</code> <code>[Target Market]</code> <code>[Company]</code>，条件块：<code>[IfDistributor]...[/IfDistributor]</code> <code>[IfBuyer]...[/IfBuyer]</code></p>
+              </div>
+            </div>
+            <label class="field">
+              <n-input
+                v-model:value="settingsEmailTemplate"
+                type="textarea"
+                :autosize="{ minRows: 12, maxRows: 30 }"
+                placeholder="输入邮件模板..."
+              />
+            </label>
+          </section>
 
           <section v-if="settingsTab === 'email'" class="settings-card">
             <div class="settings-card-head">
@@ -2773,7 +3090,28 @@ onMounted(async () => {
               <label class="field"><span>Provider</span><n-select v-model:value="agentProviderName" :options="providerOptions" /></label>
               <label class="field"><span>API Key</span><n-input v-model:value="settingsAgentKeyInput" autocomplete="off" :placeholder="settings.has_agent_key ? settings.agent_key_preview : 'sk-...'" type="password" show-password-on="click" /></label>
               <label class="field"><span>模型</span><n-input v-model:value="agentModelName" placeholder="deepseek-v4-pro" /></label>
+              <label class="field"><span>API Base URL</span><n-input v-model:value="agentApiBaseUrl" placeholder="留空使用默认: https://api.deepseek.com" /></label>
               <label class="field"><span>Backend URL</span><n-input v-model:value="agentBackendBaseUrl" /></label>
+              <div class="settings-agent-test">
+                <n-button
+                  class="ghost-button"
+                  secondary
+                  :loading="agentConfigTesting"
+                  :disabled="agentConfigTesting"
+                  @click="testAgentConnection"
+                >
+                  <template #icon>
+                    <n-icon><Zap /></n-icon>
+                  </template>
+                  {{ agentConfigTesting ? "测试中..." : "测试连接" }}
+                </n-button>
+                <div v-if="agentTestResult" :class="['agent-test-result', agentTestResult.ok ? 'success' : 'error']">
+                  <span class="agent-test-status">{{ agentTestResult.ok ? '✅' : '❌' }}</span>
+                  <span class="agent-test-message">{{ agentTestResult.message }}</span>
+                  <span v-if="agentTestResult.latency_ms > 0" class="agent-test-latency">{{ agentTestResult.latency_ms }}ms</span>
+                  <p v-if="agentTestResult.error" class="agent-test-error">{{ agentTestResult.error }}</p>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -2830,6 +3168,98 @@ onMounted(async () => {
           <n-button class="primary-button" type="primary" :disabled="outreachLoading" :loading="currentAction === 'outreach'" @click="confirmSendOutreach">
             <template #icon><n-icon><Send /></n-icon></template>
             确认发送
+          </n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- Custom Email Modal (自拟定) -->
+    <div
+      v-if="showCustomEmail"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="showCustomEmail = false"
+    >
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="自拟定邮件">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">自拟定邮件</p>
+            <h2>{{ customEmail.company_name }}</h2>
+          </div>
+          <button class="icon-only-button" type="button" aria-label="关闭" @click="showCustomEmail = false">
+            <X :size="20" aria-hidden="true" />
+          </button>
+        </header>
+        <div class="create-lead-body">
+          <p class="muted" style="margin-bottom:12px">收件人：{{ customEmail.email }}</p>
+          <label class="field"><span>主题</span><n-input v-model:value="customEmail.subject" placeholder="输入邮件主题" /></label>
+          <label class="field"><span>正文</span><n-input v-model:value="customEmail.body" type="textarea" :autosize="{ minRows: 6, maxRows: 16 }" placeholder="输入邮件正文" /></label>
+          <div v-if="availableAttachments.length > 0" class="field">
+            <span>附件</span>
+            <div class="attachment-checks">
+              <label v-for="f in availableAttachments" :key="f" class="attachment-check">
+                <n-checkbox :checked="customEmailAttachments.includes(f)" @update:checked="(checked: boolean) => { if (checked) customEmailAttachments.push(f); else customEmailAttachments = customEmailAttachments.filter(a => a !== f); }" />
+                <span>{{ f }}</span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showCustomEmail = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :loading="customEmailSending" :disabled="!customEmail.subject || !customEmail.body" @click="sendCustomEmail">
+            <template #icon><n-icon><Send /></n-icon></template>
+            发送
+          </n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- Edit Lead Modal -->
+    <div
+      v-if="showEditLead"
+      class="modal-backdrop"
+      role="presentation"
+      @click.self="showEditLead = false"
+    >
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="编辑线索">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">编辑线索</p>
+            <h2>{{ editLead.company_name }}</h2>
+          </div>
+          <button class="icon-only-button" type="button" aria-label="关闭" @click="showEditLead = false">
+            <X :size="20" aria-hidden="true" />
+          </button>
+        </header>
+        <div class="create-lead-body">
+          <div class="create-lead-row">
+            <label class="field"><span>公司名称</span><n-input v-model:value="editLead.company_name" /></label>
+            <label class="field"><span>国家</span><n-input v-model:value="editLead.country" /></label>
+          </div>
+          <div class="create-lead-row">
+            <label class="field"><span>地区</span><n-input v-model:value="editLead.region" /></label>
+            <label class="field"><span>网站</span><n-input v-model:value="editLead.website" /></label>
+          </div>
+          <div class="create-lead-row">
+            <label class="field"><span>邮箱</span><n-input v-model:value="editLead.email" /></label>
+            <label class="field"><span>联系人</span><n-input v-model:value="editLead.contact_name" /></label>
+          </div>
+          <div class="create-lead-row">
+            <label class="field"><span>类别</span><n-input v-model:value="editLead.category" /></label>
+            <label class="field"><span>来源</span><n-input v-model:value="editLead.source" /></label>
+          </div>
+          <label class="field"><span>匹配理由</span><n-input v-model:value="editLead.match_reason" /></label>
+          <div class="create-lead-row">
+            <label class="field"><span>评分</span><n-input-number v-model:value="editLead.score" :min="0" :max="100" /></label>
+            <label class="field"><span>状态</span><n-input v-model:value="editLead.status" /></label>
+          </div>
+          <label class="field"><span>备注</span><n-input v-model:value="editLead.notes" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" /></label>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showEditLead = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :loading="editLeadSaving" @click="saveEditLead">
+            <template #icon><n-icon><Save /></n-icon></template>
+            保存
           </n-button>
         </footer>
       </section>
