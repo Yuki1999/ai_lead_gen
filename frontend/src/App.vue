@@ -187,6 +187,7 @@ interface SettingsResponse {
   email_user: string;
   has_email_password: boolean;
   email_template: string;
+  scoring_rules: string;
 }
 
 interface AgentConfigResponse {
@@ -327,13 +328,15 @@ const settings = ref<SettingsResponse>({
   email_user: "",
   has_email_password: false,
   email_template: "",
+  scoring_rules: "",
 });
 const settingsAgentKeyInput = ref("");
 const settingsEmailPasswordInput = ref("");
 const settingsEmailTemplate = ref("");
+const settingsScoringRules = ref("");
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
-const settingsTab = ref<"email" | "sync" | "agent" | "template">("email");
+const settingsTab = ref<"email" | "sync" | "agent" | "template" | "scoring">("email");
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -1169,6 +1172,53 @@ const detailLead = computed(() =>
   detailLeadId.value ? leads.value.find((l) => l.id === detailLeadId.value) ?? null : null
 );
 
+interface TimelineEvent {
+  kind: "outreach" | "reply";
+  id: number;
+  time: string;
+  // outreach fields
+  subject?: string;
+  sent_to?: string;
+  body?: string;
+  status?: string;
+  source?: string;
+  // reply fields
+  reply_text?: string;
+  intent?: string;
+  confidence?: number;
+  summary?: string;
+  next_action?: string;
+  requires_human?: boolean;
+}
+
+const timelineEvents = computed<TimelineEvent[]>(() => {
+  const items: TimelineEvent[] = [
+    ...detailOutreach.value.map((ev) => ({
+      kind: "outreach" as const,
+      id: ev.id,
+      time: ev.created_at || "",
+      subject: ev.subject,
+      sent_to: ev.sent_to,
+      body: ev.body,
+      status: ev.status,
+      source: ev.source,
+    })),
+    ...detailReplies.value.map((r) => ({
+      kind: "reply" as const,
+      id: r.id,
+      time: r.created_at || "",
+      reply_text: r.reply_text,
+      intent: r.intent,
+      confidence: r.confidence,
+      summary: r.summary,
+      next_action: r.next_action,
+      requires_human: r.requires_human,
+    })),
+  ];
+  items.sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+  return items;
+});
+
 async function openLeadDetail(leadId: number): Promise<void> {
   detailLeadId.value = leadId;
   detailLoading.value = true;
@@ -1369,6 +1419,7 @@ async function loadSettings(): Promise<void> {
     settings.value = await request<SettingsResponse>("/settings");
     agentApiBaseUrl.value = settings.value.api_base_url || "";
     settingsEmailTemplate.value = settings.value.email_template || "";
+    settingsScoringRules.value = settings.value.scoring_rules || "";
   } catch {
     // use defaults
   } finally {
@@ -1398,6 +1449,9 @@ async function saveSettings(): Promise<void> {
     }
     if (settingsEmailTemplate.value.trim()) {
       body.email_template = settingsEmailTemplate.value.trim();
+    }
+    if (settingsScoringRules.value.trim()) {
+      body.scoring_rules = settingsScoringRules.value.trim();
     }
     settings.value = await request<SettingsResponse>("/settings", {
       method: "PUT",
@@ -2903,41 +2957,59 @@ onMounted(async () => {
               </div>
 
               <div class="detail-history">
-                <div v-if="detailOutreach.length > 0">
-                  <p class="panel-label">外联记录</p>
-                  <article v-for="ev in detailOutreach" :key="ev.id" class="history-card">
-                    <div class="history-head">
-                      <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : ev.status === 'draft' ? 'warning' : ev.status === 'rejected' ? 'error' : 'info'" size="small" round :bordered="false">
-                        {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : ev.status === 'draft' ? '⏳ 待审核' : ev.status === 'rejected' ? '已拒绝' : '已记录' }}
-                      </n-tag>
-                      <small>{{ ev.source === 'agent' ? '🤖 Agent · ' : '' }}{{ formatTime(ev.created_at) }}</small>
-                    </div>
-                    <strong>{{ ev.subject }}</strong>
-                    <span>收件人：{{ ev.sent_to }}</span>
-                    <p v-if="ev.status === 'draft'" class="draft-hint">💡 此草稿在页面顶部「待审核」队列中统一审批</p>
-                    <p>{{ ev.body.slice(0, 200) }}{{ ev.body.length > 200 ? '...' : '' }}</p>
-                  </article>
-                </div>
+                <div v-if="timelineEvents.length > 0">
+                  <p class="panel-label">沟通时间线（{{ timelineEvents.length }} 条记录）</p>
+                  <div class="email-timeline">
+                    <div
+                      v-for="(ev, idx) in timelineEvents"
+                      :key="`${ev.kind}-${ev.id}`"
+                      :class="['timeline-node', idx === 0 ? 'first' : '', `kind-${ev.kind}`]"
+                    >
+                      <div class="timeline-dot" aria-hidden="true">
+                        <Send v-if="ev.kind === 'outreach'" :size="12" />
+                        <MailCheck v-else :size="12" />
+                      </div>
 
-                <div v-if="detailReplies.length > 0">
-                  <p class="panel-label">回复记录（{{ detailReplies.length }} 条）</p>
-                  <article v-for="r in detailReplies" :key="r.id" class="history-card">
-                    <div class="history-head">
-                      <n-tag :type="statusTagType(r.requires_human ? 'human_review' : r.intent)" size="small" round :bordered="false">
-                        {{ r.requires_human ? '转人工' : formatStatus(r.intent) }}
-                      </n-tag>
-                      <small>{{ Math.round(r.confidence * 100) }}% · {{ formatTime(r.created_at) }}</small>
+                      <!-- Outbound email -->
+                      <article v-if="ev.kind === 'outreach'" class="timeline-card outreach-card">
+                        <div class="timeline-card-head">
+                          <n-tag
+                            :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : ev.status === 'draft' ? 'warning' : 'info'"
+                            size="tiny" round :bordered="false"
+                          >
+                            {{ ev.status === 'sent' ? '📤 已发送' : ev.status === 'send_failed' ? '❌ 失败' : ev.status === 'draft' ? '⏳ 草稿' : '已记录' }}
+                          </n-tag>
+                          <small>{{ formatTime(ev.time) }}</small>
+                        </div>
+                        <strong>{{ ev.subject }}</strong>
+                        <span class="timeline-meta">→ {{ ev.sent_to }}</span>
+                        <p v-if="ev.status === 'draft'" class="draft-hint">💡 此草稿在页面顶部「待审核」队列中统一审批</p>
+                        <p class="timeline-preview">{{ (ev.body || '').slice(0, 150) }}{{ (ev.body || '').length > 150 ? '...' : '' }}</p>
+                      </article>
+
+                      <!-- Inbound reply -->
+                      <article v-else class="timeline-card reply-card">
+                        <div class="timeline-card-head">
+                          <n-tag
+                            :type="ev.requires_human ? 'warning' : ev.intent === 'interested' ? 'success' : ev.intent === 'rejected' ? 'error' : 'info'"
+                            size="tiny" round :bordered="false"
+                          >
+                            📥 {{ ev.requires_human ? '需转人工' : ev.intent === 'interested' ? '感兴趣' : ev.intent === 'rejected' ? '已拒绝' : '待审核' }}
+                          </n-tag>
+                          <small>{{ ev.confidence ? Math.round(ev.confidence * 100) + '%' : '' }} · {{ formatTime(ev.time) }}</small>
+                        </div>
+                        <blockquote v-if="ev.reply_text" class="reply-quote">{{ ev.reply_text }}</blockquote>
+                        <p v-if="ev.summary">{{ ev.summary }}</p>
+                        <p v-if="ev.next_action" class="history-next">{{ ev.next_action }}</p>
+                        <div class="history-actions">
+                          <n-button class="ghost-button" size="tiny" secondary @click="openReplyAnalyzer(ev.reply_text); showReplyAnalyzer = true;">
+                            <template #icon><n-icon><RefreshCw /></n-icon></template>
+                            重新分析
+                          </n-button>
+                        </div>
+                      </article>
                     </div>
-                    <blockquote v-if="r.reply_text" class="reply-quote">{{ r.reply_text }}</blockquote>
-                    <p>{{ r.summary }}</p>
-                    <p class="history-next">{{ r.next_action }}</p>
-                    <div class="history-actions">
-                      <n-button class="ghost-button" size="tiny" secondary @click="openReplyAnalyzer(r.reply_text); showReplyAnalyzer = true;">
-                        <template #icon><n-icon><RefreshCw /></n-icon></template>
-                        重新分析
-                      </n-button>
-                    </div>
-                  </article>
+                  </div>
                 </div>
 
                 <!-- Inline reply analyzer -->
@@ -3024,6 +3096,7 @@ onMounted(async () => {
             <button :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
             <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
             <button :class="['settings-tab', { active: settingsTab === 'template' }]" @click="settingsTab = 'template'">模板</button>
+            <button :class="['settings-tab', { active: settingsTab === 'scoring' }]" @click="settingsTab = 'scoring'">评分</button>
           </div>
 
           <section v-if="settingsTab === 'template'" class="settings-card">
@@ -3040,6 +3113,24 @@ onMounted(async () => {
                 type="textarea"
                 :autosize="{ minRows: 12, maxRows: 30 }"
                 placeholder="输入邮件模板..."
+              />
+            </label>
+          </section>
+
+          <section v-if="settingsTab === 'scoring'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">评分规则</p>
+                <h3>线索评分标准</h3>
+                <p>Agent 搜索线索时使用的评分规则。包含正向加分、负向扣分和阈值解释。保存后自动同步到 Agent Skill。</p>
+              </div>
+            </div>
+            <label class="field">
+              <n-input
+                v-model:value="settingsScoringRules"
+                type="textarea"
+                :autosize="{ minRows: 16, maxRows: 40 }"
+                placeholder="输入评分规则..."
               />
             </label>
           </section>

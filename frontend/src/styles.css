@@ -3851,3 +3851,123 @@ textarea::placeholder {
   font-size: 13px;
   cursor: pointer;
 }
+
+/* ── Email Timeline ── */
+.email-timeline {
+  position: relative;
+  padding-left: 32px;
+}
+
+.email-timeline::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: linear-gradient(to bottom, #3b82f6, #e2e8f0 50%, #10b981 100%);
+  border-radius: 1px;
+}
+
+.timeline-node {
+  position: relative;
+  margin-bottom: 16px;
+}
+
+.timeline-node:last-child {
+  margin-bottom: 0;
+}
+
+.timeline-dot {
+  position: absolute;
+  left: -32px;
+  top: 10px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border: 2px solid #cbd5e1;
+  z-index: 1;
+}
+
+.timeline-node.kind-outreach .timeline-dot {
+  border-color: #3b82f6;
+  background: #eff6ff;
+  color: #3b82f6;
+}
+
+.timeline-node.kind-reply .timeline-dot {
+  border-color: #10b981;
+  background: #ecfdf5;
+  color: #10b981;
+}
+
+.timeline-card {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.timeline-node.kind-outreach .timeline-card {
+  border-left: 3px solid #3b82f6;
+}
+
+.timeline-node.kind-reply .timeline-card {
+  border-left: 3px solid #10b981;
+}
+
+.timeline-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.timeline-card strong {
+  font-size: 14px;
+  color: #1e293b;
+}
+
+.timeline-meta {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.timeline-preview {
+  font-size: 13px;
+  color: #475569;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.timeline-card .draft-hint {
+  font-size: 12px;
+  color: #f59e0b;
+  margin: 0;
+}
+
+.timeline-card .reply-quote {
+  font-size: 13px;
+  color: #334155;
+  padding: 6px 8px;
+  background: #f8fafc;
+  border-radius: 4px;
+  border-left: 3px solid #94a3b8;
+  margin: 0;
+}
+
+.timeline-card .history-next {
+  font-size: 12px;
+  color: #2563eb;
+  margin: 0;
+}
+
+.timeline-card .history-actions {
+  margin-top: 4px;
+}

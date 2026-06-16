@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from pathlib import Path
 import asyncio
 import logging
 import os
@@ -45,6 +46,7 @@ from app.schemas import (
 )
 from app.services import (
     DEFAULT_EMAIL_TEMPLATE,
+    DEFAULT_SCORING_RULES,
     CandidateLead,
     RenderedEmail,
     analyze_reply,
@@ -789,6 +791,7 @@ def create_app() -> FastAPI:
             "email_user": settings.get("email_user", ""),
             "has_email_password": bool(settings.get("email_password", "")),
             "email_template": settings.get("email_template", "") or DEFAULT_EMAIL_TEMPLATE,
+            "scoring_rules": settings.get("scoring_rules", "") or DEFAULT_SCORING_RULES,
         }
 
     @app.put("/settings")
@@ -797,7 +800,7 @@ def create_app() -> FastAPI:
         for key in (
             "sync_enabled", "sync_interval_minutes",
             "agent_provider", "agent_model", "agent_key", "api_base_url", "backend_base_url",
-            "email_server", "email_user", "email_password", "email_template",
+            "email_server", "email_user", "email_password", "email_template", "scoring_rules",
         ):
             if key in request:
                 val = request[key]
@@ -807,9 +810,25 @@ def create_app() -> FastAPI:
         from app.email_service import reload_config
         reload_config()
 
+        # Sync scoring rules to skill file
+        _sync_scoring_rules_to_skill()
+
         return get_settings()
 
     return app
+
+
+def _skill_scoring_path() -> Path:
+    project_root = Path(__file__).resolve().parents[2]
+    return project_root / "skills" / "overseas-distributor-prospecting" / "scoring-rules.md"
+
+
+def _sync_scoring_rules_to_skill() -> None:
+    """Write the current scoring_rules setting to the agent skill directory."""
+    rules = db.get_setting("scoring_rules") or DEFAULT_SCORING_RULES
+    path = _skill_scoring_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rules, encoding="utf-8")
 
 
 def _mask_key(key: str) -> str:
