@@ -451,7 +451,11 @@ function hasPermission(perm: string): boolean {
 
 function updateAuthPermissions(token: string): void {
   try {
-    const payload = JSON.parse(atob(token.split(".")[1]));
+    // JWT uses URL-safe base64 (no padding). Convert to standard base64 for atob.
+    const raw = token.split(".")[1];
+    const base64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded));
     authPermissions.value = payload.perms || [];
     localStorageSet("medbot_auth_permissions", JSON.stringify(authPermissions.value));
   } catch {
@@ -708,6 +712,7 @@ async function verifyAndRestoreAuth(): Promise<boolean> {
     const data = await resp.json() as { username: string; valid: boolean };
     if (data.valid && data.username) {
       authUsername.value = data.username;
+      updateAuthPermissions(authToken.value);
       localStorageSet(STORAGE_USERNAME_KEY, data.username);
       return true;
     }
