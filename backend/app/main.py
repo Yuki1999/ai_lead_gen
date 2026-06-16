@@ -11,7 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app import db
-from app.auth import require_auth, verify_credentials, create_access_token, decode_access_token, SERVICE_TOKEN
+from app.auth import (
+    require_auth, require_permission, verify_credentials, create_access_token,
+    decode_access_token, check_password, hash_password, SERVICE_TOKEN,
+)
 
 _logger = logging.getLogger("medbot")
 from app.agent_config import agent_config_status, test_agent_connection, update_agent_config
@@ -146,22 +149,31 @@ def create_app() -> FastAPI:
 
     @app.post("/auth/login", response_model=LoginResponse)
     def login(request: LoginRequest) -> dict[str, object]:
-        if not verify_credentials(request.username, request.password):
+        user = verify_credentials(request.username, request.password)
+        if not user:
             raise HTTPException(
                 status_code=401,
                 detail="用户名或密码错误",
             )
-        token = create_access_token(request.username)
+        token = create_access_token(
+            user_id=int(user["user_id"]),
+            username=str(user["username"]),
+            permissions=list(user["permissions"]) if isinstance(user["permissions"], list) else [],
+        )
         return {
             "access_token": token,
             "token_type": "bearer",
-            "username": request.username,
+            "username": str(user["username"]),
         }
 
     @app.get("/auth/verify", response_model=AuthVerifyResponse)
     def verify_token(username: str = Depends(require_auth)) -> dict[str, object]:
-        """Verify the current token is still valid. Returns the authenticated username."""
-        return {"username": username, "valid": True}
+        """Verify the current token is still valid. Returns the authenticated username + permissions."""
+        from fastapi import Request as FastAPIRequest  # noqa
+        return {
+            "username": username,
+            "valid": True,
+        }
 
     # ── Product ─────────────────────────────────────────
 
@@ -170,14 +182,16 @@ def create_app() -> FastAPI:
         return extract_product_profile().to_dict()
 
     @app.post("/agent/chat", response_model=AgentChatResponse)
-    def agent_chat(request: AgentChatRequest) -> dict[str, object]:
+    def agent_chat(request: AgentChatRequest,
+                   username: str = Depends(require_permission("agent:chat"))) -> dict[str, object]:
         try:
             return forward_agent_chat(request.model_dump())
         except AgentProxyError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     @app.post("/agent/chat/stream")
-    def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
+    def agent_chat_stream(request: AgentChatRequest,
+                          username: str = Depends(require_permission("agent:chat"))) -> StreamingResponse:
         try:
             stream = forward_agent_chat_stream(request.model_dump())
         except AgentProxyError as exc:
@@ -237,7 +251,8 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/leads/search", status_code=201)
-    def search_leads(request: SearchRequest) -> dict[str, object]:
+    def search_leads(request: SearchRequest,
+                     username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         if request.real_search:
             candidates = discover_real_prospects(
                 target_regions=request.target_regions,
@@ -260,7 +275,8 @@ def create_app() -> FastAPI:
         return {"created_count": len(saved), "leads": saved}
 
     @app.post("/leads/batch", status_code=201)
-    def batch_create_leads(request: list[LeadCreateRequest]) -> dict[str, object]:
+    def batch_create_leads(request: list[LeadCreateRequest],
+                           username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         """Batch create leads (used by Agent to save discovered leads)."""
         created = []
         for item in request:
@@ -282,7 +298,8 @@ def create_app() -> FastAPI:
         return {"created_count": len(created), "leads": created}
 
     @app.post("/leads", status_code=201)
-    def create_lead(request: LeadCreateRequest) -> dict[str, object]:
+    def create_lead(request: LeadCreateRequest,
+                    username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         """Manually create a lead."""
         lead = CandidateLead(
             company_name=request.company_name,
@@ -301,14 +318,16 @@ def create_app() -> FastAPI:
         return db.insert_lead(lead)
 
     @app.delete("/leads/{lead_id}")
-    def delete_lead(lead_id: int) -> dict[str, object]:
+    def delete_lead(lead_id: int,
+                    username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         """Delete a lead and its associated outreach events and reply analyses."""
         if not db.delete_lead(lead_id):
             raise HTTPException(status_code=404, detail="Lead not found")
         return {"ok": True, "deleted": lead_id}
 
     @app.post("/leads/batch-delete")
-    def batch_delete_leads(request: dict[str, object]) -> dict[str, object]:
+    def batch_delete_leads(request: dict[str, object],
+                           username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         """Delete multiple leads at once."""
         lead_ids = request.get("lead_ids", [])
         if not isinstance(lead_ids, list) or not lead_ids:
@@ -321,6 +340,7 @@ def create_app() -> FastAPI:
 
     @app.get("/leads")
     def list_leads(
+        username: str = Depends(require_permission("leads:read")),
         region: str | None = Query(default=None),
         status: str | None = Query(default=None),
         q: str | None = Query(default=None),
@@ -379,7 +399,8 @@ def create_app() -> FastAPI:
         return lead
 
     @app.patch("/leads/{lead_id}")
-    def update_lead(lead_id: int, request: LeadUpdateRequest) -> dict[str, object]:
+    def update_lead(lead_id: int, request: LeadUpdateRequest,
+                    username: str = Depends(require_permission("leads:write"))) -> dict[str, object]:
         updated = db.update_lead(
             lead_id,
             company_name=request.company_name,
@@ -400,7 +421,8 @@ def create_app() -> FastAPI:
         return updated
 
     @app.post("/campaigns/custom-send", status_code=201)
-    def custom_send(request: dict[str, object]) -> dict[str, object]:
+    def custom_send(request: dict[str, object],
+                    username: str = Depends(require_permission("outreach:send"))) -> dict[str, object]:
         """Send a single custom email (自拟定) to a lead — no template, user-written content."""
         lead_id = request.get("lead_id")
         subject = str(request.get("subject", "")).strip()
@@ -451,7 +473,8 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/campaigns/outreach-records", status_code=201)
-    def create_outreach_records(request: OutreachRequest) -> dict[str, object]:
+    def create_outreach_records(request: OutreachRequest,
+                                username: str = Depends(require_permission("outreach:send"))) -> dict[str, object]:
         return _create_outreach_records(request, source=request.source)
 
     @app.post("/campaigns/outreach-preview")
@@ -479,7 +502,8 @@ def create_app() -> FastAPI:
         return {"total": len(drafts), "drafts": drafts}
 
     @app.post("/campaigns/drafts/{event_id}/approve")
-    def approve_draft(event_id: int) -> dict[str, object]:
+    def approve_draft(event_id: int,
+                      username: str = Depends(require_permission("outreach:approve"))) -> dict[str, object]:
         """Approve a draft and send the email via EWS."""
         event = db.approve_outreach_event(event_id)
         if event is None:
@@ -662,7 +686,7 @@ def create_app() -> FastAPI:
         return response
 
     @app.post("/replies/sync", status_code=201)
-    def sync_inbox_replies() -> dict[str, object]:
+    def sync_inbox_replies(username: str = Depends(require_permission("replies:sync"))) -> dict[str, object]:
         """Fetch real replies from Exchange inbox and match them to leads."""
         if not email_is_configured():
             raise HTTPException(
@@ -766,7 +790,8 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/replies/analyze", status_code=201)
-    def analyze_reply_endpoint(request: ReplyAnalysisRequest) -> dict[str, object]:
+    def analyze_reply_endpoint(request: ReplyAnalysisRequest,
+                               username: str = Depends(require_permission("replies:analyze"))) -> dict[str, object]:
         if request.lead_id is not None and db.get_lead(request.lead_id) is None:
             raise HTTPException(status_code=404, detail="Lead not found")
 
@@ -803,7 +828,7 @@ def create_app() -> FastAPI:
         return {"subject": result.subject, "body": result.body, "sent_to": result.sent_to}
 
     @app.get("/settings")
-    def get_settings() -> dict[str, object]:
+    def get_settings(username: str = Depends(require_permission("settings:read"))) -> dict[str, object]:
         """Return all settings including sync frequency, agent config, and email."""
         settings = db.get_all_settings()
         return {
@@ -823,7 +848,8 @@ def create_app() -> FastAPI:
         }
 
     @app.put("/settings")
-    def save_settings(request: dict[str, object]) -> dict[str, object]:
+    def save_settings(request: dict[str, object],
+                      username: str = Depends(require_permission("settings:write"))) -> dict[str, object]:
         """Save settings. Accepts partial updates. Applies email config immediately."""
         for key in (
             "sync_enabled", "sync_interval_minutes",
@@ -842,6 +868,84 @@ def create_app() -> FastAPI:
         _sync_scoring_rules_to_skill()
 
         return get_settings()
+
+    # ── User & Role Management ──────────────────────────
+
+    @app.get("/users")
+    def list_users(username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        return {"users": db.list_users()}
+
+    @app.post("/users", status_code=201)
+    def create_user(request: dict[str, object],
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        uname = str(request.get("username", "")).strip()
+        password = str(request.get("password", "")).strip()
+        role_id = request.get("role_id")
+        if not uname or not password or not role_id:
+            raise HTTPException(status_code=422, detail="username, password, role_id are required")
+        pw_hash = hash_password(password)
+        user = db.create_user(uname, pw_hash, int(role_id))
+        if user is None:
+            raise HTTPException(status_code=409, detail="用户名已存在")
+        return user
+
+    @app.put("/users/{user_id}")
+    def update_user(user_id: int, request: dict[str, object],
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        kwargs: dict = {}
+        if "username" in request:
+            kwargs["username"] = str(request["username"]).strip()
+        if "password" in request and str(request["password"]).strip():
+            kwargs["password_hash"] = hash_password(str(request["password"]).strip())
+        if "role_id" in request:
+            kwargs["role_id"] = int(request["role_id"])
+        user = db.update_user(user_id, **kwargs)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+    @app.delete("/users/{user_id}")
+    def delete_user(user_id: int,
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        if not db.delete_user(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"ok": True, "deleted": user_id}
+
+    @app.get("/roles")
+    def list_roles(username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        return {"roles": db.list_roles()}
+
+    @app.post("/roles", status_code=201)
+    def create_role(request: dict[str, object],
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        name = str(request.get("name", "")).strip()
+        permissions = request.get("permissions") or []
+        if not name:
+            raise HTTPException(status_code=422, detail="name is required")
+        role = db.create_role(name, list(permissions))
+        if role is None:
+            raise HTTPException(status_code=409, detail="角色名已存在")
+        return role
+
+    @app.put("/roles/{role_id}")
+    def update_role(role_id: int, request: dict[str, object],
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        kwargs: dict = {}
+        if "name" in request:
+            kwargs["name"] = str(request["name"]).strip()
+        if "permissions" in request:
+            kwargs["permissions"] = list(request["permissions"])
+        role = db.update_role(role_id, **kwargs)
+        if role is None:
+            raise HTTPException(status_code=404, detail="Role not found")
+        return role
+
+    @app.delete("/roles/{role_id}")
+    def delete_role(role_id: int,
+                    username: str = Depends(require_permission("users:manage"))) -> dict[str, object]:
+        if not db.delete_role(role_id):
+            raise HTTPException(status_code=404, detail="Role not found or cannot delete admin")
+        return {"ok": True, "deleted": role_id}
 
     return app
 

@@ -1,13 +1,16 @@
-"""Authentication module: JWT tokens + password verification.
+"""Authentication module: JWT tokens + password verification + RBAC.
 
 Accepts both user JWTs and a static service token (for agent-to-backend calls).
+User JWTs embed permissions from their assigned role.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -24,20 +27,17 @@ SERVICE_TOKEN = os.getenv("MEDBOT_SERVICE_TOKEN", "medbot-agent-service-token-de
 
 security_scheme = HTTPBearer(auto_error=False)
 
-# Admin user credentials (hardcoded)
-ADMIN_USERNAME = "microport_admin"
-# bcrypt hash of "73Eyd7XtGL"
-ADMIN_PASSWORD_HASH = "$2b$12$Aed2eJHU0yB9sYJA2VNdUe1HPfle.3QK.wL0dhyfopoEIy0TqW6aW"
-
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_access_token(username: str) -> str:
-    """Create a signed JWT for the given username."""
+def create_access_token(*, user_id: int, username: str, permissions: list[str]) -> str:
+    """Create a signed JWT with embedded permissions."""
     payload = {
         "sub": username,
+        "uid": user_id,
+        "perms": permissions,
         "iat": _now(),
         "exp": _now() + timedelta(hours=_TOKEN_EXPIRE_HOURS),
         "jti": secrets.token_hex(8),
@@ -53,15 +53,37 @@ def decode_access_token(token: str) -> dict[str, object] | None:
         return None
 
 
-def verify_credentials(username: str, password: str) -> bool:
-    """Check username and password against stored admin credentials."""
-    if username != ADMIN_USERNAME:
-        return False
+def hash_password(password: str) -> str:
+    import bcrypt
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def check_password(password: str, password_hash: str) -> bool:
     try:
         import bcrypt
-        return bcrypt.checkpw(password.encode(), ADMIN_PASSWORD_HASH.encode())
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
     except Exception:
         return False
+
+
+def verify_credentials(username: str, password: str) -> dict[str, object] | None:
+    """Check username/password against the users table. Returns user dict with permissions."""
+    from app.db import get_user_by_username
+    user = get_user_by_username(username)
+    if user is None:
+        return None
+    if not check_password(password, str(user.get("password_hash", ""))):
+        return None
+    try:
+        permissions = json.loads(str(user.get("permissions", "[]")))
+    except (json.JSONDecodeError, TypeError):
+        permissions = []
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "role_id": user["role_id"],
+        "permissions": permissions,
+    }
 
 
 async def require_auth(
@@ -103,3 +125,49 @@ async def require_auth(
         )
 
     return username
+
+
+def require_permission(permission: str) -> Callable:
+    """FastAPI dependency factory – checks the JWT payload for a specific permission.
+
+    Usage:
+        @app.get("/settings")
+        def get_settings(user=Depends(require_permission("settings:read"))):
+            ...
+    """
+    async def _check(
+        credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
+    ) -> str:
+        if credentials is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        token = credentials.credentials
+
+        # Service token bypasses all permission checks
+        if token == SERVICE_TOKEN:
+            return "agent-service"
+
+        payload = decode_access_token(token)
+        if payload is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        username = payload.get("sub")
+        if not isinstance(username, str):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+        perms: list = payload.get("perms", [])
+        if permission not in perms:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Missing required permission: {permission}",
+            )
+
+        return username
+    return _check

@@ -79,6 +79,22 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                permissions TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (role_id) REFERENCES roles(id)
+            );
             """
         )
         # Migration: add message_id column if upgrading from older schema
@@ -100,6 +116,37 @@ def init_db() -> None:
             )
         except Exception:
             pass  # column already exists
+
+        # Seed default admin role and user (idempotent)
+        import json
+        all_perms = json.dumps([
+            "leads:read", "leads:write", "outreach:send", "outreach:approve",
+            "replies:sync", "replies:analyze", "settings:read", "settings:write",
+            "users:manage", "agent:chat",
+        ])
+        now = _now()
+        row = connection.execute("SELECT id FROM roles WHERE name = 'admin'").fetchone()
+        if not row:
+            connection.execute(
+                "INSERT INTO roles (name, permissions, created_at) VALUES ('admin', ?, ?)",
+                (all_perms, now),
+            )
+        row = connection.execute(
+            "SELECT id FROM users WHERE username = 'microport_admin'"
+        ).fetchone()
+        if not row:
+            role_id = connection.execute(
+                "SELECT id FROM roles WHERE name = 'admin'"
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role_id, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "microport_admin",
+                    "$2b$12$Aed2eJHU0yB9sYJA2VNdUe1HPfle.3QK.wL0dhyfopoEIy0TqW6aW",
+                    role_id,
+                    now,
+                ),
+            )
 
 
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
@@ -462,6 +509,136 @@ def get_all_settings() -> dict[str, str]:
 
 
 # ── Helpers ────────────────────────────────────────────
+
+# ── Users ──────────────────────────────────────────────────────────
+
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT u.*, r.permissions FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ?",
+            (username,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def list_users() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
+            "FROM users u JOIN roles r ON u.role_id = r.id ORDER BY u.id"
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def create_user(username: str, password_hash: str, role_id: int) -> dict[str, Any] | None:
+    with connect() as connection:
+        try:
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role_id, created_at) VALUES (?, ?, ?, ?)",
+                (username, password_hash, role_id, _now()),
+            )
+        except sqlite3.IntegrityError:
+            return None  # duplicate username
+        row = connection.execute(
+            "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
+            "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.username = ?",
+            (username,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def update_user(user_id: int, *, username: str | None = None,
+                password_hash: str | None = None,
+                role_id: int | None = None) -> dict[str, Any] | None:
+    setters: list[str] = []
+    params: list[Any] = []
+    if username is not None:
+        setters.append("username = ?")
+        params.append(username)
+    if password_hash is not None:
+        setters.append("password_hash = ?")
+        params.append(password_hash)
+    if role_id is not None:
+        setters.append("role_id = ?")
+        params.append(role_id)
+    if not setters:
+        row = connection.execute(
+            "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
+            "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
+            (user_id,),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    params.append(user_id)
+    with connect() as connection:
+        connection.execute(f"UPDATE users SET {', '.join(setters)} WHERE id = ?", params)
+        row = connection.execute(
+            "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
+            "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
+            (user_id,),
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def delete_user(user_id: int) -> bool:
+    with connect() as connection:
+        cursor = connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    return cursor.rowcount > 0
+
+
+# ── Roles ──────────────────────────────────────────────────────────
+
+def list_roles() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT r.*, (SELECT COUNT(*) FROM users WHERE role_id = r.id) AS user_count "
+            "FROM roles r ORDER BY r.id"
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def create_role(name: str, permissions: list[str]) -> dict[str, Any] | None:
+    import json
+    with connect() as connection:
+        try:
+            connection.execute(
+                "INSERT INTO roles (name, permissions, created_at) VALUES (?, ?, ?)",
+                (name, json.dumps(permissions), _now()),
+            )
+        except sqlite3.IntegrityError:
+            return None
+        row = connection.execute("SELECT * FROM roles WHERE name = ?", (name,)).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def update_role(role_id: int, *, name: str | None = None,
+                permissions: list[str] | None = None) -> dict[str, Any] | None:
+    import json
+    setters: list[str] = []
+    params: list[Any] = []
+    if name is not None:
+        setters.append("name = ?")
+        params.append(name)
+    if permissions is not None:
+        setters.append("permissions = ?")
+        params.append(json.dumps(permissions))
+    if not setters:
+        return None
+    params.append(role_id)
+    with connect() as connection:
+        connection.execute(f"UPDATE roles SET {', '.join(setters)} WHERE id = ?", params)
+        row = connection.execute("SELECT * FROM roles WHERE id = ?", (role_id,)).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def delete_role(role_id: int) -> bool:
+    with connect() as connection:
+        # Reassign users to admin role first
+        admin = connection.execute("SELECT id FROM roles WHERE name = 'admin'").fetchone()
+        if admin:
+            connection.execute("UPDATE users SET role_id = ? WHERE role_id = ?", (admin[0], role_id))
+        cursor = connection.execute("DELETE FROM roles WHERE id = ? AND name != 'admin'", (role_id,))
+    return cursor.rowcount > 0
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()

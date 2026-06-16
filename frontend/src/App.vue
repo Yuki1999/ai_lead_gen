@@ -334,9 +334,95 @@ const settingsAgentKeyInput = ref("");
 const settingsEmailPasswordInput = ref("");
 const settingsEmailTemplate = ref("");
 const settingsScoringRules = ref("");
+
+// ── Roles & Users management ──
+const ALL_PERMISSIONS = [
+  "leads:read", "leads:write", "outreach:send", "outreach:approve",
+  "replies:sync", "replies:analyze", "settings:read", "settings:write",
+  "users:manage", "agent:chat",
+];
+const permLabels: Record<string, string> = {
+  "leads:read": "查看线索", "leads:write": "编辑线索", "outreach:send": "发送外联",
+  "outreach:approve": "审批草稿", "replies:sync": "同步回复", "replies:analyze": "分析回复",
+  "settings:read": "查看设置", "settings:write": "修改设置", "users:manage": "管理用户",
+  "agent:chat": "Agent 对话",
+};
+const allRoles = ref<Array<{ id: number; name: string; permissions: string; user_count: number }>>([]);
+const allUsers = ref<Array<{ id: number; username: string; role_id: number; role_name: string }>>([]);
+const showRoleEditor = ref(false);
+const showUserEditor = ref(false);
+const editingRole = ref({ id: 0, name: "", permissions: [] as string[] });
+const editingUser = ref({ id: 0, username: "", password: "", role_id: 0 });
+
+async function loadRolesAndUsers(): Promise<void> {
+  try {
+    const [r, u] = await Promise.all([
+      request<{ roles: typeof allRoles.value }>("/roles"),
+      request<{ users: typeof allUsers.value }>("/users"),
+    ]);
+    allRoles.value = r.roles.map((role) => ({ ...role, permissions: typeof role.permissions === "string" ? JSON.parse(role.permissions) : role.permissions }));
+    allUsers.value = u.users;
+  } catch { /* ignore */ }
+}
+
+function openNewRole(): void {
+  editingRole.value = { id: 0, name: "", permissions: [] };
+  showRoleEditor.value = true;
+}
+
+function openEditRole(role: typeof allRoles.value[0]): void {
+  const perms = typeof role.permissions === "string" ? JSON.parse(role.permissions) as string[] : role.permissions;
+  editingRole.value = { id: role.id, name: role.name, permissions: perms };
+  showRoleEditor.value = true;
+}
+
+async function saveRole(): Promise<void> {
+  const body = { name: editingRole.value.name, permissions: editingRole.value.permissions };
+  if (editingRole.value.id > 0) {
+    await request(`/roles/${editingRole.value.id}`, { method: "PUT", body: JSON.stringify(body) });
+  } else {
+    await request("/roles", { method: "POST", body: JSON.stringify(body) });
+  }
+  showRoleEditor.value = false;
+  await loadRolesAndUsers();
+}
+
+async function deleteRole(roleId: number): Promise<void> {
+  if (!globalThis.confirm?.("确定删除此角色？关联的用户将移至管理员角色。")) return;
+  await request(`/roles/${roleId}`, { method: "DELETE" });
+  await loadRolesAndUsers();
+}
+
+function openNewUser(): void {
+  editingUser.value = { id: 0, username: "", password: "", role_id: allRoles.value[0]?.id || 1 };
+  showUserEditor.value = true;
+}
+
+function openEditUser(user: typeof allUsers.value[0]): void {
+  editingUser.value = { id: user.id, username: user.username, password: "", role_id: user.role_id };
+  showUserEditor.value = true;
+}
+
+async function saveUser(): Promise<void> {
+  const body: Record<string, unknown> = { username: editingUser.value.username, role_id: editingUser.value.role_id };
+  if (editingUser.value.password) body.password = editingUser.value.password;
+  if (editingUser.value.id > 0) {
+    await request(`/users/${editingUser.value.id}`, { method: "PUT", body: JSON.stringify(body) });
+  } else {
+    await request("/users", { method: "POST", body: JSON.stringify(body) });
+  }
+  showUserEditor.value = false;
+  await loadRolesAndUsers();
+}
+
+async function deleteUser(userId: number): Promise<void> {
+  if (!globalThis.confirm?.("确定删除此用户？")) return;
+  await request(`/users/${userId}`, { method: "DELETE" });
+  await loadRolesAndUsers();
+}
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
-const settingsTab = ref<"email" | "sync" | "agent" | "template" | "scoring">("email");
+const settingsTab = ref<"email" | "sync" | "agent" | "template" | "scoring" | "access">("email");
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -352,11 +438,26 @@ const STORAGE_TOKEN_KEY = "medbot_auth_token";
 const STORAGE_USERNAME_KEY = "medbot_auth_username";
 const authToken = ref(localStorageGet(STORAGE_TOKEN_KEY));
 const authUsername = ref(localStorageGet(STORAGE_USERNAME_KEY));
+const authPermissions = ref<string[]>(JSON.parse(localStorageGet("medbot_auth_permissions") || "[]"));
 const loginUsername = ref("");
 const loginPassword = ref("");
 const loginLoading = ref(false);
 const loginError = ref("");
 const isAuthenticated = computed(() => !!authToken.value);
+
+function hasPermission(perm: string): boolean {
+  return authPermissions.value.includes(perm);
+}
+
+function updateAuthPermissions(token: string): void {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    authPermissions.value = payload.perms || [];
+    localStorageSet("medbot_auth_permissions", JSON.stringify(authPermissions.value));
+  } catch {
+    authPermissions.value = [];
+  }
+}
 
 function localStorageGet(key: string): string {
   try {
@@ -541,8 +642,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 function clearAuth(): void {
   authToken.value = "";
   authUsername.value = "";
+  authPermissions.value = [];
   localStorageRemove(STORAGE_TOKEN_KEY);
   localStorageRemove(STORAGE_USERNAME_KEY);
+  localStorageRemove("medbot_auth_permissions");
 }
 
 async function login(): Promise<void> {
@@ -575,6 +678,7 @@ async function login(): Promise<void> {
     const data = await resp.json() as { access_token: string; username: string };
     authToken.value = data.access_token;
     authUsername.value = data.username;
+    updateAuthPermissions(data.access_token);
     localStorageSet(STORAGE_TOKEN_KEY, data.access_token);
     localStorageSet(STORAGE_USERNAME_KEY, data.username);
     loginPassword.value = "";
@@ -1420,6 +1524,7 @@ async function loadSettings(): Promise<void> {
     agentApiBaseUrl.value = settings.value.api_base_url || "";
     settingsEmailTemplate.value = settings.value.email_template || "";
     settingsScoringRules.value = settings.value.scoring_rules || "";
+    if (hasPermission("users:manage")) loadRolesAndUsers();
   } catch {
     // use defaults
   } finally {
@@ -1931,6 +2036,7 @@ onMounted(async () => {
           <span v-if="draftCount > 0" class="nav-badge">{{ draftCount }}</span>
         </button>
         <button
+          v-if="hasPermission('settings:read')"
           type="button"
           :class="{ active: activePage === 'settings' }"
           @click="showPage('settings')"
@@ -2788,13 +2894,14 @@ onMounted(async () => {
               </div>
             </div>
             <div class="list-head-right">
-              <n-button class="ghost-button" secondary size="small" @click="openCreateLead">
+              <n-button v-if="hasPermission('leads:write')" class="ghost-button" secondary size="small" @click="openCreateLead">
                 <template #icon><n-icon><Plus /></n-icon></template>
                 添加线索
               </n-button>
               <template v-if="selectedLeadIds.length > 0">
                 <span class="selection-count">已选 {{ selectedLeadIds.length }} 条</span>
                 <n-button
+                  v-if="hasPermission('outreach:send')"
                   class="primary-button"
                   type="primary"
                   size="small"
@@ -2862,8 +2969,8 @@ onMounted(async () => {
             </div>
 
             <div class="lead-tools" @click.stop>
-              <button v-if="lead.status === 'new' && !(lead.draft_count && lead.draft_count > 0)" class="lead-action-btn" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
-              <button v-if="lead.email" class="lead-action-btn primary" @click="openCustomEmail(lead.id)"><Edit3 :size="13" />自拟定</button>
+              <button v-if="hasPermission('outreach:send') && lead.status === 'new' && !(lead.draft_count && lead.draft_count > 0)" class="lead-action-btn" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
+              <button v-if="hasPermission('outreach:send') && lead.email" class="lead-action-btn primary" @click="openCustomEmail(lead.id)"><Edit3 :size="13" />自拟定</button>
               <span v-if="lead.status === 'new' && lead.draft_count && lead.draft_count > 0" class="draft-indicator">📝 {{ lead.draft_count }}条待审</span>
               <button v-if="['new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
               <button v-if="lead.status === 'rejected'" class="lead-action-btn" @click="reactivateLead(lead.id)"><RefreshCw :size="13" />激活</button>
@@ -3097,6 +3204,7 @@ onMounted(async () => {
             <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
             <button :class="['settings-tab', { active: settingsTab === 'template' }]" @click="settingsTab = 'template'">模板</button>
             <button :class="['settings-tab', { active: settingsTab === 'scoring' }]" @click="settingsTab = 'scoring'">评分</button>
+            <button v-if="hasPermission('users:manage')" :class="['settings-tab', { active: settingsTab === 'access' }]" @click="settingsTab = 'access'">权限</button>
           </div>
 
           <section v-if="settingsTab === 'template'" class="settings-card">
@@ -3133,6 +3241,57 @@ onMounted(async () => {
                 placeholder="输入评分规则..."
               />
             </label>
+          </section>
+
+          <section v-if="settingsTab === 'access'" class="settings-card">
+            <div class="settings-card-head">
+              <div>
+                <p class="panel-label">用户与权限</p>
+                <h3>角色与用户管理</h3>
+                <p>创建角色、分配权限、管理用户账号。</p>
+              </div>
+            </div>
+
+            <!-- Roles -->
+            <div style="margin-bottom:20px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <p class="panel-label">角色（{{ allRoles.length }}）</p>
+                <n-button size="tiny" secondary @click="openNewRole"><template #icon><n-icon><Plus /></n-icon></template>新建角色</n-button>
+              </div>
+              <div v-if="allRoles.length === 0" class="history-empty">加载中...</div>
+              <article v-for="role in allRoles" :key="role.id" class="history-card">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <strong>{{ role.name }}</strong>
+                  <small>{{ role.user_count }} 个用户</small>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">
+                  <n-tag v-for="p in (typeof role.permissions === 'string' ? JSON.parse(role.permissions) : role.permissions)" :key="p" size="tiny" round :bordered="false">{{ permLabels[p] || p }}</n-tag>
+                </div>
+                <div class="history-actions">
+                  <n-button size="tiny" secondary @click="openEditRole(role)">编辑</n-button>
+                  <n-button v-if="role.name !== 'admin'" size="tiny" secondary @click="deleteRole(role.id)" style="color:#ef4444">删除</n-button>
+                </div>
+              </article>
+            </div>
+
+            <!-- Users -->
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <p class="panel-label">用户（{{ allUsers.length }}）</p>
+                <n-button size="tiny" secondary @click="openNewUser"><template #icon><n-icon><Plus /></n-icon></template>新建用户</n-button>
+              </div>
+              <div v-if="allUsers.length === 0" class="history-empty">加载中...</div>
+              <article v-for="user in allUsers" :key="user.id" class="history-card">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <strong>{{ user.username }}</strong>
+                  <n-tag size="tiny" round :bordered="false">{{ user.role_name }}</n-tag>
+                </div>
+                <div class="history-actions">
+                  <n-button size="tiny" secondary @click="openEditUser(user)">编辑</n-button>
+                  <n-button v-if="user.username !== 'microport_admin'" size="tiny" secondary @click="deleteUser(user.id)" style="color:#ef4444">删除</n-button>
+                </div>
+              </article>
+            </div>
           </section>
 
           <section v-if="settingsTab === 'email'" class="settings-card">
@@ -3352,6 +3511,57 @@ onMounted(async () => {
             <template #icon><n-icon><Save /></n-icon></template>
             保存
           </n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- Role Editor Modal -->
+    <div v-if="showRoleEditor" class="modal-backdrop" role="presentation" @click.self="showRoleEditor = false">
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="编辑角色">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">权限管理</p>
+            <h2>{{ editingRole.id ? '编辑角色' : '新建角色' }}</h2>
+          </div>
+          <button class="icon-only-button" type="button" @click="showRoleEditor = false"><X :size="20" /></button>
+        </header>
+        <div class="create-lead-body">
+          <label class="field"><span>角色名称</span><n-input v-model:value="editingRole.name" placeholder="如 operator, viewer" /></label>
+          <p class="panel-label" style="margin-top:12px">权限</p>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            <label v-for="p in ALL_PERMISSIONS" :key="p" class="attachment-check">
+              <n-checkbox :checked="editingRole.permissions.includes(p)" @update:checked="(c: boolean) => { if (c) editingRole.permissions.push(p); else editingRole.permissions = editingRole.permissions.filter(x => x !== p); }" />
+              <span>{{ permLabels[p] || p }}</span>
+            </label>
+          </div>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showRoleEditor = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :disabled="!editingRole.name" @click="saveRole">保存</n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- User Editor Modal -->
+    <div v-if="showUserEditor" class="modal-backdrop" role="presentation" @click.self="showUserEditor = false">
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="编辑用户">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">用户管理</p>
+            <h2>{{ editingUser.id ? '编辑用户' : '新建用户' }}</h2>
+          </div>
+          <button class="icon-only-button" type="button" @click="showUserEditor = false"><X :size="20" /></button>
+        </header>
+        <div class="create-lead-body">
+          <label class="field"><span>用户名</span><n-input v-model:value="editingUser.username" /></label>
+          <label class="field"><span>密码{{ editingUser.id ? '（留空则不变）' : '' }}</span><n-input v-model:value="editingUser.password" type="password" show-password-on="click" /></label>
+          <label class="field"><span>角色</span>
+            <n-select v-model:value="editingUser.role_id" :options="allRoles.map(r => ({ label: r.name, value: r.id }))" />
+          </label>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="ghost-button" secondary @click="showUserEditor = false">取消</n-button>
+          <n-button class="primary-button" type="primary" :disabled="!editingUser.username" @click="saveUser">保存</n-button>
         </footer>
       </section>
     </div>
