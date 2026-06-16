@@ -22,6 +22,15 @@ def get_agent_base_url() -> str:
 
 def get_agent_headers() -> dict[str, str]:
     token = os.getenv("AGENT_TOKEN", "").strip()
+    if not token:
+        # Fallback: read from agent .env file
+        from pathlib import Path
+        agent_env = Path(__file__).resolve().parents[2] / "agent" / ".env"
+        if agent_env.exists():
+            for line in agent_env.read_text().splitlines():
+                if line.strip().startswith("AGENT_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
