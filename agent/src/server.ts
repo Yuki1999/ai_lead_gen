@@ -67,6 +67,26 @@ export function createServer(options: CreateServerOptions = {}) {
         return;
       }
 
+      // ── Session CRUD ────────────────────────────────────
+      if (request.method === "GET" && request.url === "/sessions") {
+        const { listSessions } = await import("./piSession.js");
+        const sessions = await listSessions();
+        sendJson(response, 200, { sessions }, config);
+        return;
+      }
+
+      if (request.method === "DELETE" && request.url?.startsWith("/sessions/")) {
+        const sessionId = decodeURIComponent(request.url.slice(10));
+        if (!sessionId) {
+          sendJson(response, 400, { detail: "session id required" }, config);
+          return;
+        }
+        const { deleteSession } = await import("./piSession.js");
+        deleteSession(sessionId);
+        sendJson(response, 200, { ok: true, deleted: sessionId }, config);
+        return;
+      }
+
       if (
         request.method === "POST" &&
         (request.url === "/agent/chat" || request.url === "/agent/chat/stream")

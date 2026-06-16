@@ -15,7 +15,7 @@ from app.auth import require_auth, verify_credentials, create_access_token, deco
 
 _logger = logging.getLogger("medbot")
 from app.agent_config import agent_config_status, test_agent_connection, update_agent_config
-from app.agent_proxy import AgentProxyError, forward_agent_chat, forward_agent_chat_stream
+from app.agent_proxy import AgentProxyError, forward_agent_chat, forward_agent_chat_stream, get_agent_base_url, get_agent_headers
 from app.email_service import (
     fetch_inbox_replies,
     is_configured as email_is_configured,
@@ -183,6 +183,34 @@ def create_app() -> FastAPI:
         except AgentProxyError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         return StreamingResponse(stream, media_type="text/event-stream")
+
+    @app.get("/agent/sessions")
+    def list_agent_sessions() -> dict[str, object]:
+        """Proxy session list from the agent sidecar."""
+        try:
+            import requests as req
+            base = get_agent_base_url()
+            headers = get_agent_headers()
+            resp = req.get(f"{base}/sessions", headers=headers, timeout=10)
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=resp.text)
+            return resp.json()
+        except req.RequestException as exc:
+            raise HTTPException(status_code=503, detail=f"Agent sidecar unavailable: {exc}")
+
+    @app.delete("/agent/sessions/{session_id}")
+    def delete_agent_session(session_id: str) -> dict[str, object]:
+        """Proxy session deletion to the agent sidecar."""
+        try:
+            import requests as req
+            base = get_agent_base_url()
+            headers = get_agent_headers()
+            resp = req.delete(f"{base}/sessions/{session_id}", headers=headers, timeout=10)
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=502, detail=resp.text)
+            return resp.json()
+        except req.RequestException as exc:
+            raise HTTPException(status_code=503, detail=f"Agent sidecar unavailable: {exc}")
 
     @app.get("/agent/config", response_model=AgentConfigResponse)
     def agent_config() -> dict[str, object]:

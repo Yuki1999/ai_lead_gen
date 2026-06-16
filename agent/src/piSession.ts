@@ -1,4 +1,5 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { getModel } from "@earendil-works/pi-ai";
 import {
@@ -11,6 +12,7 @@ import {
   SessionManager,
   type AgentSession,
   type AgentSessionEvent,
+  type SessionInfo,
   type Skill,
 } from "@earendil-works/pi-coding-agent";
 
@@ -57,6 +59,131 @@ type CachedSessionEntry<TSession> =
 // finally; cached sessions are disposed when their runtime config changes.
 const sessionCache = new Map<string, CachedSessionEntry<AgentSession>>();
 const promptLocks = new Map<string, Promise<void>>();
+
+// ── Session Persistence ──────────────────────────────────────────────
+// Client session_ids are mapped to SDK session files so conversations
+// survive agent restarts. The mapping is stored as a JSON file alongside
+// the SDK's JSONL session files.
+
+let _sessionsDir = "";
+let _mappingPath = "";
+
+function sessionsDir(): string {
+  if (!_sessionsDir) {
+    const agentDir = getAgentDir();
+    _sessionsDir = join(agentDir, "sessions");
+  }
+  return _sessionsDir;
+}
+
+function mappingPath(): string {
+  if (!_mappingPath) {
+    _mappingPath = join(sessionsDir(), "session-mapping.json");
+  }
+  return _mappingPath;
+}
+
+function loadSessionMapping(): Record<string, string> {
+  try {
+    if (existsSync(mappingPath())) {
+      return JSON.parse(readFileSync(mappingPath(), "utf8"));
+    }
+  } catch { /* ignore corrupt mapping */ }
+  return {};
+}
+
+function saveSessionMapping(clientId: string, sdkPath: string): void {
+  mkdirSync(sessionsDir(), { recursive: true });
+  const mapping = loadSessionMapping();
+  mapping[clientId] = sdkPath;
+  writeFileSync(mappingPath(), JSON.stringify(mapping, null, 2), "utf8");
+}
+
+function removeSessionMapping(clientId: string): void {
+  const mapping = loadSessionMapping();
+  delete mapping[clientId];
+  writeFileSync(mappingPath(), JSON.stringify(mapping, null, 2), "utf8");
+}
+
+// ── Public Session API ───────────────────────────────────────────────
+
+export interface SessionSummary {
+  id: string;
+  created: string;
+  modified: string;
+  messageCount: number;
+  firstMessage: string;
+  cwd: string;
+}
+
+export async function listSessions(): Promise<SessionSummary[]> {
+  try {
+    const mapping = loadSessionMapping();
+    const summaries: SessionSummary[] = [];
+
+    for (const [clientId, sdkPath] of Object.entries(mapping)) {
+      if (!existsSync(sdkPath)) continue;
+      try {
+        const sessionMgr = SessionManager.open(sdkPath, sessionsDir());
+        const header = sessionMgr.getHeader();
+        const entries = sessionMgr.getEntries();
+        const firstMsg = entries.find((e) => e.type === "message") as { message?: { content?: unknown } } | undefined;
+        const firstText = firstMsg?.message?.content
+          ? String(
+              Array.isArray((firstMsg.message as { content: unknown[] }).content)
+                ? (firstMsg.message as { content: { text?: string }[] }).content
+                    .map((c) => c.text || "")
+                    .join(" ")
+                : (firstMsg.message as { content: string }).content,
+            ).slice(0, 120)
+          : "";
+
+        summaries.push({
+          id: clientId,
+          created: header?.timestamp || "",
+          modified: entries.length > 0 ? entries[entries.length - 1].timestamp : "",
+          messageCount: entries.filter((e) => e.type === "message").length,
+          firstMessage: firstText,
+          cwd: header?.cwd || "",
+        });
+      } catch {
+        summaries.push({
+          id: clientId,
+          created: "",
+          modified: "",
+          messageCount: 0,
+          firstMessage: "(无法读取)",
+          cwd: "",
+        });
+      }
+    }
+    return summaries;
+  } catch {
+    return [];
+  }
+}
+
+export function deleteSession(clientId: string): boolean {
+  // Dispose cached session
+  const entry = sessionCache.get(clientId);
+  if (entry && !isPendingSession(entry)) {
+    entry.session.dispose();
+    sessionCache.delete(clientId);
+  }
+  promptLocks.delete(clientId);
+
+  // Remove SDK session file
+  const mapping = loadSessionMapping();
+  const sdkPath = mapping[clientId];
+  if (sdkPath) {
+    try {
+      unlinkSync(sdkPath);
+    } catch { /* file may already be gone */ }
+  }
+
+  removeSessionMapping(clientId);
+  return true;
+}
 
 export function buildSystemPrompt(base?: string): string {
   return base ? `${base}\n\n${DEFAULT_SYSTEM_PROMPT}` : DEFAULT_SYSTEM_PROMPT;
@@ -258,7 +385,7 @@ async function runPiChatPrompt(
     const managedSession = await getOrCreateCachedSession(
       sessionId,
       piSessionConfigKey(config),
-      () => createManagedPiSession(config),
+      () => createManagedPiSession(config, sessionId),
       sessionCache,
       (session) => session.dispose(),
     );
@@ -303,6 +430,7 @@ async function runPiChatPrompt(
 
 async function createManagedPiSession(
   config: AgentConfig,
+  clientSessionId: string,
 ): Promise<{ session: AgentSession; configKey: string }> {
   if (!existsSync(config.skillPath)) {
     throw new Error(`Default skill not found at ${config.skillPath}`);
@@ -310,6 +438,9 @@ async function createManagedPiSession(
 
   const projectRoot = config.projectRoot || process.cwd();
   const agentDir = getAgentDir();
+  const dir = sessionsDir();
+  mkdirSync(dir, { recursive: true });
+
   const authStorage = AuthStorage.inMemory();
   if (config.apiKey) {
     authStorage.setRuntimeApiKey(config.modelProvider, config.apiKey);
@@ -325,6 +456,21 @@ async function createManagedPiSession(
     throw new Error(
       `Pi model not found for provider ${config.modelProvider} and model ${config.modelName}`,
     );
+  }
+
+  // Resolve session file: reuse existing or create new
+  const mapping = loadSessionMapping();
+  let sessionMgr: SessionManager;
+  const existingPath = mapping[clientSessionId];
+
+  if (existingPath && existsSync(existingPath)) {
+    sessionMgr = SessionManager.open(existingPath, dir, projectRoot);
+  } else {
+    sessionMgr = SessionManager.create(projectRoot, dir);
+    const filePath = sessionMgr.getSessionFile();
+    if (filePath) {
+      saveSessionMapping(clientSessionId, filePath);
+    }
   }
 
   const backend = new BackendClient(config.backendBaseUrl, config.agentToken);
@@ -347,7 +493,7 @@ async function createManagedPiSession(
     authStorage,
     modelRegistry,
     resourceLoader,
-    sessionManager: SessionManager.inMemory(projectRoot),
+    sessionManager: sessionMgr,
     customTools: businessTools,
     tools: businessTools.map((tool) => tool.name),
   });
