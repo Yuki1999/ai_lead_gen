@@ -42,6 +42,7 @@ import {
   NIcon,
   NInput,
   NInputNumber,
+  NPagination,
   NSelect,
   NTag,
   type SelectOption,
@@ -203,7 +204,7 @@ interface AgentConfigResponse {
   restart_required: boolean;
 }
 
-const apiBase = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const apiBase = import.meta.env.VITE_API_BASE_URL || "/api";
 const naiveThemeOverrides = {
   common: {
     primaryColor: "#2563EB",
@@ -336,17 +337,44 @@ const settingsEmailTemplate = ref("");
 const settingsScoringRules = ref("");
 
 // ── Roles & Users management ──
-const ALL_PERMISSIONS = [
-  "leads:read", "leads:write", "outreach:send", "outreach:approve",
-  "replies:sync", "replies:analyze", "settings:read", "settings:write",
-  "users:manage", "agent:chat",
-];
-const permLabels: Record<string, string> = {
-  "leads:read": "查看线索", "leads:write": "编辑线索", "outreach:send": "发送外联",
-  "outreach:approve": "审批草稿", "replies:sync": "同步回复", "replies:analyze": "分析回复",
-  "settings:read": "查看设置", "settings:write": "修改设置", "users:manage": "管理用户",
-  "agent:chat": "Agent 对话",
-};
+//
+// Permission catalog is fetched from the backend (/permissions/registry) so
+// adding a permission only requires a backend change. The registry response
+// also drives the role-editor UI (groupings, presets, descriptions).
+interface PermissionMeta { key: string; group: string; group_label: string; label: string; description: string }
+interface PermissionGroup { key: string; label: string; permissions: string[] }
+interface PermissionPreset { key: string; label: string; description: string; permissions: string[] }
+interface PermissionRegistry {
+  permissions: PermissionMeta[];
+  groups: PermissionGroup[];
+  presets: PermissionPreset[];
+}
+const permissionRegistry = ref<PermissionRegistry | null>(null);
+
+const ALL_PERMISSIONS = computed<string[]>(() =>
+  permissionRegistry.value?.permissions.map((p) => p.key) ?? [],
+);
+const permLabels = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {};
+  for (const p of permissionRegistry.value?.permissions ?? []) {
+    map[p.key] = p.label;
+  }
+  return map;
+});
+const permissionGroupsForUI = computed<PermissionGroup[]>(() =>
+  permissionRegistry.value?.groups ?? [],
+);
+const permissionPresets = computed<PermissionPreset[]>(() =>
+  permissionRegistry.value?.presets ?? [],
+);
+
+async function loadPermissionRegistry(): Promise<void> {
+  if (permissionRegistry.value) return;
+  try {
+    permissionRegistry.value = await request<PermissionRegistry>("/permissions/registry");
+  } catch { /* falls back to empty list — UI hides the editor */ }
+}
+
 const allRoles = ref<Array<{ id: number; name: string; permissions: string; user_count: number }>>([]);
 const allUsers = ref<Array<{ id: number; username: string; role_id: number; role_name: string }>>([]);
 const showRoleEditor = ref(false);
@@ -356,6 +384,7 @@ const editingUser = ref({ id: 0, username: "", password: "", role_id: 0 });
 
 async function loadRolesAndUsers(): Promise<void> {
   try {
+    await loadPermissionRegistry();
     const [r, u] = await Promise.all([
       request<{ roles: typeof allRoles.value }>("/roles"),
       request<{ users: typeof allUsers.value }>("/users"),
@@ -385,6 +414,9 @@ async function saveRole(): Promise<void> {
   }
   showRoleEditor.value = false;
   await loadRolesAndUsers();
+  // If the admin just edited a role they themselves hold, their own UI permissions
+  // need to refresh — backend cache is wiped, but the frontend ref isn't.
+  await refreshPermissions();
 }
 
 async function deleteRole(roleId: number): Promise<void> {
@@ -413,6 +445,8 @@ async function saveUser(): Promise<void> {
   }
   showUserEditor.value = false;
   await loadRolesAndUsers();
+  // If the admin edited their own role assignment, their own UI must refresh.
+  await refreshPermissions();
 }
 
 async function deleteUser(userId: number): Promise<void> {
@@ -446,20 +480,47 @@ const loginError = ref("");
 const isAuthenticated = computed(() => !!authToken.value);
 
 function hasPermission(perm: string): boolean {
-  return authPermissions.value.includes(perm);
+  // Wildcard rules — must match backend app/permissions.py::matches:
+  //   "*"          → grants everything
+  //   "<group>:*"  → grants every action in that group
+  //   exact match  → as you'd expect
+  const granted = authPermissions.value;
+  if (!granted || granted.length === 0) return false;
+  if (granted.includes("*")) return true;
+  if (granted.includes(perm)) return true;
+  const colon = perm.indexOf(":");
+  if (colon > 0) {
+    const groupWildcard = perm.slice(0, colon) + ":*";
+    if (granted.includes(groupWildcard)) return true;
+  }
+  return false;
 }
 
-function updateAuthPermissions(token: string): void {
+function setAuthPermissions(perms: string[] | undefined | null): void {
+  const list = Array.isArray(perms) ? perms.map(String) : [];
+  authPermissions.value = list;
+  localStorageSet("medbot_auth_permissions", JSON.stringify(list));
+}
+
+async function refreshPermissions(): Promise<void> {
+  // Re-pull the latest permissions from the server. Cheap (cached for 30s
+  // backend-side); call after admin actions or on a periodic timer so users
+  // see role changes without a manual reload.
+  if (!authToken.value) return;
   try {
-    // JWT uses URL-safe base64 (no padding). Convert to standard base64 for atob.
-    const raw = token.split(".")[1];
-    const base64 = raw.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-    const payload = JSON.parse(atob(padded));
-    authPermissions.value = payload.perms || [];
-    localStorageSet("medbot_auth_permissions", JSON.stringify(authPermissions.value));
+    const resp = await fetch(`${apiBase}/auth/verify`, {
+      headers: { Authorization: `Bearer ${authToken.value}` },
+    });
+    if (!resp.ok) {
+      if (resp.status === 401) clearAuth();
+      return;
+    }
+    const data = await resp.json() as {
+      username: string; valid: boolean; permissions?: string[];
+    };
+    if (data.valid) setAuthPermissions(data.permissions);
   } catch {
-    authPermissions.value = [];
+    // network glitch — keep current state
   }
 }
 
@@ -679,10 +740,14 @@ async function login(): Promise<void> {
       return;
     }
 
-    const data = await resp.json() as { access_token: string; username: string };
+    const data = await resp.json() as {
+      access_token: string;
+      username: string;
+      permissions?: string[];
+    };
     authToken.value = data.access_token;
     authUsername.value = data.username;
-    updateAuthPermissions(data.access_token);
+    setAuthPermissions(data.permissions);
     localStorageSet(STORAGE_TOKEN_KEY, data.access_token);
     localStorageSet(STORAGE_USERNAME_KEY, data.username);
     loginPassword.value = "";
@@ -709,10 +774,14 @@ async function verifyAndRestoreAuth(): Promise<boolean> {
       clearAuth();
       return false;
     }
-    const data = await resp.json() as { username: string; valid: boolean };
+    const data = await resp.json() as {
+      username: string;
+      valid: boolean;
+      permissions?: string[];
+    };
     if (data.valid && data.username) {
       authUsername.value = data.username;
-      updateAuthPermissions(authToken.value);
+      setAuthPermissions(data.permissions);
       localStorageSet(STORAGE_USERNAME_KEY, data.username);
       return true;
     }
@@ -1422,6 +1491,12 @@ function onLeadPageChange(page: number): void {
   runAction("dashboard", () => loadDashboard(false));
 }
 
+function onLeadPageSizeChange(size: number): void {
+  leadPageSize.value = size;
+  leadPage.value = 1;
+  runAction("dashboard", () => loadDashboard(false));
+}
+
 function setLeadSelection(leadId: number, checked: boolean): void {
   if (checked) {
     selectedLeadIds.value = [...new Set([...selectedLeadIds.value, leadId])];
@@ -1956,6 +2031,22 @@ onMounted(async () => {
       await Promise.all([loadProductProfile(), loadDashboard()]);
     });
     void loadAgentConfig();
+    void loadPermissionRegistry();
+
+    // Periodically re-pull permissions so admin-side role changes propagate
+    // without forcing the user to refresh the page. The backend caches the
+    // lookup for 30s so this is cheap.
+    const PERM_REFRESH_MS = 5 * 60 * 1000;
+    const timer = globalThis.setInterval(() => {
+      if (authToken.value) void refreshPermissions();
+    }, PERM_REFRESH_MS);
+    // Refresh on tab focus too — gives the user immediate feedback after a
+    // role change without waiting for the timer.
+    const onFocus = () => { if (authToken.value) void refreshPermissions(); };
+    globalThis.addEventListener?.("focus", onFocus);
+    // No onUnmounted in App.vue — the root component lives for the session,
+    // so manual cleanup is unnecessary; storing the handles for symmetry only.
+    void timer; void onFocus;
   }
 });
 </script>
@@ -2200,19 +2291,19 @@ onMounted(async () => {
               </span>
               <div class="product-title-copy">
                 <p class="panel-label">产品画像</p>
-                <strong>{{ productProfile.product_name }}</strong>
-                <span class="product-procedure">{{ productProfile.procedure }}</span>
+                <strong>{{ productProfile?.product_name }}</strong>
+                <span class="product-procedure">{{ productProfile?.procedure }}</span>
               </div>
             </div>
-            <p>{{ productProfile.summary }}</p>
+            <p>{{ productProfile?.summary }}</p>
             <div class="chip-row">
-              <span v-for="point in productProfile.value_points.slice(0, 2)" :key="point">
+              <span v-for="point in productProfile?.value_points.slice(0, 2) || []" :key="point">
                 {{ point }}
               </span>
             </div>
             <small>
-              资料：{{ productProfile.source_files.length }} PDF ·
-              {{ productProfile.video_assets.length }} 视频
+              资料：{{ productProfile?.source_files.length || 0 }} PDF ·
+              {{ productProfile?.video_assets.length || 0 }} 视频
             </small>
           </n-card>
 
@@ -2285,9 +2376,9 @@ onMounted(async () => {
           <p class="selection-copy">已选择 {{ selectedCount }} 个邮箱</p>
 
           <n-card v-if="lastEmail" class="email-preview" aria-label="触达内容预览" :bordered="false">
-            <strong>{{ lastEmail.subject }}</strong>
-            <span>{{ lastEmail.sent_to }}</span>
-            <p>{{ lastEmail.body }}</p>
+            <strong>{{ lastEmail?.subject }}</strong>
+            <span>{{ lastEmail?.sent_to }}</span>
+            <p>{{ lastEmail?.body }}</p>
           </n-card>
         </section>
 
@@ -2993,7 +3084,7 @@ onMounted(async () => {
               show-size-picker
               :page-sizes="[10, 20, 50]"
               @update:page="onLeadPageChange"
-              @update:page-size="(size: number) => { leadPageSize = size; leadPage = 1; loadDashboard(false); }"
+              @update:page-size="onLeadPageSizeChange"
             />
           </div>
         </section>
