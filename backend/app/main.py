@@ -63,6 +63,8 @@ from app.web_search import discover_real_prospects, fetch_source_preview, search
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        from app.auth import validate_secrets
+        validate_secrets()
         db.init_db()
         bg_task = asyncio.create_task(_auto_sync_loop())
         try:
@@ -174,6 +176,18 @@ def create_app() -> FastAPI:
             "username": username,
             "valid": True,
         }
+
+    # ── Permission registry ─────────────────────────────
+
+    @app.get("/permissions/registry")
+    def permission_registry(_: str = Depends(require_auth)) -> dict[str, object]:
+        """Return the canonical permission catalog (keys, groups, labels, presets).
+
+        The frontend pulls this at boot to populate the role editor — there is
+        no hard-coded permission list in the UI.
+        """
+        from app.permissions import registry_payload
+        return registry_payload()
 
     # ── Product ─────────────────────────────────────────
 
@@ -694,92 +708,20 @@ def create_app() -> FastAPI:
                 detail="Email not configured.",
             )
 
-        # Fetch replies from inbox
         inbox_replies = fetch_inbox_replies(max_count=30)
-
-        # Build lookup: exact email → lead, and domain → leads
-        all_leads = db.list_leads()
-        email_to_lead: dict[str, dict[str, object]] = {}
-        domain_to_leads: dict[str, list[dict[str, object]]] = {}
-
-        for lead in all_leads:
-            lead_email = str(lead.get("email", "")).strip().lower()
-            if not lead_email:
-                continue
-            email_to_lead[lead_email] = lead
-
-            # Domain fallback
-            domain = lead_email.split("@")[-1] if "@" in lead_email else ""
-            if domain:
-                domain_to_leads.setdefault(domain, []).append(lead)
+        email_to_lead, domain_to_leads = _build_lead_index()
 
         synced: list[dict[str, object]] = []
         skipped: list[dict[str, object]] = []
 
         for reply in inbox_replies:
-            sender = reply.sender_email.lower()
-
-            # 1. Exact email match
-            matched_lead = email_to_lead.get(sender)
-
-            # 2. Domain match fallback
-            if matched_lead is None:
-                sender_domain = sender.split("@")[-1] if "@" in sender else ""
-                candidates = domain_to_leads.get(sender_domain, [])
-                if len(candidates) == 1:
-                    matched_lead = candidates[0]
-                elif len(candidates) > 1:
-                    # Pick the most recently created/updated one
-                    matched_lead = candidates[0]
-
-            if matched_lead is None:
-                skipped.append({
-                    "sender": sender,
-                    "subject": reply.subject,
-                    "reason": "no matching lead",
-                })
+            result = _process_inbox_reply(reply, email_to_lead, domain_to_leads)
+            if result is None:
                 continue
-
-            lead_id = int(matched_lead["id"])
-
-            # Dedup: skip if this exact reply was already synced
-            if _reply_already_synced(reply.message_id):
-                skipped.append({
-                    "sender": sender,
-                    "subject": reply.subject,
-                    "reason": "already synced",
-                })
-                continue
-
-            # Skip if this looks like an auto-reply
-            is_auto = _is_auto_reply(reply.subject, reply.body)
-
-            if is_auto:
-                analysis = analyze_reply("Auto-reply received")
-                # Don't change lead status for auto-replies
+            if result.pop("skipped", False):
+                skipped.append(result)
             else:
-                analysis = analyze_reply(reply.body)
-                db.update_lead(
-                    lead_id,
-                    status=_status_for_intent(analysis.intent, analysis.requires_human),
-                )
-            record = db.insert_reply_analysis(
-                lead_id=lead_id,
-                reply_text=reply.body,
-                analysis=analysis,
-                message_id=reply.message_id,
-            )
-
-            synced.append({
-                "lead_id": lead_id,
-                "company": matched_lead["company_name"],
-                "sender": sender,
-                "subject": reply.subject,
-                "intent": analysis.intent,
-                "confidence": analysis.confidence,
-                "auto_reply": is_auto,
-                "analysis_id": record["id"],
-            })
+                synced.append(result)
 
         return {
             "total_inbox": len(inbox_replies),
@@ -980,29 +922,15 @@ async def _auto_sync_loop() -> None:
             if enabled and interval > 0 and email_is_configured():
                 _logger.info("Auto-sync: checking inbox...")
                 replies = fetch_inbox_replies(max_count=20)
+                email_to_lead, domain_to_leads = _build_lead_index()
                 synced = 0
                 for reply in replies:
-                    if not _reply_already_synced(reply.message_id):
-                        matched = _match_reply_to_lead(reply.sender_email)
-                        if matched:
-                            is_auto = _is_auto_reply(reply.subject, reply.body)
-                            analysis = analyze_reply(reply.body)
-                            db.insert_reply_analysis(
-                                lead_id=int(matched["id"]),
-                                reply_text=reply.body,
-                                analysis=analysis,
-                                message_id=reply.message_id,
-                            )
-                            if not is_auto:
-                                db.update_lead(
-                                    int(matched["id"]),
-                                    status=_status_for_intent(analysis.intent, analysis.requires_human),
-                                )
-                            synced += 1
+                    result = _process_inbox_reply(reply, email_to_lead, domain_to_leads)
+                    if result is not None and not result.get("skipped"):
+                        synced += 1
                 if synced:
                     _logger.info("Auto-sync: synced %d new replies", synced)
 
-            # Sleep for a check interval (every 2 min, or the sync interval, whichever is smaller)
             sleep_seconds = max(120, interval * 60) if interval > 0 else 300
             await asyncio.sleep(sleep_seconds)
         except asyncio.CancelledError:
@@ -1012,27 +940,90 @@ async def _auto_sync_loop() -> None:
             await asyncio.sleep(300)
 
 
-def _match_reply_to_lead(sender_email: str) -> dict[str, object] | None:
-    """Match a sender email to a lead by exact or domain match."""
-    sender = sender_email.lower()
+def _build_lead_index() -> tuple[dict[str, dict[str, object]], dict[str, list[dict[str, object]]]]:
+    """Build email→lead and domain→leads lookup tables from all leads."""
     all_leads = db.list_leads()
+    email_to_lead: dict[str, dict[str, object]] = {}
+    domain_to_leads: dict[str, list[dict[str, object]]] = {}
 
-    # Exact match
     for lead in all_leads:
-        if str(lead.get("email", "")).strip().lower() == sender:
-            return lead
+        lead_email = str(lead.get("email", "")).strip().lower()
+        if not lead_email:
+            continue
+        email_to_lead[lead_email] = lead
+        domain = lead_email.split("@")[-1] if "@" in lead_email else ""
+        if domain:
+            domain_to_leads.setdefault(domain, []).append(lead)
 
-    # Domain match
+    return email_to_lead, domain_to_leads
+
+
+def _match_sender_to_lead(
+    sender_email: str,
+    email_to_lead: dict[str, dict[str, object]],
+    domain_to_leads: dict[str, list[dict[str, object]]],
+) -> dict[str, object] | None:
+    """Match a sender email to a lead by exact email, then domain fallback."""
+    sender = sender_email.lower()
+    matched = email_to_lead.get(sender)
+    if matched is not None:
+        return matched
     sender_domain = sender.split("@")[-1] if "@" in sender else ""
     if sender_domain:
-        candidates = [l for l in all_leads
-                      if str(l.get("email", "")).strip().lower().endswith("@" + sender_domain)]
-        if len(candidates) == 1:
+        candidates = domain_to_leads.get(sender_domain, [])
+        if len(candidates) >= 1:
             return candidates[0]
-        elif len(candidates) > 1:
-            return candidates[0]
-
     return None
+
+
+def _process_inbox_reply(
+    reply: object,  # InboxReply from email_service
+    email_to_lead: dict[str, dict[str, object]],
+    domain_to_leads: dict[str, list[dict[str, object]]],
+) -> dict[str, object] | None:
+    """Process a single inbox reply: match, dedup, analyze, insert, update lead.
+
+    Returns a synced-item dict on success, or a skipped-item dict (with 'skipped': True) if no match / already synced.
+    """
+    sender = reply.sender_email.lower()
+
+    # 1. Match sender to a lead
+    matched_lead = _match_sender_to_lead(sender, email_to_lead, domain_to_leads)
+    if matched_lead is None:
+        return {"sender": sender, "subject": reply.subject, "reason": "no matching lead", "skipped": True}
+
+    lead_id = int(matched_lead["id"])
+
+    # 2. Dedup: skip if already synced
+    if _reply_already_synced(reply.message_id):
+        return {"sender": sender, "subject": reply.subject, "reason": "already synced", "skipped": True}
+
+    # 3. Analyze
+    is_auto = _is_auto_reply(reply.subject, reply.body)
+    analysis = analyze_reply(reply.body)
+
+    # 4. Update lead status (skip for auto-replies)
+    if not is_auto:
+        db.update_lead(lead_id, status=_status_for_intent(analysis.intent, analysis.requires_human))
+
+    # 5. Persist analysis
+    record = db.insert_reply_analysis(
+        lead_id=lead_id,
+        reply_text=reply.body,
+        analysis=analysis,
+        message_id=reply.message_id,
+    )
+
+    return {
+        "lead_id": lead_id,
+        "company": matched_lead["company_name"],
+        "sender": sender,
+        "subject": reply.subject,
+        "intent": analysis.intent,
+        "confidence": analysis.confidence,
+        "auto_reply": is_auto,
+        "analysis_id": record["id"],
+    }
 
 
 def _lead_from_record(record: dict[str, object]) -> CandidateLead:

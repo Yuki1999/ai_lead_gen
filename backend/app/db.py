@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import secrets
 import sqlite3
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -8,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from app.services import CandidateLead, RenderedEmail, ReplyAnalysis
+
+_logger = logging.getLogger("medbot.db")
 
 
 def get_db_path() -> Path:
@@ -117,13 +121,11 @@ def init_db() -> None:
         except Exception:
             pass  # column already exists
 
-        # Seed default admin role and user (idempotent)
+        # Seed default admin role and user (idempotent).
+        # Admin gets the full wildcard so newly added permissions are picked up
+        # automatically without a migration.
         import json
-        all_perms = json.dumps([
-            "leads:read", "leads:write", "outreach:send", "outreach:approve",
-            "replies:sync", "replies:analyze", "settings:read", "settings:write",
-            "users:manage", "agent:chat",
-        ])
+        all_perms = json.dumps(["*"])
         now = _now()
         row = connection.execute("SELECT id FROM roles WHERE name = 'admin'").fetchone()
         if not row:
@@ -138,11 +140,28 @@ def init_db() -> None:
             role_id = connection.execute(
                 "SELECT id FROM roles WHERE name = 'admin'"
             ).fetchone()[0]
+
+            # Generate or read admin password — never use a hardcoded default.
+            admin_password = os.getenv("MEDBOT_ADMIN_PASSWORD")
+            if not admin_password:
+                admin_password = secrets.token_urlsafe(10)
+                # Print to stdout so the operator can capture it on first run.
+                print(
+                    f"\n{'='*60}\n"
+                    f"  FIRST RUN: Created admin user 'microport_admin'\n"
+                    f"  Password: {admin_password}\n"
+                    f"  Set MEDBOT_ADMIN_PASSWORD env var to override on next run.\n"
+                    f"{'='*60}\n"
+                )
+
+            # Late import to avoid circular dependency with auth module
+            from app.auth import hash_password as _hash_pw
+            password_hash = _hash_pw(admin_password)
             connection.execute(
                 "INSERT INTO users (username, password_hash, role_id, created_at) VALUES (?, ?, ?, ?)",
                 (
                     "microport_admin",
-                    "$2b$12$Aed2eJHU0yB9sYJA2VNdUe1HPfle.3QK.wL0dhyfopoEIy0TqW6aW",
+                    password_hash,
                     role_id,
                     now,
                 ),

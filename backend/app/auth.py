@@ -7,6 +7,7 @@ User JWTs embed permissions from their assigned role.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,10 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
+from app.permissions import matches as _perm_matches
+
+_logger = logging.getLogger("medbot.auth")
+
 # ---- Constants ----
 _SECRET_KEY = os.getenv("MEDBOT_JWT_SECRET", "medbot-dev-secret-change-in-production")
 _ALGORITHM = "HS256"
@@ -24,6 +29,36 @@ _TOKEN_EXPIRE_HOURS = 24
 # Service token for agent-to-backend communication.
 # Override via MEDBOT_SERVICE_TOKEN env var in production.
 SERVICE_TOKEN = os.getenv("MEDBOT_SERVICE_TOKEN", "medbot-agent-service-token-dev")
+
+
+def validate_secrets() -> None:
+    """Log warnings when critical secrets are still set to dev defaults.
+
+    Call once at startup. Does NOT crash — this is a demo system, but dev defaults
+    in production are dangerous and the operator must be warned.
+    """
+    warnings: list[str] = []
+
+    if _SECRET_KEY == "medbot-dev-secret-change-in-production":
+        warnings.append(
+            "MEDBOT_JWT_SECRET is using the hardcoded dev default — "
+            "JWT tokens can be forged by anyone with source access."
+        )
+    if SERVICE_TOKEN == "medbot-agent-service-token-dev":
+        warnings.append(
+            "MEDBOT_SERVICE_TOKEN is using the hardcoded dev default — "
+            "the agent-to-backend channel is unprotected."
+        )
+
+    if warnings:
+        _logger.warning("=" * 60)
+        _logger.warning("SECURITY: %d critical secret(s) using dev defaults:", len(warnings))
+        for w in warnings:
+            _logger.warning("  • %s", w)
+        _logger.warning("Set the corresponding env vars before deploying to production.")
+        _logger.warning("=" * 60)
+    else:
+        _logger.info("Secrets validation passed — no dev defaults detected.")
 
 security_scheme = HTTPBearer(auto_error=False)
 
@@ -163,7 +198,7 @@ def require_permission(permission: str) -> Callable:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
         perms: list = payload.get("perms", [])
-        if permission not in perms:
+        if not _perm_matches(perms, permission):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Missing required permission: {permission}",
