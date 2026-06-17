@@ -1,7 +1,10 @@
 """Authentication module: JWT tokens + password verification + RBAC.
 
 Accepts both user JWTs and a static service token (for agent-to-backend calls).
-User JWTs embed permissions from their assigned role.
+
+Permissions are NOT embedded in the JWT — they are looked up from the database
+on every request (with a short TTL cache) so role/permission changes take effect
+without requiring users to re-login or wait for token expiry.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -27,8 +31,16 @@ _ALGORITHM = "HS256"
 _TOKEN_EXPIRE_HOURS = 24
 
 # Service token for agent-to-backend communication.
-# Override via MEDBOT_SERVICE_TOKEN env var in production.
+# Read dynamically via ``service_token()`` so tests can mutate the env after
+# import. ``SERVICE_TOKEN`` is kept as a module-level cached value because some
+# call sites (and tests) read it directly; treat ``service_token()`` as the
+# source of truth in new code.
 SERVICE_TOKEN = os.getenv("MEDBOT_SERVICE_TOKEN", "medbot-agent-service-token-dev")
+
+
+def service_token() -> str:
+    """Return the currently configured service token (re-read from env)."""
+    return os.getenv("MEDBOT_SERVICE_TOKEN", "medbot-agent-service-token-dev")
 
 
 def validate_secrets() -> None:
@@ -44,7 +56,7 @@ def validate_secrets() -> None:
             "MEDBOT_JWT_SECRET is using the hardcoded dev default — "
             "JWT tokens can be forged by anyone with source access."
         )
-    if SERVICE_TOKEN == "medbot-agent-service-token-dev":
+    if service_token() == "medbot-agent-service-token-dev":
         warnings.append(
             "MEDBOT_SERVICE_TOKEN is using the hardcoded dev default — "
             "the agent-to-backend channel is unprotected."
@@ -67,12 +79,16 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def create_access_token(*, user_id: int, username: str, permissions: list[str]) -> str:
-    """Create a signed JWT with embedded permissions."""
+def create_access_token(*, user_id: int, username: str) -> str:
+    """Create a signed JWT containing only the user identity.
+
+    Permissions are intentionally NOT embedded — they are looked up on every
+    request via ``get_user_permissions(uid)``. Storing them in the token would
+    mean role changes don't take effect until expiry (24h).
+    """
     payload = {
         "sub": username,
         "uid": user_id,
-        "perms": permissions,
         "iat": _now(),
         "exp": _now() + timedelta(hours=_TOKEN_EXPIRE_HOURS),
         "jti": secrets.token_hex(8),
@@ -121,6 +137,64 @@ def verify_credentials(username: str, password: str) -> dict[str, object] | None
     }
 
 
+# ── Permission cache ────────────────────────────────────────────────────────
+#
+# require_permission() runs on every request. We cache the (uid → perms) lookup
+# for a short TTL so the per-request DB cost is amortized; cache is invalidated
+# explicitly on user/role mutations (see app.db).
+
+_PERM_CACHE_TTL_SECONDS = 30.0
+_perm_cache: dict[int, tuple[float, list[str]]] = {}
+
+
+def _load_user_permissions(user_id: int) -> list[str] | None:
+    """Read fresh permissions from the database. Returns None if the user is gone."""
+    from app.db import connect
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT r.permissions FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        result = json.loads(row["permissions"] or "[]")
+        return [str(p) for p in result] if isinstance(result, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def get_user_permissions(user_id: int) -> list[str] | None:
+    """Return the current permission list for ``user_id`` (cached up to 30s).
+
+    Returns ``None`` if the user has been deleted or has no role — callers
+    should treat that as 401.
+    """
+    now = time.monotonic()
+    cached = _perm_cache.get(user_id)
+    if cached and (now - cached[0]) < _PERM_CACHE_TTL_SECONDS:
+        return cached[1]
+    perms = _load_user_permissions(user_id)
+    if perms is None:
+        # User is gone — drop any stale cache entry too.
+        _perm_cache.pop(user_id, None)
+        return None
+    _perm_cache[user_id] = (now, perms)
+    return perms
+
+
+def invalidate_permission_cache(user_id: int | None = None) -> None:
+    """Drop cached permissions for one user, or for all users if ``user_id`` is None.
+
+    Called by ``app.db`` after role/user mutations so subsequent requests pick
+    up the new state immediately rather than after the 30s TTL.
+    """
+    if user_id is None:
+        _perm_cache.clear()
+    else:
+        _perm_cache.pop(user_id, None)
+
+
 async def require_auth(
     credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
 ) -> str:
@@ -130,6 +204,8 @@ async def require_auth(
     - A valid user JWT (via login)
     - The static service token (for agent-to-backend communication)
     """
+    if os.getenv("MEDBOT_AUTH_DISABLED", "").lower() in ("1", "true", "yes"):
+        return "auth-disabled"
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -140,7 +216,7 @@ async def require_auth(
     token = credentials.credentials
 
     # Check service token first (for agent-to-backend calls)
-    if token == SERVICE_TOKEN:
+    if token == service_token():
         return "agent-service"
 
     # Check JWT
@@ -163,7 +239,10 @@ async def require_auth(
 
 
 def require_permission(permission: str) -> Callable:
-    """FastAPI dependency factory – checks the JWT payload for a specific permission.
+    """FastAPI dependency factory — checks the JWT subject against fresh DB perms.
+
+    Permissions are looked up via ``get_user_permissions(uid)`` (with a 30s
+    cache) so role changes propagate without forcing the user to re-login.
 
     Usage:
         @app.get("/settings")
@@ -173,6 +252,10 @@ def require_permission(permission: str) -> Callable:
     async def _check(
         credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
     ) -> str:
+        # Honor the test-mode auth bypass so route-level dependencies match
+        # the middleware's MEDBOT_AUTH_DISABLED short-circuit.
+        if os.getenv("MEDBOT_AUTH_DISABLED", "").lower() in ("1", "true", "yes"):
+            return "auth-disabled"
         if credentials is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -182,7 +265,7 @@ def require_permission(permission: str) -> Callable:
         token = credentials.credentials
 
         # Service token bypasses all permission checks
-        if token == SERVICE_TOKEN:
+        if token == service_token():
             return "agent-service"
 
         payload = decode_access_token(token)
@@ -194,10 +277,17 @@ def require_permission(permission: str) -> Callable:
             )
 
         username = payload.get("sub")
-        if not isinstance(username, str):
+        uid = payload.get("uid")
+        if not isinstance(username, str) or not isinstance(uid, int):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-        perms: list = payload.get("perms", [])
+        perms = get_user_permissions(uid)
+        if perms is None:
+            # User was deleted — bounce them to login.
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="账号不存在或已被删除",
+            )
         if not _perm_matches(perms, permission):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

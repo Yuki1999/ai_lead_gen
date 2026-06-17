@@ -2,11 +2,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 _TEST_SERVICE_TOKEN = "test-service-token-for-pytest"
+_TEST_ADMIN_PASSWORD = "73Eyd7XtGL"
 
 
 def _client(tmp_path, monkeypatch):
     monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
     monkeypatch.setenv("MEDBOT_AUTH_DISABLED", "true")
+    monkeypatch.setenv("MEDBOT_ADMIN_PASSWORD", _TEST_ADMIN_PASSWORD)
     from app.main import create_app
     return TestClient(create_app())
 
@@ -51,7 +53,7 @@ def test_auth_login_success(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         response = client.post(
             "/auth/login",
-            json={"username": "microport_admin", "password": "73Eyd7XtGL"},
+            json={"username": "microport_admin", "password": _TEST_ADMIN_PASSWORD},
         )
 
     assert response.status_code == 200
@@ -77,7 +79,7 @@ def test_auth_verify_with_valid_token(tmp_path, monkeypatch):
         # Login to get a token
         login_resp = client.post(
             "/auth/login",
-            json={"username": "microport_admin", "password": "73Eyd7XtGL"},
+            json={"username": "microport_admin", "password": _TEST_ADMIN_PASSWORD},
         )
         token = login_resp.json()["access_token"]
 
@@ -98,6 +100,187 @@ def test_protected_route_returns_401_without_token(tmp_path, monkeypatch):
         response = client.get("/leads")
 
     assert response.status_code == 401
+
+
+# ── Permission enforcement (auth NOT disabled) ─────────────────────────────
+
+
+def _client_with_auth(tmp_path, monkeypatch):
+    """TestClient with auth ENABLED — for permission-flow tests."""
+    monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
+    monkeypatch.setenv("MEDBOT_ADMIN_PASSWORD", _TEST_ADMIN_PASSWORD)
+    monkeypatch.setenv("MEDBOT_SERVICE_TOKEN", _TEST_SERVICE_TOKEN)
+    monkeypatch.delenv("MEDBOT_AUTH_DISABLED", raising=False)
+    from app.main import create_app
+    return TestClient(create_app())
+
+
+def _login(client: TestClient, username: str, password: str) -> str:
+    resp = client.post("/auth/login", json={"username": username, "password": password})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["access_token"]
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_login_returns_permissions(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        resp = client.post(
+            "/auth/login",
+            json={"username": "microport_admin", "password": _TEST_ADMIN_PASSWORD},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Default admin role seeds with the wildcard so the UI can hand-wave.
+        assert data["permissions"] == ["*"]
+
+
+def test_verify_returns_fresh_permissions(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        token = _login(client, "microport_admin", _TEST_ADMIN_PASSWORD)
+        resp = client.get("/auth/verify", headers=_bearer(token))
+        assert resp.status_code == 200
+        assert resp.json()["permissions"] == ["*"]
+
+
+def test_permission_registry_is_consistent_with_backend(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        token = _login(client, "microport_admin", _TEST_ADMIN_PASSWORD)
+        resp = client.get("/permissions/registry", headers=_bearer(token))
+        assert resp.status_code == 200
+        data = resp.json()
+        keys = {p["key"] for p in data["permissions"]}
+        # Sanity — at least the well-known permission names are present.
+        assert {"leads:read", "leads:write", "outreach:approve", "users:manage"} <= keys
+        # Presets always include admin → ["*"]
+        admin_preset = next(p for p in data["presets"] if p["key"] == "admin")
+        assert admin_preset["permissions"] == ["*"]
+
+
+def test_403_when_missing_permission_and_200_after_grant(tmp_path, monkeypatch):
+    """End-to-end realism: low-priv role gets 403; granting the perm flips to 200."""
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        admin_token = _login(client, "microport_admin", _TEST_ADMIN_PASSWORD)
+        admin_h = _bearer(admin_token)
+
+        # Create a viewer role with leads:read only
+        role_resp = client.post(
+            "/roles",
+            json={"name": "viewer", "permissions": ["leads:read"]},
+            headers=admin_h,
+        )
+        assert role_resp.status_code == 201, role_resp.text
+        role_id = role_resp.json()["id"]
+
+        # Create a user with that role
+        user_resp = client.post(
+            "/users",
+            json={"username": "tester", "password": "t3sterpass", "role_id": role_id},
+            headers=admin_h,
+        )
+        assert user_resp.status_code == 201, user_resp.text
+        user_id = user_resp.json()["id"]
+
+        tester_token = _login(client, "tester", "t3sterpass")
+        tester_h = _bearer(tester_token)
+
+        # leads:read works
+        assert client.get("/leads", headers=tester_h).status_code == 200
+        # leads:write is denied
+        forbidden = client.post(
+            "/leads",
+            json={
+                "company_name": "Acme", "region": "EU", "country": "DE",
+                "email": "a@b.com",
+            },
+            headers=tester_h,
+        )
+        assert forbidden.status_code == 403
+        # /agent/sessions now requires agent:chat (was previously open)
+        assert client.get("/agent/sessions", headers=tester_h).status_code == 403
+        # /campaigns/drafts now requires outreach:approve
+        assert client.get("/campaigns/drafts", headers=tester_h).status_code == 403
+
+        # Admin grants leads:write — change should propagate without re-login.
+        upd = client.put(
+            f"/roles/{role_id}",
+            json={"permissions": ["leads:read", "leads:write"]},
+            headers=admin_h,
+        )
+        assert upd.status_code == 200
+        # Same tester token, no re-login — should now succeed.
+        granted = client.post(
+            "/leads",
+            json={
+                "company_name": "Acme", "region": "EU", "country": "DE",
+                "email": "a@b.com",
+            },
+            headers=tester_h,
+        )
+        assert granted.status_code == 201, granted.text
+
+
+def test_wildcard_permission_grants_group(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        admin_h = _bearer(_login(client, "microport_admin", _TEST_ADMIN_PASSWORD))
+        role = client.post(
+            "/roles", json={"name": "lead-mgr", "permissions": ["leads:*"]},
+            headers=admin_h,
+        ).json()
+        client.post(
+            "/users",
+            json={"username": "lm", "password": "lmlmlmlm", "role_id": role["id"]},
+            headers=admin_h,
+        )
+        h = _bearer(_login(client, "lm", "lmlmlmlm"))
+        # All leads:* paths permitted
+        assert client.get("/leads", headers=h).status_code == 200
+        assert client.post(
+            "/leads",
+            json={"company_name": "X", "region": "EU", "country": "DE", "email": "x@y.com"},
+            headers=h,
+        ).status_code == 201
+        # outreach is NOT covered
+        assert client.post(
+            "/campaigns/custom-send",
+            json={"lead_id": 1, "subject": "s", "body": "b"},
+            headers=h,
+        ).status_code == 403
+
+
+def test_service_token_bypasses_permission_checks(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        h = {"Authorization": f"Bearer {_TEST_SERVICE_TOKEN}"}
+        # Endpoint that requires agent:chat
+        assert client.get("/agent/sessions", headers=h).status_code in (
+            200, 502, 503,  # 200 if sidecar up; 502/503 if sidecar unreachable in test env
+        )
+        # Service token's /auth/verify reports the wildcard
+        v = client.get("/auth/verify", headers=h)
+        assert v.status_code == 200
+        assert v.json()["permissions"] == ["*"]
+
+
+def test_deleted_user_token_is_rejected(tmp_path, monkeypatch):
+    with _client_with_auth(tmp_path, monkeypatch) as client:
+        admin_h = _bearer(_login(client, "microport_admin", _TEST_ADMIN_PASSWORD))
+        role = client.post(
+            "/roles", json={"name": "rdr", "permissions": ["leads:read"]},
+            headers=admin_h,
+        ).json()
+        u = client.post(
+            "/users",
+            json={"username": "ghost", "password": "ghost1234", "role_id": role["id"]},
+            headers=admin_h,
+        ).json()
+        ghost_h = _bearer(_login(client, "ghost", "ghost1234"))
+        assert client.get("/leads", headers=ghost_h).status_code == 200
+        # Admin deletes the user — the live token must stop working.
+        client.delete(f"/users/{u['id']}", headers=admin_h)
+        denied = client.get("/leads", headers=ghost_h)
+        assert denied.status_code == 401
 
 
 def test_prospecting_persists_and_lists_leads(tmp_path, monkeypatch):

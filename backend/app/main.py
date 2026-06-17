@@ -13,7 +13,8 @@ from fastapi.responses import StreamingResponse
 from app import db
 from app.auth import (
     require_auth, require_permission, verify_credentials, create_access_token,
-    decode_access_token, check_password, hash_password, SERVICE_TOKEN,
+    decode_access_token, check_password, hash_password, security_scheme,
+    service_token,
 )
 
 _logger = logging.getLogger("medbot")
@@ -125,7 +126,7 @@ def create_app() -> FastAPI:
         token = auth_header[7:]  # strip "Bearer "
 
         # Check static service token (for agent-to-backend calls)
-        if token == SERVICE_TOKEN:
+        if token == service_token():
             return await call_next(request)
 
         # Check JWT
@@ -160,22 +161,41 @@ def create_app() -> FastAPI:
         token = create_access_token(
             user_id=int(user["user_id"]),
             username=str(user["username"]),
-            permissions=list(user["permissions"]) if isinstance(user["permissions"], list) else [],
         )
+        permissions = list(user["permissions"]) if isinstance(user["permissions"], list) else []
         return {
             "access_token": token,
             "token_type": "bearer",
             "username": str(user["username"]),
+            "permissions": permissions,
         }
 
     @app.get("/auth/verify", response_model=AuthVerifyResponse)
-    def verify_token(username: str = Depends(require_auth)) -> dict[str, object]:
-        """Verify the current token is still valid. Returns the authenticated username + permissions."""
-        from fastapi import Request as FastAPIRequest  # noqa
-        return {
-            "username": username,
-            "valid": True,
-        }
+    def verify_token(
+        credentials=Depends(security_scheme),
+    ) -> dict[str, object]:
+        """Verify the current token and return the freshest permission list.
+
+        Permissions are read from the DB on every call (subject to the 30s
+        in-process cache) so the frontend always sees the post-edit state.
+        """
+        from app.auth import get_user_permissions
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        token = credentials.credentials
+        if token == service_token():
+            return {"username": "agent-service", "valid": True, "permissions": ["*"]}
+        payload = decode_access_token(token)
+        if payload is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        username = payload.get("sub")
+        uid = payload.get("uid")
+        if not isinstance(username, str) or not isinstance(uid, int):
+            raise HTTPException(status_code=401, detail="Invalid token")
+        perms = get_user_permissions(uid)
+        if perms is None:
+            raise HTTPException(status_code=401, detail="账号不存在或已被删除")
+        return {"username": username, "valid": True, "permissions": perms}
 
     # ── Permission registry ─────────────────────────────
 
@@ -192,7 +212,7 @@ def create_app() -> FastAPI:
     # ── Product ─────────────────────────────────────────
 
     @app.get("/product/profile")
-    def product_profile() -> dict[str, object]:
+    def product_profile(_: str = Depends(require_permission("settings:read"))) -> dict[str, object]:
         return extract_product_profile().to_dict()
 
     @app.post("/agent/chat", response_model=AgentChatResponse)
@@ -213,7 +233,7 @@ def create_app() -> FastAPI:
         return StreamingResponse(stream, media_type="text/event-stream")
 
     @app.get("/agent/sessions")
-    def list_agent_sessions() -> dict[str, object]:
+    def list_agent_sessions(_: str = Depends(require_permission("agent:chat"))) -> dict[str, object]:
         """Proxy session list from the agent sidecar."""
         try:
             import requests as req
@@ -227,7 +247,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=f"Agent sidecar unavailable: {exc}")
 
     @app.delete("/agent/sessions/{session_id}")
-    def delete_agent_session(session_id: str) -> dict[str, object]:
+    def delete_agent_session(session_id: str,
+                             _: str = Depends(require_permission("agent:chat"))) -> dict[str, object]:
         """Proxy session deletion to the agent sidecar."""
         try:
             import requests as req
@@ -241,11 +262,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=f"Agent sidecar unavailable: {exc}")
 
     @app.get("/agent/config", response_model=AgentConfigResponse)
-    def agent_config() -> dict[str, object]:
+    def agent_config(_: str = Depends(require_permission("settings:read"))) -> dict[str, object]:
         return agent_config_status()
 
     @app.put("/agent/config", response_model=AgentConfigResponse)
-    def save_agent_config(request: AgentConfigUpdate) -> dict[str, object]:
+    def save_agent_config(request: AgentConfigUpdate,
+                          _: str = Depends(require_permission("settings:write"))) -> dict[str, object]:
         return update_agent_config(
             provider_name=request.provider_name,
             api_key=request.api_key,
@@ -256,7 +278,8 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/agent/test-connection", response_model=AgentTestConnectionResponse)
-    def agent_test_connection(request: AgentTestConnectionRequest) -> dict[str, object]:
+    def agent_test_connection(request: AgentTestConnectionRequest,
+                              _: str = Depends(require_permission("settings:write"))) -> dict[str, object]:
         return test_agent_connection(
             provider_name=request.provider_name,
             api_key=request.api_key,
@@ -371,6 +394,7 @@ def create_app() -> FastAPI:
     def source_preview(
         url: str = Query(min_length=8),
         email: str = Query(default=""),
+        _: str = Depends(require_permission("leads:read")),
     ) -> dict[str, object]:
         try:
             return fetch_source_preview(url=url, email=email)
@@ -378,7 +402,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/web/search")
-    def web_search(request: WebSearchRequest) -> dict[str, object]:
+    def web_search(request: WebSearchRequest,
+                   _: str = Depends(require_permission("agent:chat"))) -> dict[str, object]:
         results = search_web(request.query, limit=request.max_results)
         return {
             "query": request.query,
@@ -386,14 +411,16 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/web/fetch")
-    def web_fetch(request: WebFetchRequest) -> dict[str, object]:
+    def web_fetch(request: WebFetchRequest,
+                  _: str = Depends(require_permission("agent:chat"))) -> dict[str, object]:
         try:
             return fetch_source_preview(url=request.url, email=request.email)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/leads/{lead_id}/history")
-    def lead_history(lead_id: int) -> dict[str, object]:
+    def lead_history(lead_id: int,
+                     _: str = Depends(require_permission("leads:read"))) -> dict[str, object]:
         lead = db.get_lead(lead_id)
         if lead is None:
             raise HTTPException(status_code=404, detail="Lead not found")
@@ -406,7 +433,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/leads/{lead_id}")
-    def get_lead(lead_id: int) -> dict[str, object]:
+    def get_lead(lead_id: int,
+                 _: str = Depends(require_permission("leads:read"))) -> dict[str, object]:
         lead = db.get_lead(lead_id)
         if lead is None:
             raise HTTPException(status_code=404, detail="Lead not found")
@@ -492,7 +520,8 @@ def create_app() -> FastAPI:
         return _create_outreach_records(request, source=request.source)
 
     @app.post("/campaigns/outreach-preview")
-    def preview_outreach(request: OutreachRequest) -> dict[str, object]:
+    def preview_outreach(request: OutreachRequest,
+                         _: str = Depends(require_permission("outreach:send"))) -> dict[str, object]:
         """Generate email previews without sending."""
         previews: list[dict[str, object]] = []
         for lead_id in request.lead_ids:
@@ -510,7 +539,7 @@ def create_app() -> FastAPI:
         return {"previews": previews}
 
     @app.get("/campaigns/drafts")
-    def list_drafts() -> dict[str, object]:
+    def list_drafts(_: str = Depends(require_permission("outreach:approve"))) -> dict[str, object]:
         """List all pending draft outreach events (created by Agent, awaiting approval)."""
         drafts = db.list_draft_events()
         return {"total": len(drafts), "drafts": drafts}
@@ -545,7 +574,8 @@ def create_app() -> FastAPI:
         return {"ok": True, "event": event, "sent": False, "note": "Email not configured"}
 
     @app.post("/campaigns/drafts/{event_id}/reject")
-    def reject_draft(event_id: int) -> dict[str, object]:
+    def reject_draft(event_id: int,
+                     _: str = Depends(require_permission("outreach:approve"))) -> dict[str, object]:
         """Reject a draft without sending."""
         event = db.reject_outreach_event(event_id)
         if event is None:
@@ -553,7 +583,7 @@ def create_app() -> FastAPI:
         return {"ok": True, "event": event}
 
     @app.post("/campaigns/drafts/approve-all")
-    def approve_all_drafts() -> dict[str, object]:
+    def approve_all_drafts(_: str = Depends(require_permission("outreach:approve"))) -> dict[str, object]:
         """Approve all pending drafts and send them."""
         drafts = db.list_draft_events()
         results: list[dict[str, object]] = []
@@ -586,7 +616,8 @@ def create_app() -> FastAPI:
         return {"ok": True, "total": len(results), "results": results}
 
     @app.post("/email/test")
-    def email_test(request: EmailTestRequest) -> dict[str, object]:
+    def email_test(request: EmailTestRequest,
+                   _: str = Depends(require_permission("settings:write"))) -> dict[str, object]:
         """Send a test email to verify EWS connectivity."""
         if not email_is_configured():
             raise HTTPException(
@@ -603,13 +634,13 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/attachments")
-    def get_attachments() -> dict[str, object]:
+    def get_attachments(_: str = Depends(require_permission("outreach:send"))) -> dict[str, object]:
         """List available standard attachment files for follow-up emails."""
         from app.email_service import ATTACHMENTS_DIR
         return {"files": list_attachments(), "dir": str(ATTACHMENTS_DIR)}
 
     @app.get("/email/status")
-    def email_status() -> dict[str, object]:
+    def email_status(_: str = Depends(require_permission("settings:read"))) -> dict[str, object]:
         """Return email configuration status and Exchange connectivity."""
         configured = email_is_configured()
         status: dict[str, object] = {
@@ -624,7 +655,8 @@ def create_app() -> FastAPI:
         return status
 
     @app.post("/campaigns/send-demo", status_code=201, include_in_schema=False)
-    def send_legacy_demo(request: OutreachRequest) -> dict[str, object]:
+    def send_legacy_demo(request: OutreachRequest,
+                         _: str = Depends(require_permission("outreach:send"))) -> dict[str, object]:
         return _create_outreach_records(request, source="manual")
 
     def _create_outreach_records(
@@ -750,7 +782,8 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/replies/followup", status_code=201)
-    def generate_followup_endpoint(request: ReplyAnalysisRequest) -> dict[str, object]:
+    def generate_followup_endpoint(request: ReplyAnalysisRequest,
+                                   _: str = Depends(require_permission("replies:analyze"))) -> dict[str, object]:
         """Generate a follow-up email draft based on a customer reply."""
         lead_id = request.lead_id
         lead = db.get_lead(lead_id) if lead_id else None

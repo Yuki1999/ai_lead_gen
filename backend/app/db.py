@@ -581,11 +581,12 @@ def update_user(user_id: int, *, username: str | None = None,
         setters.append("role_id = ?")
         params.append(role_id)
     if not setters:
-        row = connection.execute(
-            "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
-            "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
-            (user_id,),
-        ).fetchone()
+        with connect() as connection:
+            row = connection.execute(
+                "SELECT u.id, u.username, u.role_id, r.name AS role_name, u.created_at "
+                "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
+                (user_id,),
+            ).fetchone()
         return _row_to_dict(row) if row else None
     params.append(user_id)
     with connect() as connection:
@@ -595,13 +596,20 @@ def update_user(user_id: int, *, username: str | None = None,
             "FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?",
             (user_id,),
         ).fetchone()
+    # Permissions may have changed (role swap) — drop cached perms for this user.
+    from app.auth import invalidate_permission_cache
+    invalidate_permission_cache(user_id)
     return _row_to_dict(row) if row else None
 
 
 def delete_user(user_id: int) -> bool:
     with connect() as connection:
         cursor = connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    return cursor.rowcount > 0
+    if cursor.rowcount > 0:
+        from app.auth import invalidate_permission_cache
+        invalidate_permission_cache(user_id)
+        return True
+    return False
 
 
 # ── Roles ──────────────────────────────────────────────────────────
@@ -646,6 +654,10 @@ def update_role(role_id: int, *, name: str | None = None,
     with connect() as connection:
         connection.execute(f"UPDATE roles SET {', '.join(setters)} WHERE id = ?", params)
         row = connection.execute("SELECT * FROM roles WHERE id = ?", (role_id,)).fetchone()
+    if permissions is not None:
+        # Every user holding this role just got new permissions — wipe cache.
+        from app.auth import invalidate_permission_cache
+        invalidate_permission_cache(None)
     return _row_to_dict(row) if row else None
 
 
@@ -656,7 +668,12 @@ def delete_role(role_id: int) -> bool:
         if admin:
             connection.execute("UPDATE users SET role_id = ? WHERE role_id = ?", (admin[0], role_id))
         cursor = connection.execute("DELETE FROM roles WHERE id = ? AND name != 'admin'", (role_id,))
-    return cursor.rowcount > 0
+    if cursor.rowcount > 0:
+        # Reassigned users now hold admin perms — wipe entire cache for safety.
+        from app.auth import invalidate_permission_cache
+        invalidate_permission_cache(None)
+        return True
+    return False
 
 
 def _now() -> str:

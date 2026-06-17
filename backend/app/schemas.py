@@ -99,11 +99,13 @@ class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     username: str
+    permissions: list[str] = Field(default_factory=list)
 
 
 class AuthVerifyResponse(BaseModel):
     username: str
     valid: bool = True
+    permissions: list[str] = Field(default_factory=list)
 
 
 class AgentTestConnectionRequest(BaseModel):
