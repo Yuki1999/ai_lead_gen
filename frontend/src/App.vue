@@ -380,7 +380,135 @@ const allUsers = ref<Array<{ id: number; username: string; role_id: number; role
 const showRoleEditor = ref(false);
 const showUserEditor = ref(false);
 const editingRole = ref({ id: 0, name: "", permissions: [] as string[] });
+const editingRoleSnapshot = ref<{ name: string; permissions: string[] }>({ name: "", permissions: [] });
 const editingUser = ref({ id: 0, username: "", password: "", role_id: 0 });
+const editingUserSnapshot = ref<{ username: string; password: string; role_id: number }>({ username: "", password: "", role_id: 0 });
+
+// ── Access-tab UI state ──────────────────────────────────
+const roleSearch = ref("");
+const userSearch = ref("");
+const permSearch = ref("");
+const collapsedGroups = ref<Record<string, boolean>>({});
+const showResetPasswordResult = ref(false);
+const resetPasswordResult = ref({ username: "", password: "" });
+
+const filteredRoles = computed(() =>
+  roleSearch.value.trim()
+    ? allRoles.value.filter((r) => r.name.toLowerCase().includes(roleSearch.value.trim().toLowerCase()))
+    : allRoles.value,
+);
+const filteredUsers = computed(() =>
+  userSearch.value.trim()
+    ? allUsers.value.filter((u) => {
+        const q = userSearch.value.trim().toLowerCase();
+        return u.username.toLowerCase().includes(q) || (u.role_name || "").toLowerCase().includes(q);
+      })
+    : allUsers.value,
+);
+
+function permsAsArray(role: { permissions: string | string[] }): string[] {
+  return typeof role.permissions === "string" ? JSON.parse(role.permissions) : (role.permissions || []);
+}
+
+function roleEditorDirty(): boolean {
+  return (
+    editingRole.value.name !== editingRoleSnapshot.value.name ||
+    JSON.stringify([...editingRole.value.permissions].sort()) !==
+      JSON.stringify([...editingRoleSnapshot.value.permissions].sort())
+  );
+}
+
+function isGrantedKey(perms: string[], key: string): boolean {
+  // Match the wildcard rules so the editor visually tracks "*" and "<group>:*".
+  if (perms.includes("*")) return true;
+  if (perms.includes(key)) return true;
+  const colon = key.indexOf(":");
+  if (colon > 0 && perms.includes(key.slice(0, colon) + ":*")) return true;
+  return false;
+}
+
+function togglePermissionKey(key: string, on: boolean): void {
+  // Editing a group-wildcard role: toggling a single key clears the wildcard
+  // and replaces it with the explicit set so the user gets exactly what they
+  // see checked.
+  let perms = [...editingRole.value.permissions];
+  if (perms.includes("*")) {
+    perms = ALL_PERMISSIONS.value.slice();
+  }
+  const colon = key.indexOf(":");
+  if (colon > 0) {
+    const wildcard = key.slice(0, colon) + ":*";
+    if (perms.includes(wildcard)) {
+      const groupKeys = (permissionGroupsForUI.value.find((g) => g.key === key.slice(0, colon))?.permissions) ?? [];
+      perms = perms.filter((p) => p !== wildcard).concat(groupKeys);
+    }
+  }
+  if (on) {
+    if (!perms.includes(key)) perms.push(key);
+  } else {
+    perms = perms.filter((p) => p !== key);
+  }
+  editingRole.value.permissions = Array.from(new Set(perms));
+}
+
+function groupSelectionState(group: PermissionGroup): "all" | "some" | "none" {
+  const granted = editingRole.value.permissions;
+  if (granted.includes("*") || granted.includes(`${group.key}:*`)) return "all";
+  const checked = group.permissions.filter((k) => granted.includes(k)).length;
+  if (checked === 0) return "none";
+  if (checked === group.permissions.length) return "all";
+  return "some";
+}
+
+function toggleGroup(group: PermissionGroup, on: boolean): void {
+  let perms = [...editingRole.value.permissions];
+  if (perms.includes("*")) perms = ALL_PERMISSIONS.value.slice();
+  // strip group's keys + group wildcard
+  perms = perms.filter((p) => p !== `${group.key}:*` && !group.permissions.includes(p));
+  if (on) perms.push(...group.permissions);
+  editingRole.value.permissions = Array.from(new Set(perms));
+}
+
+function applyPreset(presetKey: string): void {
+  const preset = permissionPresets.value.find((p) => p.key === presetKey);
+  if (!preset) return;
+  editingRole.value.permissions = [...preset.permissions];
+}
+
+function visiblePermissionsForGroup(group: PermissionGroup): string[] {
+  const q = permSearch.value.trim().toLowerCase();
+  if (!q) return group.permissions;
+  return group.permissions.filter((k) => {
+    const meta = permissionRegistry.value?.permissions.find((p) => p.key === k);
+    return (
+      k.toLowerCase().includes(q) ||
+      (meta?.label || "").toLowerCase().includes(q) ||
+      (meta?.description || "").toLowerCase().includes(q)
+    );
+  });
+}
+
+function permLabel(key: string): string {
+  return permLabels.value[key] || key;
+}
+function permDescription(key: string): string {
+  return permissionRegistry.value?.permissions.find((p) => p.key === key)?.description || "";
+}
+
+function generateRandomPassword(): string {
+  // 12-char URL-safe-ish password — consistent with backend secrets.token_urlsafe(10).
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  const out: string[] = [];
+  const random = globalThis.crypto?.getRandomValues
+    ? () => {
+        const arr = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(arr);
+        return arr[0];
+      }
+    : () => Math.floor(Math.random() * 0xffffffff);
+  for (let i = 0; i < 12; i++) out.push(alphabet[random() % alphabet.length]);
+  return out.join("");
+}
 
 async function loadRolesAndUsers(): Promise<void> {
   try {
@@ -396,12 +524,18 @@ async function loadRolesAndUsers(): Promise<void> {
 
 function openNewRole(): void {
   editingRole.value = { id: 0, name: "", permissions: [] };
+  editingRoleSnapshot.value = { name: "", permissions: [] };
+  permSearch.value = "";
+  collapsedGroups.value = {};
   showRoleEditor.value = true;
 }
 
 function openEditRole(role: typeof allRoles.value[0]): void {
-  const perms = typeof role.permissions === "string" ? JSON.parse(role.permissions) as string[] : role.permissions;
-  editingRole.value = { id: role.id, name: role.name, permissions: perms };
+  const perms = permsAsArray(role);
+  editingRole.value = { id: role.id, name: role.name, permissions: [...perms] };
+  editingRoleSnapshot.value = { name: role.name, permissions: [...perms] };
+  permSearch.value = "";
+  collapsedGroups.value = {};
   showRoleEditor.value = true;
 }
 
@@ -417,27 +551,48 @@ async function saveRole(): Promise<void> {
   // If the admin just edited a role they themselves hold, their own UI permissions
   // need to refresh — backend cache is wiped, but the frontend ref isn't.
   await refreshPermissions();
+  notice.value = `角色已${editingRole.value.id ? "更新" : "创建"}`;
 }
 
-async function deleteRole(roleId: number): Promise<void> {
-  if (!globalThis.confirm?.("确定删除此角色？关联的用户将移至管理员角色。")) return;
-  await request(`/roles/${roleId}`, { method: "DELETE" });
+async function deleteRole(role: typeof allRoles.value[0]): Promise<void> {
+  const tail = role.user_count > 0 ? `（${role.user_count} 个用户将移至 admin）` : "";
+  if (!globalThis.confirm?.(`确定删除角色「${role.name}」？${tail}`)) return;
+  await request(`/roles/${role.id}`, { method: "DELETE" });
   await loadRolesAndUsers();
+  await refreshPermissions();
+  notice.value = `角色「${role.name}」已删除`;
 }
 
 function openNewUser(): void {
   editingUser.value = { id: 0, username: "", password: "", role_id: allRoles.value[0]?.id || 1 };
+  editingUserSnapshot.value = { username: "", password: "", role_id: allRoles.value[0]?.id || 1 };
   showUserEditor.value = true;
 }
 
 function openEditUser(user: typeof allUsers.value[0]): void {
   editingUser.value = { id: user.id, username: user.username, password: "", role_id: user.role_id };
+  editingUserSnapshot.value = { username: user.username, password: "", role_id: user.role_id };
   showUserEditor.value = true;
+}
+
+function userEditorDirty(): boolean {
+  return (
+    editingUser.value.username !== editingUserSnapshot.value.username ||
+    editingUser.value.role_id !== editingUserSnapshot.value.role_id ||
+    !!editingUser.value.password
+  );
+}
+
+function generateNewPasswordForUser(): void {
+  editingUser.value.password = generateRandomPassword();
 }
 
 async function saveUser(): Promise<void> {
   const body: Record<string, unknown> = { username: editingUser.value.username, role_id: editingUser.value.role_id };
   if (editingUser.value.password) body.password = editingUser.value.password;
+  const wasReset = !!editingUser.value.password && editingUser.value.id > 0;
+  const newPassword = editingUser.value.password;
+  const username = editingUser.value.username;
   if (editingUser.value.id > 0) {
     await request(`/users/${editingUser.value.id}`, { method: "PUT", body: JSON.stringify(body) });
   } else {
@@ -447,12 +602,19 @@ async function saveUser(): Promise<void> {
   await loadRolesAndUsers();
   // If the admin edited their own role assignment, their own UI must refresh.
   await refreshPermissions();
+  if (wasReset) {
+    resetPasswordResult.value = { username, password: newPassword };
+    showResetPasswordResult.value = true;
+  } else {
+    notice.value = `用户已${editingUser.value.id ? "更新" : "创建"}`;
+  }
 }
 
-async function deleteUser(userId: number): Promise<void> {
-  if (!globalThis.confirm?.("确定删除此用户？")) return;
-  await request(`/users/${userId}`, { method: "DELETE" });
+async function deleteUser(user: typeof allUsers.value[0]): Promise<void> {
+  if (!globalThis.confirm?.(`确定删除用户「${user.username}」？此操作不可恢复。`)) return;
+  await request(`/users/${user.id}`, { method: "DELETE" });
   await loadRolesAndUsers();
+  notice.value = `用户「${user.username}」已删除`;
 }
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
@@ -2203,6 +2365,7 @@ onMounted(async () => {
               {{ currentAction === "dashboard" ? "刷新中..." : "刷新数据" }}
             </n-button>
             <n-button
+              v-if="hasPermission('replies:sync')"
               class="ghost-button"
               secondary
               :loading="currentAction === 'sync'"
@@ -2900,6 +3063,7 @@ onMounted(async () => {
               <span class="draft-queue-desc">Agent 生成的邮件在此统一审核，批准后真实发送，拒绝则废弃</span>
             </div>
             <n-button
+              v-if="hasPermission('outreach:approve')"
               class="draft-approve-all"
               size="medium"
               @click="approveAllDrafts"
@@ -2918,7 +3082,7 @@ onMounted(async () => {
               <p class="draft-subject">{{ draft.subject }}</p>
               <p class="draft-preview">{{ draft.body.slice(0, 250) }}{{ draft.body.length > 250 ? '...' : '' }}</p>
             </div>
-            <div class="draft-actions">
+            <div v-if="hasPermission('outreach:approve')" class="draft-actions">
               <n-button class="draft-btn-approve" size="small" @click="approveDraft(draft.id)">
                 <template #icon><n-icon><Check /></n-icon></template>
                 批准发送
@@ -3339,54 +3503,125 @@ onMounted(async () => {
             </label>
           </section>
 
-          <section v-if="settingsTab === 'access'" class="settings-card">
+          <section v-if="settingsTab === 'access'" class="settings-card access-pane">
             <div class="settings-card-head">
               <div>
                 <p class="panel-label">用户与权限</p>
                 <h3>角色与用户管理</h3>
-                <p>创建角色、分配权限、管理用户账号。</p>
+                <p>权限目录由后端 <code>/permissions/registry</code> 提供，新增权限只需后端一处修改。</p>
               </div>
             </div>
 
             <!-- Roles -->
-            <div style="margin-bottom:20px">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-                <p class="panel-label">角色（{{ allRoles.length }}）</p>
-                <n-button size="tiny" secondary @click="openNewRole"><template #icon><n-icon><Plus /></n-icon></template>新建角色</n-button>
-              </div>
+            <div class="access-block">
+              <header class="access-block-head">
+                <div class="access-title">
+                  <p class="panel-label">角色（{{ allRoles.length }}）</p>
+                  <small class="muted">点击编辑可调整权限；admin 角色不可删除。</small>
+                </div>
+                <div class="access-actions">
+                  <n-input
+                    v-model:value="roleSearch"
+                    placeholder="搜索角色"
+                    size="small"
+                    clearable
+                    style="width:180px"
+                  >
+                    <template #prefix><n-icon><Search :size="14" /></n-icon></template>
+                  </n-input>
+                  <n-button size="small" type="primary" @click="openNewRole">
+                    <template #icon><n-icon><Plus /></n-icon></template>新建角色
+                  </n-button>
+                </div>
+              </header>
               <div v-if="allRoles.length === 0" class="history-empty">加载中...</div>
-              <article v-for="role in allRoles" :key="role.id" class="history-card">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                  <strong>{{ role.name }}</strong>
-                  <small>{{ role.user_count }} 个用户</small>
-                </div>
-                <div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">
-                  <n-tag v-for="p in (typeof role.permissions === 'string' ? JSON.parse(role.permissions) : role.permissions)" :key="p" size="tiny" round :bordered="false">{{ permLabels[p] || p }}</n-tag>
-                </div>
-                <div class="history-actions">
-                  <n-button size="tiny" secondary @click="openEditRole(role)">编辑</n-button>
-                  <n-button v-if="role.name !== 'admin'" size="tiny" secondary @click="deleteRole(role.id)" style="color:#ef4444">删除</n-button>
-                </div>
-              </article>
+              <div v-else-if="filteredRoles.length === 0" class="history-empty">未找到匹配的角色</div>
+              <div v-else class="role-grid">
+                <article v-for="role in filteredRoles" :key="role.id" class="role-card">
+                  <div class="role-card-head">
+                    <div>
+                      <strong>{{ role.name }}</strong>
+                      <div class="role-meta">
+                        <n-tag size="tiny" round :bordered="false">{{ role.user_count }} 用户</n-tag>
+                        <n-tag size="tiny" round :bordered="false" type="info">
+                          {{ permsAsArray(role).includes("*") ? "全部权限" : `${permsAsArray(role).length} 权限` }}
+                        </n-tag>
+                      </div>
+                    </div>
+                    <div class="role-card-actions">
+                      <button class="link-button" type="button" @click="openEditRole(role)">编辑</button>
+                      <button
+                        v-if="role.name !== 'admin'"
+                        class="link-button danger"
+                        type="button"
+                        @click="deleteRole(role)"
+                      >删除</button>
+                    </div>
+                  </div>
+                  <div v-if="!permsAsArray(role).includes('*')" class="role-card-perms">
+                    <n-tag
+                      v-for="p in permsAsArray(role).slice(0, 8)"
+                      :key="p"
+                      size="tiny"
+                      round
+                      :bordered="false"
+                    >{{ permLabel(p) }}</n-tag>
+                    <small v-if="permsAsArray(role).length > 8" class="muted">
+                      +{{ permsAsArray(role).length - 8 }} 项
+                    </small>
+                  </div>
+                </article>
+              </div>
             </div>
 
             <!-- Users -->
-            <div>
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-                <p class="panel-label">用户（{{ allUsers.length }}）</p>
-                <n-button size="tiny" secondary @click="openNewUser"><template #icon><n-icon><Plus /></n-icon></template>新建用户</n-button>
-              </div>
+            <div class="access-block">
+              <header class="access-block-head">
+                <div class="access-title">
+                  <p class="panel-label">用户（{{ allUsers.length }}）</p>
+                  <small class="muted">microport_admin 是初始管理员，不可删除。</small>
+                </div>
+                <div class="access-actions">
+                  <n-input
+                    v-model:value="userSearch"
+                    placeholder="搜索用户名或角色"
+                    size="small"
+                    clearable
+                    style="width:200px"
+                  >
+                    <template #prefix><n-icon><Search :size="14" /></n-icon></template>
+                  </n-input>
+                  <n-button size="small" type="primary" @click="openNewUser">
+                    <template #icon><n-icon><Plus /></n-icon></template>新建用户
+                  </n-button>
+                </div>
+              </header>
               <div v-if="allUsers.length === 0" class="history-empty">加载中...</div>
-              <article v-for="user in allUsers" :key="user.id" class="history-card">
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                  <strong>{{ user.username }}</strong>
-                  <n-tag size="tiny" round :bordered="false">{{ user.role_name }}</n-tag>
-                </div>
-                <div class="history-actions">
-                  <n-button size="tiny" secondary @click="openEditUser(user)">编辑</n-button>
-                  <n-button v-if="user.username !== 'microport_admin'" size="tiny" secondary @click="deleteUser(user.id)" style="color:#ef4444">删除</n-button>
-                </div>
-              </article>
+              <div v-else-if="filteredUsers.length === 0" class="history-empty">未找到匹配的用户</div>
+              <table v-else class="user-table">
+                <thead>
+                  <tr>
+                    <th>用户名</th>
+                    <th>角色</th>
+                    <th class="user-table-actions">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="user in filteredUsers" :key="user.id">
+                    <td><strong>{{ user.username }}</strong></td>
+                    <td><n-tag size="tiny" round :bordered="false">{{ user.role_name }}</n-tag></td>
+                    <td class="user-table-actions">
+                      <button class="link-button" type="button" @click="openEditUser(user)">编辑</button>
+                      <button
+                        v-if="user.username !== 'microport_admin'"
+                        class="link-button danger"
+                        type="button"
+                        @click="deleteUser(user)"
+                      >删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </section>
 
@@ -3613,27 +3848,108 @@ onMounted(async () => {
 
     <!-- Role Editor Modal -->
     <div v-if="showRoleEditor" class="modal-backdrop" role="presentation" @click.self="showRoleEditor = false">
-      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="编辑角色">
+      <section class="create-lead-modal role-editor-modal" role="dialog" aria-modal="true" aria-label="编辑角色">
         <header class="modal-header">
           <div>
             <p class="panel-label">权限管理</p>
-            <h2>{{ editingRole.id ? '编辑角色' : '新建角色' }}</h2>
+            <h2>{{ editingRole.id ? `编辑角色：${editingRoleSnapshot.name}` : '新建角色' }}</h2>
           </div>
           <button class="icon-only-button" type="button" @click="showRoleEditor = false"><X :size="20" /></button>
         </header>
         <div class="create-lead-body">
-          <label class="field"><span>角色名称</span><n-input v-model:value="editingRole.name" placeholder="如 operator, viewer" /></label>
-          <p class="panel-label" style="margin-top:12px">权限</p>
-          <div style="display:flex;flex-wrap:wrap;gap:6px">
-            <label v-for="p in ALL_PERMISSIONS" :key="p" class="attachment-check">
-              <n-checkbox :checked="editingRole.permissions.includes(p)" @update:checked="(c: boolean) => { if (c) editingRole.permissions.push(p); else editingRole.permissions = editingRole.permissions.filter(x => x !== p); }" />
-              <span>{{ permLabels[p] || p }}</span>
+          <div class="role-editor-meta">
+            <label class="field" style="flex:1 1 220px">
+              <span>角色名称</span>
+              <n-input v-model:value="editingRole.name" placeholder="如 operator, viewer" />
             </label>
+            <label class="field" style="flex:1 1 220px">
+              <span>预设模板</span>
+              <n-select
+                placeholder="可选：套用预设权限"
+                clearable
+                :options="permissionPresets.map(p => ({ label: p.label + ' — ' + p.description, value: p.key }))"
+                @update:value="(v: string | null) => v && applyPreset(v)"
+              />
+            </label>
+          </div>
+
+          <div class="perm-toolbar">
+            <p class="panel-label" style="margin:0">权限（{{ editingRole.permissions.includes("*") ? "全部权限" : `${editingRole.permissions.length} / ${ALL_PERMISSIONS.length}` }}）</p>
+            <n-input
+              v-model:value="permSearch"
+              placeholder="搜索权限"
+              size="small"
+              clearable
+              style="width:220px"
+            >
+              <template #prefix><n-icon><Search :size="14" /></n-icon></template>
+            </n-input>
+          </div>
+
+          <div v-if="editingRole.permissions.includes('*')" class="perm-wildcard-banner">
+            <ShieldCheck :size="16" />
+            <span>该角色拥有全部权限（含未来新增的权限）。点击下方任一权限将解开通配符并展开为显式列表。</span>
+          </div>
+
+          <div class="perm-groups">
+            <article
+              v-for="group in permissionGroupsForUI"
+              :key="group.key"
+              v-show="visiblePermissionsForGroup(group).length > 0"
+              class="perm-group"
+            >
+              <header class="perm-group-head">
+                <button
+                  class="perm-group-toggle"
+                  type="button"
+                  :aria-expanded="!collapsedGroups[group.key]"
+                  @click="collapsedGroups[group.key] = !collapsedGroups[group.key]"
+                >
+                  <ChevronDown
+                    :size="16"
+                    :style="{ transform: collapsedGroups[group.key] ? 'rotate(-90deg)' : 'none', transition: 'transform 0.15s' }"
+                  />
+                  <strong>{{ group.label }}</strong>
+                  <small class="muted">
+                    {{ group.permissions.filter(k => isGrantedKey(editingRole.permissions, k)).length }} / {{ group.permissions.length }}
+                  </small>
+                </button>
+                <n-checkbox
+                  :checked="groupSelectionState(group) === 'all'"
+                  :indeterminate="groupSelectionState(group) === 'some'"
+                  @update:checked="(c: boolean) => toggleGroup(group, c)"
+                >整组</n-checkbox>
+              </header>
+              <div v-if="!collapsedGroups[group.key]" class="perm-group-body">
+                <label
+                  v-for="key in visiblePermissionsForGroup(group)"
+                  :key="key"
+                  class="perm-row"
+                  :title="permDescription(key)"
+                >
+                  <n-checkbox
+                    :checked="isGrantedKey(editingRole.permissions, key)"
+                    @update:checked="(c: boolean) => togglePermissionKey(key, c)"
+                  />
+                  <div class="perm-row-text">
+                    <span class="perm-row-label">{{ permLabel(key) }}</span>
+                    <small class="perm-row-desc">{{ permDescription(key) }}</small>
+                  </div>
+                  <code class="perm-row-key">{{ key }}</code>
+                </label>
+              </div>
+            </article>
           </div>
         </div>
         <footer class="create-lead-footer">
+          <small v-if="editingRole.id && roleEditorDirty()" class="muted" style="margin-right:auto">有未保存的修改</small>
           <n-button class="ghost-button" secondary @click="showRoleEditor = false">取消</n-button>
-          <n-button class="primary-button" type="primary" :disabled="!editingRole.name" @click="saveRole">保存</n-button>
+          <n-button
+            class="primary-button"
+            type="primary"
+            :disabled="!editingRole.name.trim() || (editingRole.id > 0 && !roleEditorDirty())"
+            @click="saveRole"
+          >保存</n-button>
         </footer>
       </section>
     </div>
@@ -3644,20 +3960,80 @@ onMounted(async () => {
         <header class="modal-header">
           <div>
             <p class="panel-label">用户管理</p>
-            <h2>{{ editingUser.id ? '编辑用户' : '新建用户' }}</h2>
+            <h2>{{ editingUser.id ? `编辑用户：${editingUserSnapshot.username}` : '新建用户' }}</h2>
           </div>
           <button class="icon-only-button" type="button" @click="showUserEditor = false"><X :size="20" /></button>
         </header>
         <div class="create-lead-body">
           <label class="field"><span>用户名</span><n-input v-model:value="editingUser.username" /></label>
-          <label class="field"><span>密码{{ editingUser.id ? '（留空则不变）' : '' }}</span><n-input v-model:value="editingUser.password" type="password" show-password-on="click" /></label>
-          <label class="field"><span>角色</span>
+          <label class="field">
+            <span>密码{{ editingUser.id ? '（留空则不修改）' : '' }}</span>
+            <div class="password-row">
+              <n-input
+                v-model:value="editingUser.password"
+                :type="editingUser.id ? 'text' : 'password'"
+                show-password-on="click"
+                :placeholder="editingUser.id ? '留空表示不修改密码' : '至少 6 个字符'"
+                style="flex:1"
+              />
+              <n-button
+                size="small"
+                secondary
+                title="生成 12 位随机密码"
+                @click="generateNewPasswordForUser"
+              >
+                <template #icon><n-icon><RefreshCw :size="14" /></n-icon></template>
+                生成
+              </n-button>
+            </div>
+            <small v-if="editingUser.id && editingUser.password" class="hint warning">
+              保存后将弹出一次性密码确认框，请提醒用户立即记录。
+            </small>
+          </label>
+          <label class="field">
+            <span>角色</span>
             <n-select v-model:value="editingUser.role_id" :options="allRoles.map(r => ({ label: r.name, value: r.id }))" />
           </label>
+          <small
+            v-if="editingUser.id && editingUser.role_id !== editingUserSnapshot.role_id"
+            class="hint info"
+          >
+            角色变更后该用户的权限将立即生效（无需重新登录，最长 30 秒后端缓存自动刷新）。
+          </small>
         </div>
         <footer class="create-lead-footer">
           <n-button class="ghost-button" secondary @click="showUserEditor = false">取消</n-button>
-          <n-button class="primary-button" type="primary" :disabled="!editingUser.username" @click="saveUser">保存</n-button>
+          <n-button
+            class="primary-button"
+            type="primary"
+            :disabled="!editingUser.username.trim() || (editingUser.id === 0 && !editingUser.password) || (editingUser.id > 0 && !userEditorDirty())"
+            @click="saveUser"
+          >保存</n-button>
+        </footer>
+      </section>
+    </div>
+
+    <!-- Reset Password Result Modal — one-time display after admin resets a user's password -->
+    <div v-if="showResetPasswordResult" class="modal-backdrop" role="presentation" @click.self="showResetPasswordResult = false">
+      <section class="create-lead-modal" role="dialog" aria-modal="true" aria-label="新密码">
+        <header class="modal-header">
+          <div>
+            <p class="panel-label">密码已重置</p>
+            <h2>{{ resetPasswordResult.username }} 的新密码</h2>
+          </div>
+          <button class="icon-only-button" type="button" @click="showResetPasswordResult = false"><X :size="20" /></button>
+        </header>
+        <div class="create-lead-body">
+          <p class="reset-password-warning">⚠️ 此密码仅显示一次，请立即复制并发给用户。关闭此对话框后将无法再次查看。</p>
+          <div class="reset-password-display">
+            <code>{{ resetPasswordResult.password }}</code>
+            <n-button size="small" secondary @click="copyTextToClipboard(resetPasswordResult.password, '密码已复制到剪贴板')">
+              复制
+            </n-button>
+          </div>
+        </div>
+        <footer class="create-lead-footer">
+          <n-button class="primary-button" type="primary" @click="showResetPasswordResult = false">已记录</n-button>
         </footer>
       </section>
     </div>
