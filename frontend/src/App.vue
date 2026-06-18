@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { router } from "@/router";
 import {
   AlertTriangle,
   Bell,
@@ -37,11 +38,14 @@ import {
   NCard,
   NCheckbox,
   NConfigProvider,
+  NDialogProvider,
   NEmpty,
   NGlobalStyle,
   NIcon,
   NInput,
   NInputNumber,
+  NMessageProvider,
+  NNotificationProvider,
   NPagination,
   NSelect,
   NTag,
@@ -63,6 +67,9 @@ import {
   type AgentSessionState,
 } from "./agentSession";
 import MarkdownRenderer from "./components/MarkdownRenderer.vue";
+import NaiveApiBridge from "./components/NaiveApiBridge.vue";
+import CommandPalette, { type Command } from "./components/CommandPalette.vue";
+import { confirmDanger } from "./composables/useNotifications";
 import { parseMarkdown } from "./markdown";
 
 interface Lead {
@@ -292,6 +299,10 @@ const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
 const notice = ref("");
 const error = ref("");
+// Hard cap on the Agent prompt length. The composer's character counter
+// and `n-input :maxlength` both read from this so the displayed limit
+// and the enforced limit can never drift.
+const AGENT_PROMPT_MAX = 2000;
 const agentPrompt = ref(
   "帮我找 SkyWalker TKA 在印度的渠道商，优先找骨科植入物、关节置换、TKA 分销商，要求公开邮箱和来源证据。"
 );
@@ -302,6 +313,91 @@ const agentEvents = ref<AgentEvent[]>([]);
 const agentProcessItems = ref<AgentProcessItem[]>([]);
 const agentLoading = ref(false);
 const agentError = ref("");
+// Wall-clock time of the most recent successful Agent run completion.
+// Powers the "完成于 …" badge in the report head.
+const agentLastCompletedAt = ref<Date | null>(null);
+
+// Cmd/Ctrl+K command palette (PR6.2). The palette itself is dumb — it
+// just renders the list and bubbles the chosen command back up. The
+// command list below is the canonical "what you can do" surface; we
+// feed it to the palette on every render so permission gates and live
+// data (selected leads, current page) are reflected without manual
+// refresh.
+const commandPaletteOpen = ref(false);
+const paletteCommands = computed<Command[]>(() => {
+  const list: Command[] = [
+    {
+      id: "go-leads",
+      group: "页面",
+      label: "线索数据库",
+      hint: "/leads",
+      run: () => showPage("workspace", "overview"),
+    },
+    {
+      id: "go-agent",
+      group: "页面",
+      label: "渠道拓展 Agent",
+      hint: "/agent",
+      run: () => showPage("agent"),
+    },
+    {
+      id: "go-settings",
+      group: "页面",
+      label: "系统设置",
+      hint: "/settings",
+      run: () => showPage("settings"),
+    },
+    {
+      id: "refresh-dashboard",
+      group: "操作",
+      label: "刷新线索列表",
+      hint: "重新拉取当前过滤条件下的线索",
+      available: () => isAuthenticated.value,
+      run: () => loadDashboard(),
+    },
+    {
+      id: "create-lead",
+      group: "操作",
+      label: "添加新线索",
+      available: () => isAuthenticated.value && hasPermission("leads:write"),
+      run: () => {
+        showPage("workspace");
+        openCreateLead();
+      },
+    },
+    {
+      id: "approve-all-drafts",
+      group: "操作",
+      label: "批准全部待发草稿",
+      hint: `${draftCount.value} 条待审批`,
+      available: () =>
+        isAuthenticated.value &&
+        hasPermission("outreach:send") &&
+        draftCount.value > 0,
+      run: () => approveAllDrafts(),
+    },
+    {
+      id: "sync-replies",
+      group: "操作",
+      label: "同步邮件回复",
+      hint: "立即扫描收件箱",
+      available: () => isAuthenticated.value && hasPermission("replies:sync"),
+      run: () => syncReplies(),
+    },
+    {
+      id: "logout",
+      group: "账户",
+      label: "退出登录",
+      available: () => isAuthenticated.value,
+      run: () => logout(),
+    },
+  ];
+  return list;
+});
+
+function toggleCommandPalette(): void {
+  commandPaletteOpen.value = !commandPaletteOpen.value;
+}
 const agentConfig = ref<AgentConfigResponse | null>(null);
 const agentApiKeyInput = ref("");
 const agentProviderName = ref("deepseek");
@@ -555,8 +651,13 @@ async function saveRole(): Promise<void> {
 }
 
 async function deleteRole(role: typeof allRoles.value[0]): Promise<void> {
-  const tail = role.user_count > 0 ? `（${role.user_count} 个用户将移至 admin）` : "";
-  if (!globalThis.confirm?.(`确定删除角色「${role.name}」？${tail}`)) return;
+  const tail = role.user_count > 0 ? `${role.user_count} 个使用此角色的用户会被移至 admin。` : "";
+  const confirmed = await confirmDanger({
+    title: `删除角色「${role.name}」？`,
+    content: `${tail}此操作不可恢复。`.trim(),
+    positiveText: "删除角色",
+  });
+  if (!confirmed) return;
   await request(`/roles/${role.id}`, { method: "DELETE" });
   await loadRolesAndUsers();
   await refreshPermissions();
@@ -611,7 +712,12 @@ async function saveUser(): Promise<void> {
 }
 
 async function deleteUser(user: typeof allUsers.value[0]): Promise<void> {
-  if (!globalThis.confirm?.(`确定删除用户「${user.username}」？此操作不可恢复。`)) return;
+  const confirmed = await confirmDanger({
+    title: `删除用户「${user.username}」？`,
+    content: "此操作不可恢复，账号下的访问凭证会立即失效。",
+    positiveText: "删除用户",
+  });
+  if (!confirmed) return;
   await request(`/users/${user.id}`, { method: "DELETE" });
   await loadRolesAndUsers();
   notice.value = `用户「${user.username}」已删除`;
@@ -619,6 +725,62 @@ async function deleteUser(user: typeof allUsers.value[0]): Promise<void> {
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
 const settingsTab = ref<"email" | "sync" | "agent" | "template" | "scoring" | "access">("email");
+
+// Keyboard-navigable tablist support (PR6.1). The list is rebuilt
+// reactively because the "权限" tab is permission-gated; arrow-key
+// navigation must skip a tab that isn't currently mounted.
+type SettingsTabValue = "email" | "sync" | "agent" | "template" | "scoring" | "access";
+const settingsTabList = computed<{ value: SettingsTabValue; label: string }[]>(() => {
+  const tabs: { value: SettingsTabValue; label: string }[] = [
+    { value: "email", label: "邮箱" },
+    { value: "sync", label: "同步" },
+    { value: "agent", label: "Agent" },
+    { value: "template", label: "模板" },
+    { value: "scoring", label: "评分" },
+  ];
+  if (hasPermission("users:manage")) {
+    tabs.push({ value: "access", label: "权限" });
+  }
+  return tabs;
+});
+
+const settingsTabRefs: Partial<Record<SettingsTabValue, HTMLButtonElement>> = {};
+function bindSettingsTabRef(value: SettingsTabValue, el: HTMLButtonElement | null): void {
+  if (el) settingsTabRefs[value] = el;
+  else delete settingsTabRefs[value];
+}
+
+function onSettingsTabKeydown(event: KeyboardEvent): void {
+  const list = settingsTabList.value.map((t) => t.value);
+  const current = settingsTab.value;
+  const idx = list.indexOf(current);
+  if (idx < 0) return;
+  let next: SettingsTabValue | null = null;
+  switch (event.key) {
+    case "ArrowLeft":
+      next = list[(idx - 1 + list.length) % list.length];
+      break;
+    case "ArrowRight":
+      next = list[(idx + 1) % list.length];
+      break;
+    case "Home":
+      next = list[0];
+      break;
+    case "End":
+      next = list[list.length - 1];
+      break;
+    default:
+      return;
+  }
+  if (!next) return;
+  event.preventDefault();
+  settingsTab.value = next;
+  // Move DOM focus too so subsequent ←/→ keep working without the user
+  // having to mouse-click.
+  globalThis.requestAnimationFrame?.(() => {
+    settingsTabRefs[next!]?.focus();
+  });
+}
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -628,6 +790,20 @@ const showCreateLead = ref(false);
 const createError = ref("");
 const newLead = ref({ company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" });
 const activePage = ref<"workspace" | "agent" | "settings">("workspace");
+
+// Sync the local `activePage` with the router so browser back/forward
+// and bookmarkable URLs work without rewriting every consumer of
+// `activePage.value` in this file. Pages still read `activePage` exactly
+// as before; navigation is just URL-aware now.
+watch(
+  () => router.currentRoute.value.name,
+  (name) => {
+    if (name === "agent" || name === "settings" || name === "workspace") {
+      activePage.value = name;
+    }
+  },
+  { immediate: true },
+);
 
 // ── Auth state ────────────────────────────────────────
 const STORAGE_TOKEN_KEY = "medbot_auth_token";
@@ -755,6 +931,33 @@ const agentHistoryCount = computed(() =>
   countAgentHistoryItems(historicalAgentStatusItems.value, agentEvents.value)
 );
 const agentMarkdownBlocks = computed(() => parseMarkdown(agentResponse.value));
+
+/**
+ * Human-readable label for the last successful Agent completion.
+ * Empty when nothing has finished yet (the badge is hidden).
+ *
+ * Recent completions are shown as a relative phrase ("刚刚", "3 分钟前");
+ * older ones fall back to a "YYYY-MM-DD HH:mm" stamp so the timestamp
+ * stays unambiguous when a session has been idle for hours.
+ */
+const agentCompletedAtLabel = computed<string>(() => {
+  const at = agentLastCompletedAt.value;
+  if (!at) return "";
+  const elapsedMs = Date.now() - at.getTime();
+  if (elapsedMs < 60 * 1000) return "完成于 刚刚";
+  if (elapsedMs < 60 * 60 * 1000) {
+    return `完成于 ${Math.floor(elapsedMs / (60 * 1000))} 分钟前`;
+  }
+  if (elapsedMs < 12 * 60 * 60 * 1000) {
+    return `完成于 ${Math.floor(elapsedMs / (60 * 60 * 1000))} 小时前`;
+  }
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `完成于 ${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ` +
+    `${pad(at.getHours())}:${pad(at.getMinutes())}`
+  );
+});
+
 const activeAgentSession = computed(() =>
   agentSessions.value.find((session) => session.id === agentSessionId.value)
 );
@@ -957,7 +1160,9 @@ async function verifyAndRestoreAuth(): Promise<boolean> {
 
 function logout(): void {
   clearAuth();
-  activePage.value = "workspace";
+  // Navigate via router so the URL/back-button stay consistent. The watch
+  // mirrors this into `activePage` before the login overlay appears.
+  void router.push({ name: "workspace" });
   sidebarUserMenuOpen.value = false;
   notice.value = "已退出登录";
 }
@@ -1041,8 +1246,21 @@ async function createLead(): Promise<void> {
     createError.value = "请填写国家";
     return;
   }
-  if (!newLead.value.email.trim()) {
+  const email = newLead.value.email.trim();
+  if (!email) {
     createError.value = "请填写邮箱";
+    return;
+  }
+  // Permissive email check — same family as the HTML5 input[type=email]
+  // pattern; rejects clearly broken values like "bob" or "x@" without
+  // chasing every RFC edge case.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    createError.value = "邮箱格式不正确";
+    return;
+  }
+  const website = newLead.value.website.trim();
+  if (website && !/^https?:\/\/[^\s]+$/i.test(website)) {
+    createError.value = "网址需以 http:// 或 https:// 开头";
     return;
   }
   try {
@@ -1069,7 +1287,11 @@ async function createLead(): Promise<void> {
 
 async function batchDeleteLeads(): Promise<void> {
   if (selectedLeadIds.value.length === 0) return;
-  const confirmed = globalThis.confirm?.(`确定删除选中的 ${selectedLeadIds.value.length} 条线索及其关联数据？`) ?? true;
+  const confirmed = await confirmDanger({
+    title: `删除选中的 ${selectedLeadIds.value.length} 条线索？`,
+    content: "关联的外联记录、回复分析和草稿都会一并清除，此操作不可恢复。",
+    positiveText: "全部删除",
+  });
   if (!confirmed) return;
   await runAction("qualify", async () => {
     await request("/leads/batch-delete", {
@@ -1083,7 +1305,11 @@ async function batchDeleteLeads(): Promise<void> {
 }
 
 async function deleteLead(leadId: number): Promise<void> {
-  const confirmed = globalThis.confirm?.("确定删除这条线索及其关联的外联记录和回复分析？") ?? true;
+  const confirmed = await confirmDanger({
+    title: "删除这条线索？",
+    content: "关联的外联记录和回复分析也会被清除，此操作不可恢复。",
+    positiveText: "删除线索",
+  });
   if (!confirmed) return;
   await runAction("qualify", async () => {
     await request(`/leads/${leadId}`, { method: "DELETE" });
@@ -1215,10 +1441,27 @@ async function generateFollowupAndOpen(): Promise<void> {
   });
 }
 
+// Aborter for the in-flight Agent SSE stream. Held at module scope so
+// the cancel button can call `agentAbort.value?.abort()` without needing
+// to thread a reference through composables.
+const agentAbort = ref<AbortController | null>(null);
+
+function cancelAgentPrompt(): void {
+  const controller = agentAbort.value;
+  if (!controller) return;
+  controller.abort();
+  // The fetch will reject in the running `sendAgentPrompt` and the
+  // `finally` clause clears `agentLoading` and the controller; we just
+  // surface a clean process-bar message so the user sees confirmation.
+  appendAgentProcess("error", "已中断", "用户主动取消了本次 Agent 任务");
+}
+
 async function sendAgentPrompt(): Promise<void> {
   const message = agentPrompt.value.trim();
   if (!message || agentLoading.value) return;
 
+  const controller = new AbortController();
+  agentAbort.value = controller;
   agentLoading.value = true;
   clearAgentOutput();
   notice.value = "";
@@ -1235,6 +1478,7 @@ async function sendAgentPrompt(): Promise<void> {
         message,
         session_id: agentSessionId.value || undefined,
       }),
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -1258,12 +1502,22 @@ async function sendAgentPrompt(): Promise<void> {
     if (buffer.trim()) {
       handleAgentSseFrame(buffer);
     }
+    agentLastCompletedAt.value = new Date();
     await loadDashboard();
   } catch (caught) {
-    agentError.value = caught instanceof Error ? caught.message : "Agent 请求失败";
-    appendAgentProcess("error", "Agent 请求失败", agentError.value);
+    // AbortError fires when the user clicked cancel — already messaged.
+    const aborted =
+      controller.signal.aborted ||
+      (caught instanceof DOMException && caught.name === "AbortError");
+    if (!aborted) {
+      agentError.value = caught instanceof Error ? caught.message : "Agent 请求失败";
+      appendAgentProcess("error", "Agent 请求失败", agentError.value);
+    }
   } finally {
     agentLoading.value = false;
+    if (agentAbort.value === controller) {
+      agentAbort.value = null;
+    }
   }
 }
 
@@ -1386,6 +1640,19 @@ async function openEditLead(leadId: number): Promise<void> {
 
 async function saveEditLead(): Promise<void> {
   if (editLeadSaving.value) return;
+  // Same shape as the create-lead validation. We only check fields the
+  // user can edit non-trivially — empty values blank a field; bad-format
+  // values block the save and surface a global error.
+  const email = (editLead.value.email || "").trim();
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    error.value = "邮箱格式不正确";
+    return;
+  }
+  const website = (editLead.value.website || "").trim();
+  if (website && !/^https?:\/\/[^\s]+$/i.test(website)) {
+    error.value = "网址需以 http:// 或 https:// 开头";
+    return;
+  }
   editLeadSaving.value = true;
   try {
     await request(`/leads/${editLead.value.id}`, {
@@ -1732,6 +1999,17 @@ function statusTagType(status: string): "default" | "info" | "success" | "warnin
   return "default";
 }
 
+/**
+ * Maps a 0–100 lead score onto a visual tier.
+ * Tiers map to `--score-{high,mid,low}` design tokens via the
+ * `.lead-score-badge.score-{high,mid,low}` rules in styles.css.
+ */
+function scoreTier(score: number): "score-high" | "score-mid" | "score-low" {
+  if (score >= 75) return "score-high";
+  if (score >= 40) return "score-mid";
+  return "score-low";
+}
+
 function applyAgentConfig(config: AgentConfigResponse): void {
   agentConfig.value = config;
   agentProviderName.value = config.provider_name;
@@ -1741,21 +2019,29 @@ function applyAgentConfig(config: AgentConfigResponse): void {
 }
 
 function showPage(page: "workspace" | "agent" | "settings", sectionId?: string): void {
-  activePage.value = page;
   agentGuideOpen.value = false;
   agentNotificationsOpen.value = false;
   sidebarUserMenuOpen.value = false;
-  const hash = page === "agent" ? "agent" : page === "settings" ? "settings" : sectionId || "overview";
-  globalThis.history?.replaceState(null, "", `#${hash}`);
 
-  if (page === "settings") {
-    loadSettings();
-    return;
-  }
-  const targetId = sectionId || (page === "agent" ? "overview" : "");
-  if (!targetId) return;
-  globalThis.requestAnimationFrame?.(() => {
-    globalThis.document?.getElementById(targetId)?.scrollIntoView({ block: "start" });
+  // Drive navigation through the router so browser history works.
+  // The watch on `router.currentRoute.value.name` mirrors this back into
+  // the local `activePage` ref, so existing template `v-if` checks still
+  // resolve before the next paint.
+  const routeName = page;
+  const navigation = router.currentRoute.value.name === routeName
+    ? Promise.resolve()
+    : router.push({ name: routeName });
+
+  void Promise.resolve(navigation).then(() => {
+    if (page === "settings") {
+      loadSettings();
+      return;
+    }
+    const targetId = sectionId || (page === "agent" ? "overview" : "");
+    if (!targetId) return;
+    globalThis.requestAnimationFrame?.(() => {
+      globalThis.document?.getElementById(targetId)?.scrollIntoView({ block: "start" });
+    });
   });
 }
 
@@ -1816,38 +2102,75 @@ async function saveSettings(): Promise<void> {
   }
 }
 
+/**
+ * Mutual-exclusion control for the Agent page's stack of popovers.
+ *
+ * The Agent page can show up to 5 different floating panels (guide,
+ * notifications, settings, skill detail, logs) plus the sidebar user
+ * menu. Pre-PR5 each toggle was hand-rolled, leading to overlap when
+ * multiple were opened at once. `closeOtherPopovers(except)` is the
+ * single source of truth: every toggle calls it before opening, so at
+ * most one popover is visible at a time.
+ *
+ * Note: `agentReportFullscreen` is intentionally excluded — it's a
+ * full-canvas overlay rather than a small popover, and a user opening
+ * a report panel on top of it would close it.
+ */
+type PopoverKey =
+  | "guide"
+  | "notifications"
+  | "userMenu"
+  | "settings"
+  | "skill"
+  | "logs";
+
+function closeOtherPopovers(except: PopoverKey | null): void {
+  if (except !== "guide") agentGuideOpen.value = false;
+  if (except !== "notifications") agentNotificationsOpen.value = false;
+  if (except !== "userMenu") sidebarUserMenuOpen.value = false;
+  if (except !== "settings") agentSettingsOpen.value = false;
+  if (except !== "skill") agentSkillDetailsOpen.value = false;
+  if (except !== "logs") agentLogsOpen.value = false;
+}
+
 function toggleAgentGuide(): void {
   agentGuideOpen.value = !agentGuideOpen.value;
-  if (agentGuideOpen.value) agentNotificationsOpen.value = false;
+  if (agentGuideOpen.value) closeOtherPopovers("guide");
 }
 
 function toggleAgentNotifications(): void {
   agentNotificationsOpen.value = !agentNotificationsOpen.value;
-  if (agentNotificationsOpen.value) agentGuideOpen.value = false;
+  if (agentNotificationsOpen.value) closeOtherPopovers("notifications");
 }
 
 function toggleSidebarUserMenu(): void {
   sidebarUserMenuOpen.value = !sidebarUserMenuOpen.value;
+  if (sidebarUserMenuOpen.value) closeOtherPopovers("userMenu");
 }
 
 function toggleAgentSettings(): void {
   agentSettingsOpen.value = !agentSettingsOpen.value;
-  if (agentSettingsOpen.value) agentConfigExpanded.value = true;
+  if (agentSettingsOpen.value) {
+    agentConfigExpanded.value = true;
+    closeOtherPopovers("settings");
+  }
 }
 
 function toggleAgentSkillDetails(): void {
   agentSkillDetailsOpen.value = !agentSkillDetailsOpen.value;
+  if (agentSkillDetailsOpen.value) closeOtherPopovers("skill");
 }
 
 function toggleAgentLogs(): void {
   agentLogsOpen.value = !agentLogsOpen.value;
+  if (agentLogsOpen.value) closeOtherPopovers("logs");
 }
 
 function toggleAgentReportFullscreen(): void {
-  if (!agentOutputText.value) {
-    notice.value = "暂无 Agent 输出可全屏查看";
-    return;
-  }
+  // The fullscreen button is `:disabled="!agentOutputText"`, but a
+  // keyboard-driven activate could still slip through if the disabled
+  // state lags the data. We still bail silently to avoid throwing.
+  if (!agentOutputText.value) return;
   agentReportFullscreen.value = !agentReportFullscreen.value;
 }
 
@@ -1990,11 +2313,15 @@ function saveAgentSessionTitle(sessionId: string): void {
   cancelEditAgentSession();
 }
 
-function removeAgentSession(sessionId: string): void {
+async function removeAgentSession(sessionId: string): Promise<void> {
   if (agentLoading.value) return;
   const session = agentSessions.value.find((item) => item.id === sessionId);
   const title = session?.title || "当前会话";
-  const confirmed = globalThis.confirm?.(`删除会话“${title}”？`) ?? true;
+  const confirmed = await confirmDanger({
+    title: `删除会话「${title}」？`,
+    content: "本地保存的会话历史和过程记录会一并清除，发送给 Agent 的请求不受影响。",
+    positiveText: "删除",
+  });
   if (!confirmed) return;
 
   const wasActive = agentSessionId.value === sessionId;
@@ -2182,9 +2509,104 @@ function formatAgentEvent(event: AgentEvent): string {
 
 onMounted(async () => {
   applyAgentSessionState(loadAgentSessionState(getAgentStorage()));
-  if (globalThis.location?.hash === "#agent") {
-    activePage.value = "agent";
+  // Legacy hash format (`#agent`, `#settings`) → upgrade to router URLs.
+  const legacyHash = globalThis.location?.hash;
+  if (legacyHash === "#agent") {
+    void router.replace({ name: "agent" });
+  } else if (legacyHash === "#settings") {
+    void router.replace({ name: "settings" });
   }
+
+  // Global Esc handler — closes the topmost modal/popover in priority
+  // order. Naive UI's `n-dialog` already handles its own Esc, so this
+  // only needs to cover the legacy `modal-backdrop` overlays still
+  // inlined in this template (until PR7 ports them to `n-modal`).
+  const onGlobalKeydown = (event: KeyboardEvent) => {
+    // Cmd/Ctrl+K opens the command palette. Skip when the user is
+    // composing inside a textarea/input — most browsers reserve the
+    // shortcut already for power-user actions, but inside the agent
+    // composer (a multi-line textarea) we still want it to work.
+    if ((event.metaKey || event.ctrlKey) && (event.key === "k" || event.key === "K")) {
+      event.preventDefault();
+      toggleCommandPalette();
+      return;
+    }
+    if (event.key !== "Escape") return;
+    if (commandPaletteOpen.value) {
+      // The palette has its own Esc handler on the input, but if focus
+      // has bubbled out (e.g. clicking the backdrop) we need this fallback.
+      commandPaletteOpen.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (agentReportFullscreen.value) {
+      agentReportFullscreen.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (sourcePreviewLead.value) {
+      closeSourcePreview();
+      event.preventDefault();
+      return;
+    }
+    if (showResetPasswordResult.value) {
+      showResetPasswordResult.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showRoleEditor.value) {
+      showRoleEditor.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showUserEditor.value) {
+      showUserEditor.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showCreateLead.value) {
+      showCreateLead.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showEditLead.value) {
+      showEditLead.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showCustomEmail.value) {
+      showCustomEmail.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (showOutreachPreview.value) {
+      showOutreachPreview.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (detailLeadId.value !== null) {
+      closeLeadDetail();
+      event.preventDefault();
+      return;
+    }
+    if (agentGuideOpen.value) {
+      agentGuideOpen.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (agentNotificationsOpen.value) {
+      agentNotificationsOpen.value = false;
+      event.preventDefault();
+      return;
+    }
+    if (sidebarUserMenuOpen.value) {
+      sidebarUserMenuOpen.value = false;
+      event.preventDefault();
+      return;
+    }
+  };
+  globalThis.addEventListener?.("keydown", onGlobalKeydown);
+  void onGlobalKeydown;
 
   // Verify or restore auth on startup
   const loggedIn = await verifyAndRestoreAuth();
@@ -2216,6 +2638,25 @@ onMounted(async () => {
 <template>
   <n-config-provider :theme-overrides="naiveThemeOverrides">
   <n-global-style />
+  <!--
+    Naive's discrete API providers wrap the whole shell so any descendant
+    can call `useMessage()`, `useDialog()` or `useNotification()` (PR2+).
+    They are pure providers — no DOM cost when nothing is queued.
+  -->
+  <n-message-provider :max="5" placement="top-right">
+  <n-dialog-provider>
+  <n-notification-provider :max="4" placement="top-right">
+  <NaiveApiBridge />
+
+  <!--
+    Cmd/Ctrl+K command palette. Lives at the root so its z-index
+    overlay sits above every page surface (workspace, agent, settings)
+    and every modal-backdrop.
+  -->
+  <CommandPalette
+    v-model:open="commandPaletteOpen"
+    :commands="paletteCommands"
+  />
 
   <!-- Login screen -->
   <div v-if="!isAuthenticated" class="login-overlay" aria-label="登录">
@@ -2677,13 +3118,17 @@ onMounted(async () => {
               <div class="agent-composer-card agent-compose-surface">
                 <div class="agent-composer-heading">
                   <strong>向 Agent 发起任务</strong>
-                  <span>{{ agentPrompt.length }} / 2000</span>
+                  <span :class="['char-counter', { 'char-counter-over': agentPrompt.length > AGENT_PROMPT_MAX }]">
+                    {{ agentPrompt.length }} / {{ AGENT_PROMPT_MAX }}
+                  </span>
                 </div>
                 <label class="field agent-field">
                   <span>任务指令</span>
                   <n-input
                     v-model:value="agentPrompt"
                     type="textarea"
+                    :maxlength="AGENT_PROMPT_MAX"
+                    show-count
                     :autosize="{ minRows: 5, maxRows: 10 }"
                   />
                 </label>
@@ -2713,6 +3158,19 @@ onMounted(async () => {
                         <n-icon><RefreshCw /></n-icon>
                       </template>
                       新建会话
+                    </n-button>
+                    <n-button
+                      v-if="agentLoading"
+                      class="ghost-button agent-cancel-button"
+                      secondary
+                      type="error"
+                      aria-label="中断当前 Agent 任务"
+                      @click="cancelAgentPrompt"
+                    >
+                      <template #icon>
+                        <n-icon><X /></n-icon>
+                      </template>
+                      停止
                     </n-button>
                     <n-button
                       class="primary-button"
@@ -2777,9 +3235,9 @@ onMounted(async () => {
                       {{ agentError ? "失败" : agentLoading ? "生成中" : "已完成" }}
                     </n-tag>
                   </div>
-                  <span>
+                  <span v-if="agentCompletedAtLabel">
                     <CheckCircle2 :size="15" aria-hidden="true" />
-                    完成于 2026-05-15
+                    {{ agentCompletedAtLabel }}
                   </span>
                   <div class="report-actions">
                     <button
@@ -3184,8 +3642,28 @@ onMounted(async () => {
             </div>
           </div>
 
+          <!--
+            Skeleton: shown while the very first dashboard load is in
+            flight. Once leads are populated we render the rows below;
+            on empty (post-load) the `n-empty` block takes over.
+          -->
+          <div
+            v-if="currentAction === 'dashboard' && leads.length === 0"
+            class="lead-skeleton-list"
+            aria-busy="true"
+            aria-label="线索加载中"
+          >
+            <div v-for="n in 6" :key="n" class="lead-skeleton-row">
+              <span class="skeleton-bar skeleton-checkbox" />
+              <span class="skeleton-bar skeleton-strong" />
+              <span class="skeleton-bar skeleton-meta" />
+              <span class="skeleton-bar skeleton-meta short" />
+              <span class="skeleton-bar skeleton-pill" />
+            </div>
+          </div>
+
           <n-empty
-            v-if="leads.length === 0"
+            v-else-if="leads.length === 0"
             class="empty-state"
             description="点击左侧'实时搜索并入库'后，结果会显示在这里。"
           >
@@ -3222,7 +3700,7 @@ onMounted(async () => {
               <div class="lead-bottom">
                 <a v-if="lead.email" :href="`mailto:${lead.email}`" class="lead-email" @click.stop>{{ lead.email }}</a>
                 <span v-else class="muted">—</span>
-                <span class="lead-score-badge">{{ lead.score }}</span>
+                <span :class="['lead-score-badge', scoreTier(lead.score)]" :title="`匹配评分 ${lead.score}/100`">{{ lead.score }}</span>
                 <button class="source-link" type="button" @click.stop="openSourcePreview(lead)">{{ lead.source }}</button>
                 <span class="lead-reason-inline">{{ lead.match_reason }}</span>
               </div>
@@ -3458,13 +3936,32 @@ onMounted(async () => {
           class="settings-page"
           aria-labelledby="settings-title"
         >
-          <div class="settings-tabs">
-            <button :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
-            <button :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
-            <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
-            <button :class="['settings-tab', { active: settingsTab === 'template' }]" @click="settingsTab = 'template'">模板</button>
-            <button :class="['settings-tab', { active: settingsTab === 'scoring' }]" @click="settingsTab = 'scoring'">评分</button>
-            <button v-if="hasPermission('users:manage')" :class="['settings-tab', { active: settingsTab === 'access' }]" @click="settingsTab = 'access'">权限</button>
+          <!--
+            ARIA tablist (PR6.1) — gives the settings tabs first-class
+            keyboard navigation: ←/→ to move focus, Home/End to jump.
+            Each tab declares the panel id it controls so AT can announce
+            the relationship even when the inner card uses ad-hoc markup.
+          -->
+          <div
+            class="settings-tabs"
+            role="tablist"
+            aria-label="设置分组"
+            @keydown="onSettingsTabKeydown"
+          >
+            <button
+              v-for="tab in settingsTabList"
+              :key="tab.value"
+              :id="`settings-tab-${tab.value}`"
+              :ref="(el) => bindSettingsTabRef(tab.value, el as HTMLButtonElement | null)"
+              role="tab"
+              :class="['settings-tab', { active: settingsTab === tab.value }]"
+              :aria-selected="settingsTab === tab.value"
+              :aria-controls="`settings-panel-${tab.value}`"
+              :tabindex="settingsTab === tab.value ? 0 : -1"
+              @click="settingsTab = tab.value"
+            >
+              {{ tab.label }}
+            </button>
           </div>
 
           <section v-if="settingsTab === 'template'" class="settings-card">
@@ -3832,7 +4329,13 @@ onMounted(async () => {
           <label class="field"><span>匹配理由</span><n-input v-model:value="editLead.match_reason" /></label>
           <div class="create-lead-row">
             <label class="field"><span>评分</span><n-input-number v-model:value="editLead.score" :min="0" :max="100" /></label>
-            <label class="field"><span>状态</span><n-input v-model:value="editLead.status" /></label>
+            <label class="field"><span>状态</span>
+              <n-select
+                v-model:value="editLead.status"
+                :options="statusFilterOptions.filter(o => o.value !== '')"
+                placeholder="选择状态"
+              />
+            </label>
           </div>
           <label class="field"><span>备注</span><n-input v-model:value="editLead.notes" type="textarea" :autosize="{ minRows: 2, maxRows: 6 }" /></label>
         </div>
@@ -4222,5 +4725,8 @@ onMounted(async () => {
       </section>
     </div>
   </div>
+  </n-notification-provider>
+  </n-dialog-provider>
+  </n-message-provider>
   </n-config-provider>
 </template>

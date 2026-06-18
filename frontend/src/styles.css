@@ -34,6 +34,64 @@
   --shadow-md: 0 24px 60px rgba(15, 23, 42, 0.12);
   --radius: 8px;
   --radius-sm: 6px;
+
+  /* ── Design token tier 2 (PR3) ──────────────────────
+     Adds neutrals, font sizes, spacing rails, additional radii and
+     score-color thresholds. New rules should reference these tokens
+     instead of inlining hex/rem/px so the system stays consistent. */
+
+  /* Neutral scale — replaces scattered hard-coded greys
+     (#f8fafc / #e5e7eb / #cbd5e1 / #94a3b8 / #64748b / #334155 / #1f2937 / #0f172a) */
+  --neutral-50: #f8fafc;
+  --neutral-100: #f1f5f9;
+  --neutral-200: #e2e8f0;
+  --neutral-300: #cbd5e1;
+  --neutral-400: #94a3b8;
+  --neutral-500: #64748b;
+  --neutral-600: #475569;
+  --neutral-700: #334155;
+  --neutral-800: #1f2937;
+  --neutral-900: #0f172a;
+
+  /* Radius — adds pill (was inlined as 999px in 16 places) and large card */
+  --radius-pill: 999px;
+  --radius-lg: 12px;
+
+  /* Type scale — anchors the most common font sizes used across the app */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
+
+  /* Spacing rails (4-px grid) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+
+  /* Score colors — keyed by `lead.score` thresholds.
+     Use `--score-high` ≥75, `--score-mid` 40–74, `--score-low` <40. */
+  --score-high: var(--success);
+  --score-high-soft: var(--success-soft);
+  --score-mid: var(--accent);
+  --score-mid-soft: var(--accent-soft);
+  --score-low: var(--neutral-400);
+  --score-low-soft: var(--neutral-100);
+
+  /* Breakpoints — reference values; not consumable in @media but
+     handy for documentation and JS-side reads via getComputedStyle. */
+  --bp-sm: 520px;
+  --bp-md: 760px;
+  --bp-lg: 1120px;
+  --bp-xl: 1280px;
 }
 
 html {
@@ -948,6 +1006,81 @@ textarea::placeholder {
   }
 }
 
+/* ── Skeleton placeholders (PR4) ──────────────────────
+   Used while the lead list / dashboard is loading for the first
+   time so the user sees structured anticipation instead of a
+   collapsed empty state. */
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
+}
+
+.lead-skeleton-list {
+  display: grid;
+  gap: 10px;
+  padding: 12px 16px 18px;
+}
+
+.lead-skeleton-row {
+  display: grid;
+  grid-template-columns: 24px minmax(140px, 1fr) 80px 120px 60px;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.skeleton-bar {
+  display: block;
+  height: 12px;
+  border-radius: var(--radius-pill);
+  background: var(--neutral-100);
+  background-image: linear-gradient(
+    90deg,
+    var(--neutral-100) 0%,
+    var(--neutral-50) 50%,
+    var(--neutral-100) 100%
+  );
+  background-size: 200px 100%;
+  background-repeat: no-repeat;
+  animation: skeleton-shimmer 1.4s linear infinite;
+}
+
+.skeleton-checkbox {
+  height: 16px;
+  width: 16px;
+  border-radius: var(--radius-sm);
+}
+
+.skeleton-strong {
+  height: 14px;
+}
+
+.skeleton-meta {
+  height: 10px;
+}
+
+.skeleton-meta.short {
+  width: 64px;
+}
+
+.skeleton-pill {
+  height: 18px;
+  width: 48px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-bar {
+    animation: none;
+  }
+}
+
 .summary-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1506,13 +1639,38 @@ textarea::placeholder {
   color: var(--text-muted);
   background: var(--surface-muted);
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-variant-numeric: tabular-nums;
+  border: 1px solid transparent;
+  transition:
+    color 160ms ease,
+    background 160ms ease,
+    border-color 160ms ease;
+}
+
+/* Score tiers — driven by `scoreTier()` and the `--score-*` tokens.
+   Stars stay neutral inside each tier so the badge color reads first. */
+.lead-score-badge.score-high {
+  color: var(--score-high);
+  background: var(--score-high-soft);
+  border-color: var(--score-high);
+}
+
+.lead-score-badge.score-mid {
+  color: var(--score-mid);
+  background: var(--score-mid-soft);
+  border-color: var(--score-mid);
+}
+
+.lead-score-badge.score-low {
+  color: var(--neutral-500);
+  background: var(--score-low-soft);
+  border-color: var(--neutral-300);
 }
 
 .lead-score-badge::before {
   content: "★ ";
-  color: #f59e0b;
+  color: currentColor;
   font-size: 10px;
 }
 
@@ -2266,6 +2424,17 @@ textarea::placeholder {
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 800;
+}
+
+/* Composer character counter — turns red when the prompt has been
+   trimmed by `n-input :maxlength`, signalling the cap was hit. */
+.agent-composer-heading .char-counter {
+  font-variant-numeric: tabular-nums;
+  transition: color 160ms ease;
+}
+
+.agent-composer-heading .char-counter-over {
+  color: var(--danger);
 }
 
 .agent-field {
