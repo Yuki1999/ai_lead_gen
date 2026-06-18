@@ -2659,53 +2659,111 @@ onMounted(async () => {
   />
 
   <!-- Login screen -->
-  <div v-if="!isAuthenticated" class="login-overlay" aria-label="登录">
-    <div class="login-card">
-      <div class="login-brand">
-        <div class="brand-mark">SW</div>
+  <!--
+    Modern login screen (V1)
+    Split-pane layout: brand hero on the left, form on the right.
+    A radial gradient + soft decorative blobs replace the previous flat
+    gradient card, giving the screen visual depth without imagery.
+  -->
+  <div v-if="!isAuthenticated" class="login-shell" aria-label="登录">
+    <aside class="login-hero" aria-hidden="true">
+      <div class="login-hero-glow login-hero-glow-a"></div>
+      <div class="login-hero-glow login-hero-glow-b"></div>
+
+      <div class="login-hero-brand">
+        <div class="brand-mark login-brand-mark">SW</div>
         <div>
           <strong>SkyWalker</strong>
           <span>Overseas Prospecting</span>
         </div>
       </div>
-      <h2>系统登录</h2>
-      <p class="login-desc">请输入管理员账号和密码</p>
-      <label class="field">
-        <span>用户名</span>
-        <n-input
-          v-model:value="loginUsername"
-          placeholder="用户名"
-          autocomplete="username"
-          :disabled="loginLoading"
-          @keydown="onLoginKeydown"
-        />
-      </label>
-      <label class="field">
-        <span>密码</span>
-        <n-input
-          v-model:value="loginPassword"
-          type="password"
-          placeholder="密码"
-          autocomplete="current-password"
-          show-password-on="click"
-          :disabled="loginLoading"
-          @keydown="onLoginKeydown"
-        />
-      </label>
-      <p v-if="loginError" class="login-error">{{ loginError }}</p>
-      <n-button
-        class="primary-button"
-        type="primary"
-        size="large"
-        block
-        :loading="loginLoading"
-        :disabled="loginLoading"
-        @click="login"
+
+      <div class="login-hero-copy">
+        <h1>把海外渠道<br />拓展工作交给 Agent。</h1>
+        <p>
+          从产品画像出发，自动检索分销商、抓取证据、生成可发邮件 — 你只需要审核和点击。
+        </p>
+      </div>
+
+      <ul class="login-hero-points">
+        <li><span class="login-hero-dot login-hero-dot-blue" />多源证据 · 网页/邮箱/PDF 自动汇总</li>
+        <li><span class="login-hero-dot login-hero-dot-teal" />一键外联 · 草稿审核 → 自动发送</li>
+        <li><span class="login-hero-dot login-hero-dot-amber" />自动转人工 · 高意向回复主动提醒</li>
+      </ul>
+
+      <div class="login-hero-foot">
+        <span>v0.9.0 · 微创畅行</span>
+        <span>仅限授权访问</span>
+      </div>
+    </aside>
+
+    <main class="login-form-pane">
+      <form
+        class="login-form"
+        autocomplete="on"
+        @submit.prevent="login"
       >
-        {{ loginLoading ? "登录中..." : "登录" }}
-      </n-button>
-    </div>
+        <header class="login-form-head">
+          <p class="login-form-eyebrow">系统登录</p>
+          <h2>欢迎回来</h2>
+          <p class="login-form-sub">请使用授权账户登录工作台</p>
+        </header>
+
+        <label class="field">
+          <span>用户名</span>
+          <n-input
+            v-model:value="loginUsername"
+            size="large"
+            placeholder="例如 microport_admin"
+            autocomplete="username"
+            :disabled="loginLoading"
+            @keydown="onLoginKeydown"
+          />
+        </label>
+
+        <label class="field">
+          <span>密码</span>
+          <n-input
+            v-model:value="loginPassword"
+            type="password"
+            size="large"
+            placeholder="••••••••"
+            autocomplete="current-password"
+            show-password-on="click"
+            :disabled="loginLoading"
+            @keydown="onLoginKeydown"
+          />
+        </label>
+
+        <p
+          v-if="loginError"
+          class="login-error"
+          role="alert"
+          aria-live="polite"
+        >
+          {{ loginError }}
+        </p>
+
+        <n-button
+          class="primary-button login-submit"
+          type="primary"
+          size="large"
+          block
+          attr-type="submit"
+          :loading="loginLoading"
+          :disabled="loginLoading || !loginUsername || !loginPassword"
+        >
+          {{ loginLoading ? "登录中..." : "登录工作台" }}
+        </n-button>
+
+        <p class="login-form-foot">
+          忘记密码？请联系系统管理员重置 ·
+          <kbd>Tab</kbd> 切换 <kbd>Enter</kbd> 登录
+        </p>
+      </form>
+    </main>
   </div>
+
 
   <div v-show="isAuthenticated" class="app-shell app-frame">
     <aside class="sidebar" aria-label="系统导航">
@@ -2745,6 +2803,28 @@ onMounted(async () => {
         </button>
       </nav>
       <div class="sidebar-footer">
+        <!--
+          Sidebar Cmd+K cue (V2). Acts as a discoverable affordance for
+          the keyboard shortcut: clicking it opens the same palette so
+          mouse users get the same surface. The kbd hints adapt to the
+          OS via JS detection; we keep static "⌘ K" as the visual since
+          Tailwind/Naive don't ship platform detection helpers.
+        -->
+        <button
+          type="button"
+          class="sidebar-cmd-hint"
+          aria-label="打开命令面板 (Ctrl/Cmd + K)"
+          @click="toggleCommandPalette"
+        >
+          <span class="sidebar-cmd-hint-label">
+            <Search :size="14" aria-hidden="true" />
+            搜索 / 跳页
+          </span>
+          <span class="sidebar-cmd-hint-keys">
+            <kbd>⌘</kbd><kbd>K</kbd>
+          </span>
+        </button>
+
         <button
           class="sidebar-user-card"
           type="button"
