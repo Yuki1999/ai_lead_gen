@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 const appVue = readFileSync(new URL("../src/App.vue", import.meta.url), "utf8");
+const loginPage = readFileSync(new URL("../src/components/LoginPage.vue", import.meta.url), "utf8");
+const agentPage = readFileSync(new URL("../src/components/AgentPage.vue", import.meta.url), "utf8");
+const workspacePage = readFileSync(new URL("../src/components/WorkspacePage.vue", import.meta.url), "utf8");
+const settingsPage = readFileSync(new URL("../src/components/SettingsPage.vue", import.meta.url), "utf8");
+const allTemplates = appVue + loginPage + agentPage + workspacePage + settingsPage;
 const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 const packageJson = readFileSync(new URL("../package.json", import.meta.url), "utf8");
 
@@ -17,11 +22,15 @@ describe("modern console UI contract", () => {
       "modern-data-table",
       "lead-intelligence-panel",
     ]) {
-      assert.match(appVue + styles, new RegExp(className));
+      assert.match(allTemplates + styles, new RegExp(className));
     }
   });
 
   it("uses a chat-first Agent console layout", () => {
+    // After the agent-page rewrite, the shell is a chat app (header /
+    // drawer + scroll / sticky composer). Legacy class names are kept
+    // alongside the new ones so consumers depending on the old contract
+    // — and Vue style hooks that already shipped — still resolve.
     for (const className of [
       "agent-console-layout",
       "agent-chat-shell",
@@ -29,17 +38,24 @@ describe("modern console UI contract", () => {
       "agent-conversation-panel",
       "agent-sidebar-panel",
       "agent-main-panel",
-      "agent-side-panel",
-      "agent-context-rail",
-      "agent-execution-rail",
       "agent-compose-surface",
       "agent-session-search",
       "agent-skill-pill",
-      "agent-report-card",
-      "agent-capability-card",
-      "agent-log-button",
+      // Chat-rewrite primitives
+      "agent-chat-head",
+      "agent-chat-body",
+      "agent-chat-drawer",
+      "agent-chat-stage",
+      "agent-chat-scroll",
+      "agent-chat-composer",
+      "agent-chat-turn",
+      "agent-msg-user",
+      "agent-msg-agent",
+      "agent-tool-card",
+      "agent-welcome",
+      "agent-starter-card",
     ]) {
-      assert.match(appVue + styles, new RegExp(className));
+      assert.match(allTemplates + styles, new RegExp(className));
     }
   });
 
@@ -53,7 +69,7 @@ describe("modern console UI contract", () => {
       "agent-online-badge",
       "notification-button",
     ]) {
-      assert.match(appVue + styles, new RegExp(className));
+      assert.match(allTemplates + styles, new RegExp(className));
     }
   });
 
@@ -62,9 +78,11 @@ describe("modern console UI contract", () => {
       styles,
       /\.dashboard-grid\.agent-route \.content-area\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*none;/s,
     );
+    // Chat shell collapses the previous 3-column grid into a single
+    // column that the drawer + stage live inside `.agent-chat-body`.
     assert.match(
       styles,
-      /\.agent-design-shell\s*\{[^}]*width:\s*100%;[^}]*grid-template-columns:\s*minmax\(220px,\s*clamp\(232px,\s*16vw,\s*280px\)\) minmax\(0,\s*1fr\) minmax\(280px,\s*clamp\(300px,\s*20\.5vw,\s*340px\)\);/s,
+      /\.agent-chat-shell\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s*!important;/s,
     );
   });
 
@@ -84,27 +102,11 @@ describe("modern console UI contract", () => {
     for (const className of [
       "agent-crumb",
       "agent-action-buttons",
-      "agent-config-header",
-      "agent-config-summary",
       "agent-config-manage-button",
-      "session-manager-foot",
     ]) {
-      assert.match(appVue + styles, new RegExp(className));
+      assert.match(allTemplates + styles, new RegExp(className));
     }
     assert.match(styles, /\.agent-hero-actions\s*\{[^}]*margin-top:\s*14px;/s);
-    assert.match(styles, /\.agent-context-rail\s*\{[^}]*gap:\s*16px;/s);
-    assert.match(
-      styles,
-      /\.agent-design-shell \.agent-session-manager\s*\{[^}]*min-height:\s*calc\(100dvh - 186px\);[^}]*grid-template-rows:\s*auto auto minmax\(0,\s*1fr\) auto;/s,
-    );
-    assert.match(styles, /\.session-list\s*\{[^}]*align-content:\s*start;/s);
-    assert.match(styles, /\.agent-config\s*\{[^}]*padding:\s*15px;/s);
-    assert.match(styles, /\.agent-capability-card\s*\{[^}]*padding:\s*15px;/s);
-    assert.match(styles, /\.agent-execution-rail\s*\{[^}]*min-height:\s*380px;/s);
-    assert.match(
-      styles,
-      /\.agent-output,\s*\.agent-empty-state\s*\{[^}]*min-height:\s*clamp\(360px,\s*calc\(100dvh - 485px\),\s*560px\);/s,
-    );
   });
 
   it("uses a Vue component library for core controls", () => {
@@ -117,25 +119,29 @@ describe("modern console UI contract", () => {
       "n-select",
       "n-tag",
     ]) {
-      assert.match(appVue, new RegExp(component));
+      assert.match(allTemplates, new RegExp(component));
     }
   });
 
   it("wires Agent page interactive controls to visible behavior", () => {
+    // Core interactions kept across the chat-rewrite. `@click=` bindings
+    // for the legacy panels are gone (skill/logs/notifications still
+    // exist but live inside the new composer/drawer surfaces).
     for (const binding of [
+      '@click="toggleSidebarUserMenu"',
       '@click="toggleAgentGuide"',
       '@click="toggleAgentNotifications"',
-      '@click="toggleSidebarUserMenu"',
-      'v-model:value="agentSessionSearch"',
+      'v-model="agentSessionSearch"',
       "filteredAgentSessions",
       '@click="toggleAgentSettings"',
-      '@click="copyAgentOutput"',
-      '@click="downloadAgentOutput"',
-      '@click="toggleAgentReportFullscreen"',
-      '@click.prevent="toggleAgentSkillDetails"',
-      '@click="toggleAgentLogs"',
+      '@click="toggleAgentSkillDetails"',
+      '@click="sendAgentPrompt"',
+      '@click="cancelAgentPrompt"',
+      '@click="clearChatHistory"',
+      '@click="startNewAgentSession"',
+      '@click="toggleSessionDrawer"',
     ]) {
-      assert.match(appVue, new RegExp(binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(allTemplates, new RegExp(binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     }
 
     for (const stateClass of [
@@ -144,12 +150,12 @@ describe("modern console UI contract", () => {
       "agent-notification-panel",
       "sidebar-user-menu",
       "agent-settings-panel",
-      "agent-report-fullscreen",
-      "agent-skill-detail-panel",
-      "agent-log-panel",
-      "session-empty-state",
+      "agent-msg-thinking",
+      "agent-streaming-cursor",
+      "agent-tool-card",
+      "agent-chat-drawer",
     ]) {
-      assert.match(appVue + styles, new RegExp(stateClass));
+      assert.match(allTemplates + styles, new RegExp(stateClass));
     }
   });
 });
