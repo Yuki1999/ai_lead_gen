@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   ChevronDown,
   Clock3,
+  Copy,
   Database,
   Edit3,
   ExternalLink,
@@ -316,6 +317,186 @@ const agentError = ref("");
 // Wall-clock time of the most recent successful Agent run completion.
 // Powers the "完成于 …" badge in the report head.
 const agentLastCompletedAt = ref<Date | null>(null);
+
+// ── Agent chat-turn machinery (A-rewrite) ────────────
+// We keep `agentResponse` / `agentProcessItems` as the canonical
+// in-flight buffers (they're what the SSE handler writes into).
+// `currentTurnPrompt` captures the user-side text at send time;
+// `agentTurnHistory` collects completed turns so the chat scroll
+// shows past Q&A like a real conversation.
+interface AgentTurn {
+  id: string;
+  user: string;
+  response: string;
+  process: AgentProcessItem[];
+  completedAt: Date | null;
+  failed?: string;
+}
+const currentTurnPrompt = ref<string>("");
+const agentTurnHistory = ref<AgentTurn[]>([]);
+// Map of toolCard id -> expanded?  (lazy collapse state)
+const expandedToolCards = ref<Record<string, boolean>>({});
+
+function toggleToolCard(turnId: string, idx: number): void {
+  const key = `${turnId}:${idx}`;
+  expandedToolCards.value[key] = !expandedToolCards.value[key];
+}
+function isToolCardExpanded(turnId: string, idx: number): boolean {
+  return !!expandedToolCards.value[`${turnId}:${idx}`];
+}
+
+const hasAnyConversation = computed<boolean>(() => {
+  return (
+    agentTurnHistory.value.length > 0 ||
+    !!currentTurnPrompt.value ||
+    !!agentResponse.value ||
+    agentProcessItems.value.length > 0
+  );
+});
+
+// Rotating starter prompts shown when the conversation is empty.
+// Tap a card → drop into the composer + send (chat-app convention).
+interface StarterPrompt {
+  icon: string;
+  title: string;
+  body: string;
+}
+const starterPrompts: StarterPrompt[] = [
+  {
+    icon: "🇮🇳",
+    title: "在印度找 TKA 分销商",
+    body: "帮我找 SkyWalker TKA 在印度的渠道商，优先骨科植入物、关节置换、TKA 分销商，要求公开邮箱和来源证据。",
+  },
+  {
+    icon: "🇩🇪",
+    title: "德国骨科采购方",
+    body: "搜索德国地区的骨科医院采购、GPO 集采、私立连锁，关注 hip/knee implant 类目，给出 contact email。",
+  },
+  {
+    icon: "🇸🇦",
+    title: "中东医院采购对接",
+    body: "在阿联酋和沙特找私立医院采购或 distributor，列出公司名 + 联系人 + 邮箱 + 是否有官网证据。",
+  },
+  {
+    icon: "📧",
+    title: "起草跟进邮件",
+    body: "我刚和墨西哥的一家代理商通过邮件，他们要求看 SkyWalker TKA 的临床数据。帮我起草一封跟进邮件。",
+  },
+];
+
+function applyStarterPrompt(starter: StarterPrompt): void {
+  agentPrompt.value = starter.body;
+  // Defer one frame so the textarea reflects the bound value before we
+  // submit, otherwise composing IME may eat the send.
+  globalThis.requestAnimationFrame?.(() => {
+    sendAgentPrompt();
+  });
+}
+
+// Sessions drawer (mobile-first toggle that hides the session list on
+// narrow viewports). Defaults to open on desktop, closed on phones.
+const sessionDrawerOpen = ref(false);
+
+// Template ref pointing at the chat-scroll container so we can
+// auto-pin the viewport to the bottom when new tokens arrive — the
+// behaviour every modern chat client expects ("ChatGPT-scroll").
+const agentChatScrollEl = ref<HTMLDivElement | null>(null);
+
+function scrollChatToBottom(behavior: ScrollBehavior = "smooth"): void {
+  const el = agentChatScrollEl.value;
+  if (!el) return;
+  // Only auto-scroll when the user is already near the bottom; if they
+  // scrolled up to inspect history, leave them alone (chat-app courtesy).
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  if (distanceFromBottom > 240) return;
+  el.scrollTo({ top: el.scrollHeight, behavior });
+}
+
+watch(
+  () => agentResponse.value,
+  () => {
+    globalThis.requestAnimationFrame?.(() => scrollChatToBottom("smooth"));
+  },
+);
+watch(
+  () => agentProcessItems.value.length,
+  () => {
+    globalThis.requestAnimationFrame?.(() => scrollChatToBottom("smooth"));
+  },
+);
+watch(
+  () => agentTurnHistory.value.length,
+  () => {
+    // New turn pushed → snap to bottom unconditionally so the user
+    // immediately sees their latest message.
+    globalThis.requestAnimationFrame?.(() => {
+      const el = agentChatScrollEl.value;
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    });
+  },
+);
+
+function toggleSessionDrawer(): void {
+  sessionDrawerOpen.value = !sessionDrawerOpen.value;
+}
+
+function copyTurnResponse(turn: AgentTurn): void {
+  if (!turn.response) return;
+  void copyTextToClipboard(turn.response, "已复制 Agent 输出到剪贴板");
+}
+
+// Aliases bridging the new chat-shell template to the existing
+// session-rename helpers (which were named under the old 3-column
+// layout). Keeps the v-on/@submit bindings readable in the new
+// markup without duplicating the underlying logic.
+function beginAgentSessionRename(session: AgentSessionRecord): void {
+  beginEditAgentSession(session);
+}
+function cancelAgentSessionRename(): void {
+  cancelEditAgentSession();
+}
+function commitAgentSessionRename(): void {
+  if (!editingSessionId.value) return;
+  saveAgentSessionTitle(editingSessionId.value);
+}
+
+// Composer keydown — Cmd/Ctrl+Enter submits, Shift+Enter inserts a
+// newline (browser default), plain Enter alone does not submit on
+// purpose so users can stage multi-line prompts without surprises.
+function onComposerKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Enter") return;
+  const wantsSubmit = (event.metaKey || event.ctrlKey) && !event.shiftKey;
+  if (!wantsSubmit) return;
+  event.preventDefault();
+  if (agentLoading.value) return;
+  void sendAgentPrompt();
+}
+
+async function clearChatHistory(): Promise<void> {
+  if (agentLoading.value) return;
+  if (agentTurnHistory.value.length === 0 && !currentTurnPrompt.value && !agentResponse.value) {
+    return;
+  }
+  const ok = await confirmDanger({
+    title: "清空当前对话？",
+    content: "本会话的所有问答和工具调用记录都会被清除。",
+    positiveText: "清空",
+  });
+  if (!ok) return;
+  agentTurnHistory.value = [];
+  currentTurnPrompt.value = "";
+  expandedToolCards.value = {};
+  clearAgentOutput();
+  notice.value = "已清空对话历史";
+}
+
+function regenerateTurn(turn: AgentTurn): void {
+  if (agentLoading.value) return;
+  agentPrompt.value = turn.user;
+  globalThis.requestAnimationFrame?.(() => {
+    sendAgentPrompt();
+  });
+}
 
 // Cmd/Ctrl+K command palette (PR6.2). The palette itself is dumb — it
 // just renders the list and bubbles the chosen command back up. The
@@ -1460,6 +1641,29 @@ async function sendAgentPrompt(): Promise<void> {
   const message = agentPrompt.value.trim();
   if (!message || agentLoading.value) return;
 
+  // Chat-app convention: captured user text moves to the active turn,
+  // and any previously completed turn slides into the scrollback. This
+  // lets the chat shell re-render the conversation as a real history
+  // instead of overwriting in place.
+  if (
+    currentTurnPrompt.value &&
+    (agentResponse.value || agentProcessItems.value.length > 0 || agentError.value)
+  ) {
+    agentTurnHistory.value.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      user: currentTurnPrompt.value,
+      response: agentResponse.value,
+      process: [...agentProcessItems.value],
+      completedAt: agentLastCompletedAt.value,
+      failed: agentError.value || undefined,
+    });
+  }
+
+  currentTurnPrompt.value = message;
+  // Pre-clear the composer so the in-flight bubble owns the prompt
+  // text. Restoring on error keeps work recoverable.
+  agentPrompt.value = "";
+
   const controller = new AbortController();
   agentAbort.value = controller;
   agentLoading.value = true;
@@ -1512,6 +1716,12 @@ async function sendAgentPrompt(): Promise<void> {
     if (!aborted) {
       agentError.value = caught instanceof Error ? caught.message : "Agent 请求失败";
       appendAgentProcess("error", "Agent 请求失败", agentError.value);
+      // Make the failed prompt available again so the user can edit
+      // and retry without retyping. Cancel doesn't restore — the user
+      // chose to abandon.
+      if (!agentPrompt.value) {
+        agentPrompt.value = currentTurnPrompt.value;
+      }
     }
   } finally {
     agentLoading.value = false;
@@ -3067,527 +3277,446 @@ onMounted(async () => {
         </section>
 
         <section class="content-area" aria-label="线索和回复工作区">
+          <!--
+            ── Agent page (chat-style rewrite) ──────────
+            Three structural pieces:
+              1. agent-chat-head    sticky title bar + actions
+              2. agent-chat-body    sessions drawer + chat scroll area
+              3. agent-chat-composer  fixed bottom prompt input
+
+            Compared to the previous 3-column report-card layout, this
+            shell mirrors modern Agent UIs (Claude / ChatGPT / Cursor):
+            a continuous turn-by-turn scroll where each user prompt is
+            answered by an agent message that contains tool-call cards
+            inline plus a streaming markdown body. The bottom-anchored
+            composer keeps the input within thumb-reach on every device.
+          -->
           <section
             v-if="activePage === 'agent'"
             class="agent-panel agent-page-panel agent-console-layout agent-chat-shell agent-design-shell"
             aria-labelledby="agent-title"
           >
-            <header class="agent-head">
-              <div class="agent-title">
-                <span class="agent-icon">
-                  <Bot :size="21" aria-hidden="true" />
-                </span>
-                <div>
-                  <p class="panel-label">Pi / pi-mono</p>
-                  <h2 id="agent-title">渠道拓展 Agent</h2>
-                  <p>默认使用 overseas-distributor-prospecting skill，并通过后台工具写入线索库。</p>
+            <header class="agent-chat-head">
+              <button
+                class="agent-chat-drawer-toggle"
+                type="button"
+                aria-label="切换会话列表"
+                aria-controls="agent-sessions-drawer"
+                :aria-expanded="sessionDrawerOpen"
+                @click="toggleSessionDrawer"
+              >
+                <span class="agent-chat-drawer-toggle-bar" />
+                <span class="agent-chat-drawer-toggle-bar" />
+                <span class="agent-chat-drawer-toggle-bar" />
+              </button>
+
+              <div class="agent-chat-head-identity">
+                <div class="agent-chat-avatar agent-chat-avatar-lg">
+                  <Bot :size="20" aria-hidden="true" />
+                </div>
+                <div class="agent-chat-head-meta">
+                  <h2 id="agent-title">{{ activeAgentSession?.title || "渠道拓展 Agent" }}</h2>
+                  <p>
+                    <span class="agent-chat-meta-pill">
+                      <span class="agent-chat-meta-dot" />
+                      {{ agentLoading ? "正在生成" : (agentResponse || agentTurnHistory.length) ? "已就绪" : "等待输入" }}
+                    </span>
+                    <span class="agent-chat-meta-divider" aria-hidden="true">·</span>
+                    <span>overseas-distributor-prospecting</span>
+                    <span class="agent-chat-meta-divider" aria-hidden="true">·</span>
+                    <span>{{ shortAgentSessionId(agentSessionId) }}</span>
+                  </p>
                 </div>
               </div>
-              <span class="agent-session">
-                {{ activeAgentSession?.title || "当前会话" }} · {{ shortAgentSessionId(agentSessionId) }}
-              </span>
-            </header>
 
-            <section class="agent-session-manager agent-sidebar-panel" aria-label="会话管理">
-              <div class="session-manager-head">
-                <div>
-                  <p class="panel-label">会话管理</p>
-                  <strong>{{ agentSessions.length }} 个会话</strong>
-                </div>
-                <n-button class="ghost-button" secondary :disabled="agentLoading" @click="startNewAgentSession">
+              <div class="agent-chat-head-actions">
+                <n-button
+                  size="small"
+                  secondary
+                  :disabled="agentLoading || (!hasAnyConversation)"
+                  @click="clearChatHistory"
+                >
+                  <template #icon>
+                    <n-icon><Trash2 /></n-icon>
+                  </template>
+                  清空
+                </n-button>
+                <n-button
+                  size="small"
+                  type="primary"
+                  ghost
+                  @click="startNewAgentSession"
+                >
                   <template #icon>
                     <n-icon><Plus /></n-icon>
                   </template>
-                  新建会话
+                  新会话
                 </n-button>
               </div>
-              <n-input
-                v-model:value="agentSessionSearch"
-                class="agent-session-search"
-                placeholder="搜索会话..."
-                clearable
+            </header>
+
+            <div class="agent-chat-body">
+              <!-- Sessions drawer (collapsible on narrow viewports) -->
+              <aside
+                id="agent-sessions-drawer"
+                class="agent-chat-drawer agent-sidebar-panel"
+                :class="{ open: sessionDrawerOpen }"
+                aria-label="Agent 会话列表"
               >
-                <template #prefix>
-                  <n-icon><Search /></n-icon>
-                </template>
-              </n-input>
-
-              <div class="session-list" role="list">
-                <article
-                  v-for="session in filteredAgentSessions"
-                  :key="session.id"
-                  :class="['session-row', { active: session.id === agentSessionId }]"
-                  role="listitem"
-                >
-                  <form
-                    v-if="editingSessionId === session.id"
-                    class="session-rename"
-                    @submit.prevent="saveAgentSessionTitle(session.id)"
+                <header class="agent-chat-drawer-head">
+                  <strong>会话</strong>
+                  <button
+                    class="agent-chat-drawer-new"
+                    type="button"
+                    aria-label="新建会话"
+                    @click="startNewAgentSession"
                   >
-                    <n-input
-                      v-model="editingSessionTitle"
-                      aria-label="会话名称"
-                      maxlength="80"
-                    />
-                    <n-button class="icon-only-button" type="primary" circle attr-type="submit" aria-label="保存会话名称">
-                      <template #icon>
-                        <n-icon><Check /></n-icon>
-                      </template>
-                    </n-button>
-                    <n-button
-                      class="icon-only-button"
-                      circle
-                      aria-label="取消重命名"
-                      @click="cancelEditAgentSession"
-                    >
-                      <template #icon>
-                        <n-icon><X /></n-icon>
-                      </template>
-                    </n-button>
-                  </form>
+                    <Plus :size="14" aria-hidden="true" />
+                    新建
+                  </button>
+                </header>
 
-                  <template v-else>
-                    <button
-                      class="session-select-button"
-                      type="button"
-                      :disabled="agentLoading"
-                      @click="switchAgentSession(session.id)"
-                    >
-                      <strong>{{ session.title }}</strong>
-                      <small>
-                        {{ formatAgentSessionTime(session.updatedAt) }} ·
-                        {{ shortAgentSessionId(session.id) }}
-                      </small>
-                    </button>
-                    <div class="session-row-actions">
-                      <n-button
-                        class="icon-only-button"
-                        circle
-                        :disabled="agentLoading"
-                        :aria-label="`重命名 ${session.title}`"
-                        @click="beginEditAgentSession(session)"
-                      >
-                        <template #icon>
-                          <n-icon><Pencil /></n-icon>
-                        </template>
-                      </n-button>
-                      <n-button
-                        class="icon-only-button danger-action"
-                        circle
-                        :disabled="agentLoading"
-                        :aria-label="`删除 ${session.title}`"
-                        @click="removeAgentSession(session.id)"
-                      >
-                        <template #icon>
-                          <n-icon><Trash2 /></n-icon>
-                        </template>
-                      </n-button>
-                    </div>
-                  </template>
-                </article>
-                <div v-if="filteredAgentSessions.length === 0" class="session-empty-state">
-                  没有匹配的会话
-                </div>
-              </div>
-              <div class="session-manager-foot">
-                共 {{ filteredAgentSessions.length }} / {{ agentSessions.length }} 个会话
-              </div>
-            </section>
-
-            <section class="agent-main-panel agent-conversation-panel" aria-label="Agent 任务和输出">
-              <div class="agent-composer-card agent-compose-surface">
-                <div class="agent-composer-heading">
-                  <strong>向 Agent 发起任务</strong>
-                  <span :class="['char-counter', { 'char-counter-over': agentPrompt.length > AGENT_PROMPT_MAX }]">
-                    {{ agentPrompt.length }} / {{ AGENT_PROMPT_MAX }}
-                  </span>
-                </div>
-                <label class="field agent-field">
-                  <span>任务指令</span>
-                  <n-input
-                    v-model:value="agentPrompt"
-                    type="textarea"
-                    :maxlength="AGENT_PROMPT_MAX"
-                    show-count
-                    :autosize="{ minRows: 5, maxRows: 10 }"
+                <div class="agent-chat-drawer-search agent-session-search">
+                  <Search :size="14" aria-hidden="true" />
+                  <input
+                    v-model="agentSessionSearch"
+                    type="text"
+                    placeholder="搜索会话..."
+                    aria-label="搜索会话"
                   />
-                </label>
-
-                <div class="agent-actions">
-                  <span class="agent-skill-pill">overseas-distributor-prospecting</span>
-                  <div class="agent-action-buttons">
-                    <n-button
-                      class="icon-only-button agent-tune-button"
-                      circle
-                      secondary
-                      aria-label="高级设置"
-                      :aria-expanded="agentSettingsOpen"
-                      @click="toggleAgentSettings"
-                    >
-                      <template #icon>
-                        <n-icon><SlidersHorizontal /></n-icon>
-                      </template>
-                    </n-button>
-                    <n-button
-                      class="ghost-button"
-                      secondary
-                      :disabled="agentLoading"
-                      @click="startNewAgentSession"
-                    >
-                      <template #icon>
-                        <n-icon><RefreshCw /></n-icon>
-                      </template>
-                      新建会话
-                    </n-button>
-                    <n-button
-                      v-if="agentLoading"
-                      class="ghost-button agent-cancel-button"
-                      secondary
-                      type="error"
-                      aria-label="中断当前 Agent 任务"
-                      @click="cancelAgentPrompt"
-                    >
-                      <template #icon>
-                        <n-icon><X /></n-icon>
-                      </template>
-                      停止
-                    </n-button>
-                    <n-button
-                      class="primary-button"
-                      type="primary"
-                      size="large"
-                      :loading="agentLoading"
-                      :disabled="agentLoading || !agentPrompt.trim()"
-                      @click="sendAgentPrompt"
-                    >
-                      <template #icon>
-                        <n-icon><Send /></n-icon>
-                      </template>
-                      {{ agentLoading ? "处理中..." : "发送任务" }}
-                    </n-button>
-                  </div>
                 </div>
 
-                <section
-                  v-if="agentSettingsOpen"
-                  class="agent-settings-panel"
-                  aria-label="Agent 高级设置"
-                >
-                  <div>
-                    <span>Provider</span>
-                    <strong>{{ agentProviderName }}</strong>
-                  </div>
-                  <div>
-                    <span>Model</span>
-                    <strong>{{ agentModelName }}</strong>
-                  </div>
-                  <div>
-                    <span>Session</span>
-                    <strong>{{ shortAgentSessionId(agentSessionId) }}</strong>
-                  </div>
-                  <n-button class="ghost-button" secondary @click="agentConfigExpanded = true">
-                    打开配置管理
-                  </n-button>
-                  <n-button class="ghost-button" secondary @click="copyAgentSessionId">
-                    复制会话 ID
-                  </n-button>
-                </section>
-              </div>
-
-              <div
-                v-if="agentResponse || agentError"
-                :class="[
-                  'agent-output',
-                  'agent-report-card',
-                  { 'agent-report-fullscreen': agentReportFullscreen },
-                ]"
-                aria-live="polite"
-              >
-                <div class="agent-report-head">
-                  <div>
-                    <strong>Agent 输出</strong>
-                    <n-tag
-                      :type="agentError ? 'error' : agentLoading ? 'info' : 'success'"
-                      size="small"
-                      round
-                      :bordered="false"
-                    >
-                      {{ agentError ? "失败" : agentLoading ? "生成中" : "已完成" }}
-                    </n-tag>
-                  </div>
-                  <span v-if="agentCompletedAtLabel">
-                    <CheckCircle2 :size="15" aria-hidden="true" />
-                    {{ agentCompletedAtLabel }}
-                  </span>
-                  <div class="report-actions">
-                    <button
-                      type="button"
-                      aria-label="复制"
-                      :disabled="!agentOutputText"
-                      @click="copyAgentOutput"
-                    >
-                      <Check :size="15" aria-hidden="true" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="导出"
-                      :disabled="!agentOutputText"
-                      @click="downloadAgentOutput"
-                    >
-                      <ExternalLink :size="15" aria-hidden="true" />
-                    </button>
-                    <button
-                      type="button"
-                      :aria-label="agentReportFullscreen ? '退出全屏' : '全屏'"
-                      :disabled="!agentOutputText"
-                      @click="toggleAgentReportFullscreen"
-                    >
-                      <Maximize2 :size="15" aria-hidden="true" />
-                    </button>
-                  </div>
-                </div>
-                <p v-if="agentError" class="error">{{ agentError }}</p>
-                <MarkdownRenderer
-                  v-if="agentResponse"
-                  class="agent-message"
-                  :blocks="agentMarkdownBlocks"
-                />
-              </div>
-              <div v-else class="agent-empty-state agent-report-card" aria-live="polite">
-                <Bot :size="22" aria-hidden="true" />
-                <div>
-                  <strong>输入任务后，Agent 会在这里持续输出。</strong>
-                  <span>工具调用过程会固定显示在右侧执行轨道中，历史默认折叠。</span>
-                </div>
-              </div>
-            </section>
-
-            <aside class="agent-context-rail agent-side-panel" aria-label="Agent 上下文">
-              <section class="agent-config" aria-label="Agent 配置">
-                <div class="agent-config-header">
-                  <strong>Agent 配置</strong>
-                  <span
-                    :class="[
-                      'status',
-                      agentConfig?.has_api_key ? 'status-qualified' : 'status-needs-review',
-                    ]"
+                <ul class="agent-chat-drawer-list" role="list">
+                  <li
+                    v-for="session in filteredAgentSessions"
+                    :key="session.id"
+                    :class="['agent-chat-drawer-item', { active: session.id === agentSessionId }]"
+                    role="listitem"
                   >
-                    <i></i>
-                    {{ agentConfig?.has_api_key ? "已连接" : "未连接" }}
-                  </span>
-                </div>
-
-                <dl class="agent-config-summary">
-                  <div>
-                    <dt>Provider</dt>
-                    <dd>{{ agentProviderName }}</dd>
-                  </div>
-                  <div>
-                    <dt>Model</dt>
-                    <dd>{{ agentModelName }}</dd>
-                  </div>
-                  <div>
-                    <dt>API 状态</dt>
-                    <dd>{{ agentConfig?.has_api_key ? "200 OK" : "未配置" }}</dd>
-                  </div>
-                  <div>
-                    <dt>API Key</dt>
-                    <dd>{{ agentConfig?.api_key_preview || "未配置" }}</dd>
-                  </div>
-                </dl>
-
-                <n-button
-                  class="ghost-button agent-config-manage-button"
-                  secondary
-                  :aria-expanded="agentConfigExpanded"
-                  @click="agentConfigExpanded = !agentConfigExpanded"
-                >
-                  <template #icon>
-                    <n-icon><SlidersHorizontal /></n-icon>
-                  </template>
-                  配置管理
-                </n-button>
-
-                <div v-if="agentConfigExpanded" class="agent-config-grid">
-                  <label class="field">
-                    <span>Provider</span>
-                    <n-select v-model:value="agentProviderName" :options="providerOptions" />
-                  </label>
-                  <label class="field">
-                    <span>API Key</span>
-                    <n-input
-                      v-model:value="agentApiKeyInput"
-                      autocomplete="off"
-                      placeholder="sk-..."
-                      type="password"
-                      show-password-on="click"
-                    />
-                  </label>
-                  <label class="field">
-                    <span>模型</span>
-                    <n-input v-model:value="agentModelName" />
-                  </label>
-                  <label class="field">
-                    <span>API Base URL</span>
-                    <n-input v-model:value="agentApiBaseUrl" placeholder="留空使用默认" />
-                  </label>
-                  <label class="field">
-                    <span>Backend URL</span>
-                    <n-input v-model:value="agentBackendBaseUrl" />
-                  </label>
-                  <div class="agent-config-actions">
-                    <n-button
-                      class="ghost-button"
-                      secondary
-                      :loading="agentConfigSaving"
-                      :disabled="agentConfigLoading || agentConfigSaving || agentConfigTesting"
-                      @click="saveAgentConfig"
+                    <form
+                      v-if="editingSessionId === session.id"
+                      class="agent-chat-drawer-rename"
+                      @submit.prevent="commitAgentSessionRename"
                     >
-                      <template #icon>
-                        <n-icon><Save /></n-icon>
-                      </template>
-                      {{ agentConfigSaving ? "保存中..." : "保存配置" }}
-                    </n-button>
-                    <n-button
-                      class="ghost-button"
-                      secondary
-                      :loading="agentConfigTesting"
-                      :disabled="agentConfigLoading || agentConfigSaving || agentConfigTesting"
-                      @click="testAgentConnection"
+                      <input
+                        v-model="editingSessionTitle"
+                        autofocus
+                        @keydown.escape="cancelAgentSessionRename"
+                        @blur="commitAgentSessionRename"
+                      />
+                    </form>
+                    <button
+                      v-else
+                      type="button"
+                      class="agent-chat-drawer-item-button"
+                      @click="switchAgentSession(session.id)"
+                      @dblclick="beginAgentSessionRename(session)"
                     >
-                      <template #icon>
-                        <n-icon><Zap /></n-icon>
-                      </template>
-                      {{ agentConfigTesting ? "测试中..." : "测试连接" }}
-                    </n-button>
-                  </div>
-                  <div v-if="agentTestResult" :class="['agent-test-result', agentTestResult.ok ? 'success' : 'error']">
-                    <span class="agent-test-status">{{ agentTestResult.ok ? '✅' : '❌' }}</span>
-                    <span class="agent-test-message">{{ agentTestResult.message }}</span>
-                    <span v-if="agentTestResult.latency_ms > 0" class="agent-test-latency">{{ agentTestResult.latency_ms }}ms</span>
-                    <p v-if="agentTestResult.error" class="agent-test-error">{{ agentTestResult.error }}</p>
-                  </div>
-                </div>
+                      <span class="agent-chat-drawer-item-title">{{ session.title || "未命名会话" }}</span>
+                      <span class="agent-chat-drawer-item-time">{{ formatAgentSessionTime(session.updatedAt) }}</span>
+                    </button>
+                    <button
+                      v-if="editingSessionId !== session.id"
+                      type="button"
+                      class="agent-chat-drawer-item-delete"
+                      aria-label="删除会话"
+                      @click="removeAgentSession(session.id)"
+                    >
+                      <Trash2 :size="13" aria-hidden="true" />
+                    </button>
+                  </li>
+                  <li v-if="filteredAgentSessions.length === 0" class="agent-chat-drawer-empty">
+                    没有匹配的会话
+                  </li>
+                </ul>
+              </aside>
 
-                <p v-if="agentConfigNotice" class="notice">{{ agentConfigNotice }}</p>
-                <p v-if="agentConfigError" class="error">{{ agentConfigError }}</p>
-              </section>
-
-              <section class="agent-capability-card" aria-label="当前技能">
-                <div>
-                  <p class="panel-label">当前技能</p>
-                  <n-tag type="success" round :bordered="false">
-                    overseas-distributor-prospecting
-                  </n-tag>
-                  <small>海外经销商线索挖掘与分析</small>
-                </div>
-                <a
-                  href="#agent-title"
-                  :aria-expanded="agentSkillDetailsOpen"
-                  @click.prevent="toggleAgentSkillDetails"
-                >
-                  详情
-                </a>
-              </section>
-
-              <section
-                v-if="agentSkillDetailsOpen"
-                class="agent-skill-detail-panel"
-                aria-label="技能详情"
-              >
-                <div>
-                  <span>适用产品</span>
-                  <strong>SkyWalker TKA / 骨科手术机器人 / 医疗器械渠道</strong>
-                </div>
-                <div>
-                  <span>默认流程</span>
-                  <strong>产品画像、国家市场搜索、线索评分、公开证据汇总</strong>
-                </div>
-                <div>
-                  <span>输出格式</span>
-                  <strong>Markdown 报告 + 可入库线索</strong>
-                </div>
-              </section>
-
-              <section class="agent-execution-rail" aria-label="Agent 实时过程">
-                <div class="execution-rail-head">
-                  <div>
-                    <p class="panel-label">执行过程</p>
-                    <strong>{{ currentAgentProcessItem ? "正在执行" : "等待任务" }}</strong>
-                  </div>
-                  <span>{{ agentHistoryCount }} 历史</span>
-                </div>
-
-                <div v-if="currentAgentProcessItem" class="agent-process">
-                  <div
-                    :class="[
-                      'agent-process-item',
-                      'agent-process-current',
-                      `process-${currentAgentProcessItem.kind}`,
-                    ]"
-                  >
-                    <span aria-hidden="true"></span>
-                    <div>
-                      <strong>{{ currentAgentProcessItem.label }}</strong>
-                      <small v-if="currentAgentProcessItem.detail">{{ currentAgentProcessItem.detail }}</small>
+              <!-- Chat scroll stage -->
+              <main class="agent-chat-stage agent-conversation-panel agent-main-panel">
+                <div ref="agentChatScrollEl" class="agent-chat-scroll">
+                  <!-- Welcome / starter prompts when empty -->
+                  <section v-if="!hasAnyConversation" class="agent-welcome">
+                    <div class="agent-welcome-glow agent-welcome-glow-a" aria-hidden="true" />
+                    <div class="agent-welcome-glow agent-welcome-glow-b" aria-hidden="true" />
+                    <div class="agent-welcome-mark">
+                      <Bot :size="32" aria-hidden="true" />
                     </div>
-                  </div>
-                </div>
-                <div v-else class="agent-process-idle">
-                  <span aria-hidden="true"></span>
-                  <div>
-                    <strong>暂无运行中的工具</strong>
-                    <small>发送任务后，这里只展示最新一步。</small>
-                  </div>
-                </div>
+                    <h1>你好，我是 <span class="agent-welcome-accent">Pi</span></h1>
+                    <p>
+                      骨科海外渠道拓展 Agent — 告诉我你想找什么样的代理商，我会上网搜证据、把符合条件的线索写入数据库，并在你确认后起草触达邮件。
+                    </p>
+                    <ul class="agent-starter-grid" role="list">
+                      <li v-for="starter in starterPrompts" :key="starter.title">
+                        <button
+                          type="button"
+                          class="agent-starter-card"
+                          :disabled="agentLoading"
+                          @click="applyStarterPrompt(starter)"
+                        >
+                          <span class="agent-starter-icon" aria-hidden="true">{{ starter.icon }}</span>
+                          <strong>{{ starter.title }}</strong>
+                          <span class="agent-starter-body">{{ starter.body }}</span>
+                          <span class="agent-starter-arrow" aria-hidden="true">↗</span>
+                        </button>
+                      </li>
+                    </ul>
+                  </section>
 
-                <details v-if="agentHistoryCount > 0" class="agent-history">
-                  <summary>
-                    <span>历史记录</span>
-                    <small>{{ agentHistoryCount }} 条</small>
-                  </summary>
-                  <div v-if="historicalAgentStatusItems.length > 0" class="agent-history-process">
-                    <div
-                      v-for="item in historicalAgentStatusItems"
-                      :key="item.id"
-                      :class="['agent-process-item', `process-${item.kind}`]"
-                    >
-                      <span aria-hidden="true"></span>
-                      <div>
-                        <strong>{{ item.label }}</strong>
-                        <small v-if="item.detail">{{ item.detail }}</small>
+                  <!-- Completed turn history -->
+                  <article
+                    v-for="turn in agentTurnHistory"
+                    :key="turn.id"
+                    class="agent-chat-turn"
+                  >
+                    <div class="agent-msg agent-msg-user">
+                      <div class="agent-msg-bubble">{{ turn.user }}</div>
+                    </div>
+                    <div class="agent-msg agent-msg-agent">
+                      <div class="agent-msg-avatar" aria-hidden="true">
+                        <Bot :size="14" />
+                      </div>
+                      <div class="agent-msg-body">
+                        <div
+                          v-for="(item, idx) in turn.process"
+                          :key="idx"
+                          :class="['agent-tool-card', `is-${item.kind}`]"
+                        >
+                          <button
+                            type="button"
+                            class="agent-tool-card-head"
+                            :aria-expanded="isToolCardExpanded(turn.id, idx)"
+                            @click="toggleToolCard(turn.id, idx)"
+                          >
+                            <span class="agent-tool-card-status">
+                              <CheckCircle2 v-if="item.kind === 'done'" :size="14" aria-hidden="true" />
+                              <AlertTriangle v-else-if="item.kind === 'error'" :size="14" aria-hidden="true" />
+                              <RefreshCw v-else :size="14" aria-hidden="true" class="spin" />
+                            </span>
+                            <span class="agent-tool-card-title">{{ item.label }}</span>
+                            <span class="agent-tool-card-detail">{{ item.detail }}</span>
+                            <ChevronDown
+                              :size="14"
+                              aria-hidden="true"
+                              class="agent-tool-card-chevron"
+                              :class="{ rotate: isToolCardExpanded(turn.id, idx) }"
+                            />
+                          </button>
+                          <div
+                            v-if="isToolCardExpanded(turn.id, idx) && item.detail"
+                            class="agent-tool-card-body"
+                          >{{ item.detail }}</div>
+                        </div>
+
+                        <div v-if="turn.failed" class="agent-msg-error" role="alert">
+                          <AlertTriangle :size="14" aria-hidden="true" />
+                          {{ turn.failed }}
+                        </div>
+                        <div v-else-if="turn.response" class="agent-msg-md">
+                          <MarkdownRenderer :blocks="parseMarkdown(turn.response)" />
+                        </div>
+
+                        <div class="agent-msg-actions">
+                          <button
+                            v-if="turn.response"
+                            type="button"
+                            class="agent-msg-action"
+                            @click="copyTurnResponse(turn)"
+                          >
+                            <Copy :size="12" aria-hidden="true" />
+                            复制
+                          </button>
+                          <button
+                            type="button"
+                            class="agent-msg-action"
+                            :disabled="agentLoading"
+                            @click="regenerateTurn(turn)"
+                          >
+                            <RefreshCw :size="12" aria-hidden="true" />
+                            重试
+                          </button>
+                          <span v-if="turn.completedAt" class="agent-msg-time">
+                            {{ formatTime(turn.completedAt.toISOString()) }}
+                          </span>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <div v-if="agentEvents.length > 0" class="agent-events" aria-label="Agent 工具事件历史">
-                    <span v-for="(event, index) in agentEvents" :key="index">
-                      {{ formatAgentEvent(event) }}
+                  </article>
+
+                  <!-- Active in-flight turn -->
+                  <article
+                    v-if="currentTurnPrompt"
+                    class="agent-chat-turn agent-chat-turn-active"
+                  >
+                    <div class="agent-msg agent-msg-user">
+                      <div class="agent-msg-bubble">{{ currentTurnPrompt }}</div>
+                    </div>
+                    <div class="agent-msg agent-msg-agent">
+                      <div
+                        class="agent-msg-avatar"
+                        :class="{ 'is-thinking': agentLoading }"
+                        aria-hidden="true"
+                      >
+                        <Bot :size="14" />
+                      </div>
+                      <div class="agent-msg-body">
+                        <div
+                          v-for="(item, idx) in agentProcessItems"
+                          :key="`active-${idx}`"
+                          :class="['agent-tool-card', `is-${item.kind}`]"
+                        >
+                          <button
+                            type="button"
+                            class="agent-tool-card-head"
+                            :aria-expanded="isToolCardExpanded('active', idx)"
+                            @click="toggleToolCard('active', idx)"
+                          >
+                            <span class="agent-tool-card-status">
+                              <CheckCircle2 v-if="item.kind === 'done'" :size="14" aria-hidden="true" />
+                              <AlertTriangle v-else-if="item.kind === 'error'" :size="14" aria-hidden="true" />
+                              <RefreshCw v-else :size="14" aria-hidden="true" class="spin" />
+                            </span>
+                            <span class="agent-tool-card-title">{{ item.label }}</span>
+                            <span class="agent-tool-card-detail">{{ item.detail }}</span>
+                            <ChevronDown
+                              :size="14"
+                              aria-hidden="true"
+                              class="agent-tool-card-chevron"
+                              :class="{ rotate: isToolCardExpanded('active', idx) }"
+                            />
+                          </button>
+                          <div
+                            v-if="isToolCardExpanded('active', idx) && item.detail"
+                            class="agent-tool-card-body"
+                          >{{ item.detail }}</div>
+                        </div>
+
+                        <div
+                          v-if="agentLoading && !agentResponse && agentProcessItems.length === 0"
+                          class="agent-msg-thinking"
+                          aria-live="polite"
+                        >
+                          <span class="agent-thinking-dot" />
+                          <span class="agent-thinking-dot" />
+                          <span class="agent-thinking-dot" />
+                          <span class="agent-thinking-text">Pi 正在思考...</span>
+                        </div>
+
+                        <div v-if="agentResponse" class="agent-msg-md">
+                          <MarkdownRenderer :blocks="agentMarkdownBlocks" />
+                          <span v-if="agentLoading" class="agent-streaming-cursor" aria-hidden="true">▌</span>
+                        </div>
+
+                        <div v-if="agentError" class="agent-msg-error" role="alert">
+                          <AlertTriangle :size="14" aria-hidden="true" />
+                          {{ agentError }}
+                        </div>
+
+                        <div v-if="!agentLoading && (agentResponse || agentError)" class="agent-msg-actions">
+                          <button
+                            v-if="agentResponse"
+                            type="button"
+                            class="agent-msg-action"
+                            @click="copyTextToClipboard(agentResponse, '已复制 Agent 输出')"
+                          >
+                            <Copy :size="12" aria-hidden="true" />
+                            复制
+                          </button>
+                          <button
+                            type="button"
+                            class="agent-msg-action"
+                            :disabled="agentLoading"
+                            @click="agentPrompt = currentTurnPrompt; sendAgentPrompt()"
+                          >
+                            <RefreshCw :size="12" aria-hidden="true" />
+                            重试
+                          </button>
+                          <button
+                            v-if="agentResponse"
+                            type="button"
+                            class="agent-msg-action"
+                            @click="agentReportFullscreen = true"
+                          >
+                            <Maximize2 :size="12" aria-hidden="true" />
+                            全屏
+                          </button>
+                          <span v-if="agentCompletedAtLabel" class="agent-msg-time">
+                            {{ agentCompletedAtLabel }}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </article>
+                </div>
+
+                <!-- Sticky composer at bottom -->
+                <footer class="agent-chat-composer agent-compose-surface" aria-label="发送任务">
+                  <div class="agent-chat-composer-meta">
+                    <button
+                      type="button"
+                      class="agent-chat-composer-skill agent-skill-pill"
+                      :aria-expanded="agentSkillDetailsOpen"
+                      @click="toggleAgentSkillDetails"
+                    >
+                      <Zap :size="13" aria-hidden="true" />
+                      overseas-distributor-prospecting
+                      <ChevronDown :size="12" aria-hidden="true" />
+                    </button>
+                    <span
+                      class="agent-chat-composer-counter"
+                      :class="{ 'is-over': agentPrompt.length > AGENT_PROMPT_MAX }"
+                    >
+                      {{ agentPrompt.length }} / {{ AGENT_PROMPT_MAX }}
                     </span>
                   </div>
-                </details>
-              </section>
-              <n-button
-                class="agent-log-button"
-                secondary
-                block
-                :aria-expanded="agentLogsOpen"
-                @click="toggleAgentLogs"
-              >
-                <template #icon>
-                  <n-icon><Clock3 /></n-icon>
-                </template>
-                查看完整执行日志
-              </n-button>
-              <section v-if="agentLogsOpen" class="agent-log-panel" aria-label="完整执行日志">
-                <article v-for="row in agentLogRows" :key="row.id" class="agent-log-row">
-                  <span>{{ row.title }}</span>
-                  <small>{{ row.detail }}</small>
-                </article>
-                <div v-if="agentLogRows.length === 0" class="agent-log-empty">
-                  暂无执行日志
-                </div>
-              </section>
-            </aside>
+                  <div class="agent-chat-composer-row">
+                    <textarea
+                      v-model="agentPrompt"
+                      :maxlength="AGENT_PROMPT_MAX"
+                      class="agent-chat-composer-input"
+                      placeholder="向 Pi 描述你的渠道拓展需求…例如：找印度的 TKA 分销商"
+                      aria-label="Agent 提示输入"
+                      @keydown="onComposerKeydown"
+                    />
+                    <div class="agent-chat-composer-actions">
+                      <button
+                        v-if="agentLoading"
+                        type="button"
+                        class="agent-chat-composer-stop"
+                        aria-label="停止生成 (Esc)"
+                        @click="cancelAgentPrompt"
+                      >
+                        <X :size="14" aria-hidden="true" />
+                        停止
+                      </button>
+                      <button
+                        v-else
+                        type="button"
+                        class="agent-chat-composer-send"
+                        :disabled="!agentPrompt.trim()"
+                        aria-label="发送 (Cmd+Enter)"
+                        @click="sendAgentPrompt"
+                      >
+                        <Send :size="14" aria-hidden="true" />
+                      </button>
+                    </div>
+                  </div>
+                  <div class="agent-chat-composer-foot">
+                    <span class="agent-chat-composer-shortcut">
+                      <kbd>⌘</kbd><kbd>↵</kbd> 发送 ·
+                      <kbd>Shift</kbd><kbd>↵</kbd> 换行
+                    </span>
+                    <button
+                      type="button"
+                      class="agent-chat-composer-settings agent-config-manage-button"
+                      @click="toggleAgentSettings"
+                    >
+                      <SlidersHorizontal :size="13" aria-hidden="true" />
+                      模型设置
+                    </button>
+                  </div>
+                </footer>
+              </main>
+            </div>
           </section>
 
         <section
