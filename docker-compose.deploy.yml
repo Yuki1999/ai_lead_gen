@@ -1,0 +1,80 @@
+# 离线部署用 compose —— 引用预构建镜像（不在客户现场 build）。
+# 镜像由 scripts/make-offline-package.sh 构建并打包，现场 docker load 后用此文件启动。
+# IMAGE_TAG 由 .env 提供（安装脚本会从交付清单 MANIFEST 写入）。
+services:
+  backend:
+    image: "medbot-backend:${IMAGE_TAG:?请在 .env 设置 IMAGE_TAG（见交付清单 MANIFEST）}"
+    env_file:
+      - .env
+    environment:
+      MEDBOT_DB_PATH: /data/medbot.db
+      AGENT_BASE_URL: http://agent:8011
+      AGENT_ENV_PATH: /app/agent/.env
+      MEDBOT_SERVICE_TOKEN: "${MEDBOT_SERVICE_TOKEN:-}"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - medbot-data:/data
+      - ./agent/.env:/app/agent/.env
+    depends_on:
+      agent:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  agent:
+    image: "medbot-agent:${IMAGE_TAG:?请在 .env 设置 IMAGE_TAG}"
+    env_file:
+      - ./agent/.env
+    environment:
+      PROJECT_ROOT: /app
+      BACKEND_BASE_URL: http://backend:8000
+      BACKEND_SERVICE_TOKEN: "${MEDBOT_SERVICE_TOKEN:-}"
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: "8011"
+      AGENT_CORS_ORIGIN: "${PUBLIC_ORIGIN:-http://localhost:5173}"
+    volumes:
+      - ./agent/.env:/app/agent/.env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8011/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    image: "medbot-frontend:${IMAGE_TAG:?请在 .env 设置 IMAGE_TAG}"
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  medbot-data:
