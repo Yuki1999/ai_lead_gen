@@ -7,11 +7,14 @@ from pathlib import Path
 PROVIDER_API_KEY_ENV = {
     "openai": "OPENAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    # 阿里云百炼 / 通义千问 (DashScope OpenAI-compatible)
+    "bailian": "DASHSCOPE_API_KEY",
 }
 
 DEFAULT_MODEL_BY_PROVIDER = {
     "openai": "gpt-5-mini",
     "deepseek": "deepseek-v4-pro",
+    "bailian": "qwen3.7-max",
 }
 
 

@@ -9,6 +9,7 @@ services:
       MEDBOT_DB_PATH: /data/medbot.db
       AGENT_BASE_URL: http://agent:8011
       AGENT_ENV_PATH: /app/agent/.env
+      MEDBOT_SERVICE_TOKEN: "${MEDBOT_SERVICE_TOKEN:-}"
       PYTHONUNBUFFERED: "1"
     volumes:
       - medbot-data:/data
@@ -41,6 +42,7 @@ services:
     environment:
       PROJECT_ROOT: /app
       BACKEND_BASE_URL: http://backend:8000
+      BACKEND_SERVICE_TOKEN: "${MEDBOT_SERVICE_TOKEN:-}"
       AGENT_HOST: 0.0.0.0
       AGENT_PORT: "8011"
       AGENT_CORS_ORIGIN: "${PUBLIC_ORIGIN:-http://localhost:5173}"

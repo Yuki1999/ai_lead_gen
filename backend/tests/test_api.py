@@ -1,12 +1,25 @@
+from contextlib import contextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 
 
-def _client(tmp_path, monkeypatch):
+def _authenticate(client: TestClient, username: str = "admin", password: str = "admin123") -> None:
+    """Log in and attach the bearer token to the client for subsequent requests."""
+    resp = client.post("/auth/login", json={"username": username, "password": password})
+    assert resp.status_code == 200, resp.text
+    client.headers["Authorization"] = f"Bearer {resp.json()['token']}"
+
+
+@contextmanager
+def _client(tmp_path, monkeypatch, *, authenticate: bool = True):
     monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
     from app.main import create_app
 
-    return TestClient(create_app())
+    with TestClient(create_app()) as client:
+        if authenticate:
+            _authenticate(client)
+        yield client
 
 
 def test_health_check(tmp_path, monkeypatch):
@@ -80,6 +93,7 @@ def test_real_search_mode_uses_product_profile_and_web_search(tmp_path, monkeypa
     )
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.post(
             "/leads/search",
             json={
@@ -117,8 +131,9 @@ def test_demo_email_send_records_events(tmp_path, monkeypatch):
     assert sent.status_code == 201
     assert payload["sent_count"] == 1
     assert payload["events"][0]["lead_id"] == lead_id
-    assert "Middle East" in payload["events"][0]["subject"]
-    assert "introductory product brief" in payload["events"][0]["body"].lower()
+    # Approved template: subject carries the target market, body is brand-consistent.
+    assert "MEDBOT NaviBot Skywalker" in payload["events"][0]["subject"]
+    assert "reply to this email" in payload["events"][0]["body"].lower()
 
 
 def test_demo_email_send_requires_discovered_email(tmp_path, monkeypatch):
@@ -150,6 +165,7 @@ def test_demo_email_send_requires_discovered_email(tmp_path, monkeypatch):
     )
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         created = client.post(
             "/leads/search",
             json={
@@ -182,7 +198,7 @@ def test_reply_analysis_updates_lead_status(tmp_path, monkeypatch):
             "/replies/analyze",
             json={
                 "lead_id": lead_id,
-                "reply_text": "We are interested. Please send product details and certificates.",
+                "reply_text": "We are interested in the Skywalker system and would like to learn more. Who can we talk to?",
             },
         )
         listed = client.get("/leads")
@@ -265,6 +281,7 @@ def test_source_preview_endpoint_returns_page_text_and_email_match(tmp_path, mon
     )
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.get(
             "/sources/preview",
             params={"url": "https://source.example/contact", "email": "sales@source.example"},
@@ -297,6 +314,7 @@ def test_web_search_endpoint_returns_search_results(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "search_web", fake_search_web, raising=False)
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.post(
             "/web/search",
             json={"query": "orthopedic implant distributor India", "max_results": 2},
@@ -340,6 +358,7 @@ def test_web_fetch_endpoint_returns_page_preview(tmp_path, monkeypatch):
     )
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.post(
             "/web/fetch",
             json={"url": "https://ortho.example/contact", "email": "sales@ortho.example"},
@@ -366,6 +385,7 @@ def test_agent_chat_proxy_forwards_to_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "forward_agent_chat", fake_forward_agent_chat, raising=False)
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.post(
             "/agent/chat",
             json={"message": "Find India SkyWalker TKA distributors"},
@@ -395,6 +415,7 @@ def test_agent_chat_stream_proxy_forwards_sse(tmp_path, monkeypatch):
     )
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         with client.stream(
             "POST",
             "/agent/chat/stream",
@@ -420,6 +441,7 @@ def test_agent_chat_proxy_reports_sidecar_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "forward_agent_chat", fake_forward_agent_chat, raising=False)
 
     with TestClient(main_module.create_app()) as client:
+        _authenticate(client)
         response = client.post("/agent/chat", json={"message": "hello"})
 
     assert response.status_code == 503
@@ -720,3 +742,271 @@ def test_forward_agent_chat_stream_stops_cleanly_when_upstream_disconnects(monke
 
     assert chunks == [b"event: start\n\n"]
     assert fake_http.response.closed is True
+
+
+# ── Auth & RBAC ───────────────────────────────────────────────────────────────
+
+def test_protected_endpoint_requires_auth(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, authenticate=False) as client:
+        # No token → 401
+        assert client.get("/leads").status_code == 401
+        # Health stays public
+        assert client.get("/health").status_code == 200
+
+
+def test_login_rejects_bad_credentials(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, authenticate=False) as client:
+        resp = client.post("/auth/login", json={"username": "admin", "password": "wrong"})
+        assert resp.status_code == 401
+
+
+def test_seeded_admin_has_all_permissions(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        me = client.get("/auth/me").json()
+        assert me["username"] == "admin"
+        assert me["is_superadmin"] is True
+        perms = client.get("/admin/permissions").json()["permissions"]
+        assert set(me["permissions"]) == {p["key"] for p in perms}
+
+
+def test_custom_role_limits_permissions(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        # Admin creates a read-only role + a user with only that role.
+        role = client.post(
+            "/admin/roles",
+            json={"name": "仅查看线索", "description": "", "permissions": ["leads.view"]},
+        ).json()
+        assert role["permissions"] == ["leads.view"]
+
+        client.post(
+            "/admin/users",
+            json={
+                "username": "viewer1",
+                "password": "viewer123",
+                "display_name": "Viewer",
+                "role_ids": [role["id"]],
+            },
+        )
+
+        # Log in as the limited user on a fresh client (no inherited admin header).
+        from fastapi.testclient import TestClient
+        from app.main import create_app
+
+        with TestClient(create_app()) as c2:
+            _authenticate(c2, "viewer1", "viewer123")
+            assert c2.get("/leads").status_code == 200  # has leads.view
+            # Lacks leads.search / outreach / users.manage → 403
+            assert c2.post("/leads/search", json={"target_regions": ["Europe"], "real_search": False}).status_code == 403
+            assert c2.get("/admin/users").status_code == 403
+
+
+def test_non_admin_cannot_manage_users(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post(
+            "/admin/roles", json={"name": "操作", "permissions": ["leads.view", "leads.search"]}
+        ).json()
+        client.post(
+            "/admin/users",
+            json={"username": "op1", "password": "oppass1", "role_ids": [role["id"]]},
+        )
+
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    with TestClient(create_app()) as c2:
+        _authenticate(c2, "op1", "oppass1")
+        assert c2.post("/admin/roles", json={"name": "x", "permissions": []}).status_code == 403
+
+
+def test_cannot_delete_last_superadmin(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        me = client.get("/auth/me").json()
+        # Deleting self is blocked, and it's the only superadmin anyway.
+        resp = client.request("DELETE", f"/admin/users/{me['id']}")
+        assert resp.status_code == 400
+
+
+# ── Compliance: unsubscribe, suppression, audit ───────────────────────────────
+
+def test_unsubscribe_link_suppresses_recipient(tmp_path, monkeypatch):
+    from app.email_service import make_unsubscribe_token
+
+    with _client(tmp_path, monkeypatch) as client:
+        token = make_unsubscribe_token("doc@hospital.example")
+        # Public endpoint, no auth needed
+        page = client.get("/unsubscribe", params={"token": token})
+        assert page.status_code == 200
+        assert "退订" in page.text or "unsubscribed" in page.text.lower()
+
+        supp = client.get("/admin/suppressions").json()
+        emails = [s["email"] for s in supp["suppressions"]]
+        assert "doc@hospital.example" in emails
+
+        # Tampered token is rejected
+        bad = client.get("/unsubscribe", params={"token": "garbage.deadbeef"})
+        assert bad.status_code == 200
+        assert "无效" in bad.text or "Invalid" in bad.text
+
+
+def test_suppressed_address_is_not_emailed(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/search",
+            json={"target_regions": ["Europe"], "product_keywords": ["surgical robot"],
+                  "max_results": 1, "real_search": False},
+        )
+        lead = created.json()["leads"][0]
+        # Suppress this lead's email
+        client.post("/admin/suppressions", json={"email": lead["email"], "reason": "manual"})
+
+        sent = client.post("/campaigns/send-demo", json={"lead_ids": [lead["id"]]})
+        assert sent.status_code == 201
+        # The outreach event is recorded as suppressed, not sent/recorded
+        assert sent.json()["events"][0]["status"] == "suppressed"
+
+
+def test_manual_suppression_add_and_remove(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post("/admin/suppressions", json={"email": "x@y.com", "reason": "bounce"})
+        assert any(s["email"] == "x@y.com" for s in client.get("/admin/suppressions").json()["suppressions"])
+        client.request("DELETE", "/admin/suppressions", params={"email": "x@y.com"})
+        assert not any(s["email"] == "x@y.com" for s in client.get("/admin/suppressions").json()["suppressions"])
+
+
+def test_audit_log_records_login_and_actions(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        # The fixture already logged in → a login event should exist
+        client.post("/admin/suppressions", json={"email": "z@z.com"})
+        audit = client.get("/admin/audit").json()["events"]
+        actions = {e["action"] for e in audit}
+        assert "login" in actions
+        assert "suppression.add" in actions
+        # actor is recorded
+        assert all(e["actor"] for e in audit)
+
+
+def test_audit_requires_admin(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post("/admin/roles", json={"name": "noaudit", "permissions": ["leads.view"]}).json()
+        client.post("/admin/users", json={"username": "nau", "password": "nau123x", "role_ids": [role["id"]]})
+
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+    with TestClient(create_app()) as c2:
+        _authenticate(c2, "nau", "nau123x")
+        assert c2.get("/admin/audit").status_code == 403
+        assert c2.get("/admin/suppressions").status_code == 403
+
+
+# ── #3 Auth hardening ─────────────────────────────────────────────────────────
+
+def test_login_rate_limited_after_failures(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch, authenticate=False) as client:
+        for _ in range(5):
+            r = client.post("/auth/login", json={"username": "ratelimitee", "password": "bad"})
+            assert r.status_code == 401
+        # 6th attempt is locked out
+        r = client.post("/auth/login", json={"username": "ratelimitee", "password": "bad"})
+        assert r.status_code == 429
+        assert "Retry-After" in r.headers
+
+
+def test_default_admin_must_change_password_then_cleared(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        me = client.get("/auth/me").json()
+        assert me["must_change_password"] is True
+        client.post("/auth/change-password", json={"old_password": "admin123", "new_password": "newpass123"})
+        assert client.get("/auth/me").json()["must_change_password"] is False
+
+
+def test_admin_reset_forces_user_change(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post("/admin/roles", json={"name": "r1", "permissions": ["leads.view"]}).json()
+        u = client.post("/admin/users", json={"username": "u1", "password": "init123", "role_ids": [role["id"]]}).json()
+        # New users must change on first login
+        assert u["must_change_password"] is True
+
+
+def test_secret_settings_encrypted_at_rest(tmp_path, monkeypatch):
+    import sqlite3
+    with _client(tmp_path, monkeypatch) as client:
+        client.put("/settings", json={"agent_provider": "bailian", "agent_key": "sk-secret-123456"})
+        # Raw DB value is ciphertext, not the plaintext key
+        conn = sqlite3.connect(str(tmp_path / "medbot-demo.db"))
+        raw = conn.execute("SELECT value FROM settings WHERE key='agent_key'").fetchone()[0]
+        conn.close()
+        assert raw.startswith("enc:v1:")
+        assert "sk-secret-123456" not in raw
+    # And it decrypts back transparently
+    from app import db as dbmod
+    monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
+    assert dbmod.get_setting("agent_key") == "sk-secret-123456"
+
+
+# ── #2 Send queue, throttle, bounce ───────────────────────────────────────────
+
+def test_send_enqueues_and_dispatch_delivers(tmp_path, monkeypatch):
+    from app import main as m
+    from app.email_service import SendResult
+    sent: list[str] = []
+    monkeypatch.setattr(m, "email_is_configured", lambda: True)
+    monkeypatch.setattr(m, "send_email", lambda *, to, subject, body, **k: (sent.append(to), SendResult(sent_to=to, subject=subject, success=True, message_id="mid"))[1])
+
+    with _client(tmp_path, monkeypatch) as client:
+        lead = client.post("/leads", json={
+            "company_name": "Q Co", "region": "Europe", "country": "Germany",
+            "email": "buyer@qco.example", "category": "distributor",
+        }).json()
+        resp = client.post("/campaigns/send-demo", json={"lead_ids": [lead["id"]]})
+        # Email configured → queued, not sent inline
+        assert resp.json()["events"][0]["status"] == "queued"
+        assert resp.json()["queued_count"] == 1
+        assert client.get("/campaigns/queue").json()["queued"] == 1
+
+        # Drain one from the queue
+        assert m._dispatch_due_email() is True
+        assert sent == ["buyer@qco.example"]
+        q = client.get("/campaigns/queue").json()
+        assert q["queued"] == 0 and q["sent_today"] == 1
+
+
+def test_dispatch_skips_suppressed_in_queue(tmp_path, monkeypatch):
+    from app import main as m
+    from app.email_service import SendResult
+    monkeypatch.setattr(m, "email_is_configured", lambda: True)
+    monkeypatch.setattr(m, "send_email", lambda **k: SendResult(sent_to="x", subject="s", success=True))
+
+    with _client(tmp_path, monkeypatch) as client:
+        lead = client.post("/leads", json={
+            "company_name": "S Co", "region": "Europe", "country": "France",
+            "email": "no@sco.example", "category": "distributor",
+        }).json()
+        client.post("/campaigns/send-demo", json={"lead_ids": [lead["id"]]})  # queued
+        client.post("/admin/suppressions", json={"email": "no@sco.example"})  # then suppressed
+        m._dispatch_due_email()
+        # The queued item should be marked suppressed, not sent
+        assert client.get("/campaigns/queue").json()["queued"] == 0
+        hist = client.get(f"/leads/{lead['id']}/history").json()
+        assert hist["outreach_events"][0]["status"] == "suppressed"
+
+
+def test_bounce_message_suppresses_recipient(tmp_path, monkeypatch):
+    from app import main as m
+    from app.email_service import InboxReply
+    monkeypatch.setattr(m, "email_is_configured", lambda: True)
+
+    with _client(tmp_path, monkeypatch) as client:
+        lead = client.post("/leads", json={
+            "company_name": "B Co", "region": "Europe", "country": "Spain",
+            "email": "deadbox@bco.example", "category": "distributor",
+        }).json()
+        bounce = InboxReply(
+            sender_email="MAILER-DAEMON@exchange.local", sender_name="Mail Delivery System",
+            subject="Undeliverable: Distribution Partnership",
+            body="Your message to deadbox@bco.example could not be delivered. 550 5.1.1 user unknown.",
+            received_at="", message_id="bounce-1",
+        )
+        monkeypatch.setattr(m, "fetch_inbox_replies", lambda **k: [bounce])
+        result = client.post("/replies/sync").json()
+        assert result["bounced_suppressed"] == 1
+        assert any(s["email"] == "deadbox@bco.example" for s in client.get("/admin/suppressions").json()["suppressions"])

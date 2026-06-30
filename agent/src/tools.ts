@@ -34,6 +34,12 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
             category: Type.Optional(Type.String({ description: "Distributor category" })),
             match_reason: Type.Optional(Type.String({ description: "Why this lead matches" })),
             source: Type.Optional(Type.String({ description: "Source URL or note" })),
+            lead_type: Type.Optional(
+              Type.String({
+                description:
+                  "Recipient role: 'distributor' for medical-device distributors/channel partners, or 'kol' for surgeons/KOLs/hospital procurement. Selects which approved email template is used. Leave empty to auto-infer.",
+              }),
+            ),
           }),
           { description: "Array of leads to save" }
         ),

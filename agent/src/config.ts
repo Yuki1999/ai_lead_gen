@@ -7,6 +7,7 @@ export interface AgentConfig {
   host: string;
   port: number;
   backendBaseUrl: string;
+  backendServiceToken?: string;
   modelProvider: string;
   modelName: string;
   skillName: string;
@@ -35,10 +36,13 @@ const DEFAULT_SESSION_IDLE_MS = 30 * 60 * 1000;
 const DEFAULT_MODEL_BY_PROVIDER: Record<string, string> = {
   openai: "gpt-5-mini",
   deepseek: "deepseek-v4-pro",
+  bailian: "qwen3.7-max",
 };
 const PROVIDER_API_KEY_ENV: Record<string, string> = {
   openai: "OPENAI_API_KEY",
   deepseek: "DEEPSEEK_API_KEY",
+  // 阿里云百炼 / 通义千问 (DashScope)
+  bailian: "DASHSCOPE_API_KEY",
 };
 
 export function loadConfig(options: LoadConfigOptions = {}): AgentConfig {
@@ -59,6 +63,7 @@ export function loadConfig(options: LoadConfigOptions = {}): AgentConfig {
       /\/$/,
       "",
     ),
+    backendServiceToken: env.BACKEND_SERVICE_TOKEN || undefined,
     modelProvider,
     modelName: env.PI_MODEL || DEFAULT_MODEL_BY_PROVIDER[modelProvider] || "gpt-5-mini",
     skillName: DEFAULT_SKILL_NAME,

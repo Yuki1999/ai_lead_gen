@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import asdict
@@ -43,6 +44,7 @@ def init_db() -> None:
                 score INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 notes TEXT NOT NULL DEFAULT '',
+                lead_type TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -79,6 +81,55 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_superadmin INTEGER NOT NULL DEFAULT 0,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS roles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                permissions TEXT NOT NULL DEFAULT '[]',
+                is_system INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_roles (
+                user_id INTEGER NOT NULL,
+                role_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, role_id),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (role_id) REFERENCES roles(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS suppressions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                reason TEXT NOT NULL DEFAULT 'unsubscribe',
+                source TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
             """
         )
         # Migration: add message_id column if upgrading from older schema
@@ -100,6 +151,26 @@ def init_db() -> None:
             )
         except Exception:
             pass  # column already exists
+        try:
+            connection.execute(
+                "ALTER TABLE leads ADD COLUMN lead_type TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass  # column already exists
+        try:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass  # column already exists
+        try:
+            connection.execute(
+                "ALTER TABLE outreach_events ADD COLUMN sent_at TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass  # column already exists
+
+    seed_auth()
 
 
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
@@ -110,11 +181,11 @@ def insert_lead(lead: CandidateLead) -> dict[str, Any]:
             """
             INSERT INTO leads (
                 company_name, region, country, website, contact_name, email, category,
-                match_reason, source, score, status, notes, created_at, updated_at
+                match_reason, source, score, status, notes, lead_type, created_at, updated_at
             )
             VALUES (
                 :company_name, :region, :country, :website, :contact_name, :email, :category,
-                :match_reason, :source, :score, :status, :notes, :created_at, :updated_at
+                :match_reason, :source, :score, :status, :notes, :lead_type, :created_at, :updated_at
             )
             """,
             payload,
@@ -290,6 +361,74 @@ def list_reply_analyses(lead_id: int) -> list[dict[str, Any]]:
     return results
 
 
+def enqueue_outreach(lead_id: int, email: RenderedEmail, *, source: str = "manual") -> dict[str, Any]:
+    """Queue an email for throttled background delivery (status 'queued')."""
+    return insert_outreach_event(lead_id, email, status="queued", source=source)
+
+
+def list_queued_events(limit: int = 50) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM outreach_events WHERE status = 'queued' ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
+def count_queued() -> int:
+    with connect() as connection:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM outreach_events WHERE status = 'queued'"
+        ).fetchone()[0])
+
+
+def count_sent_since(iso_since: str, *, domain: str | None = None) -> int:
+    sql = "SELECT COUNT(*) FROM outreach_events WHERE status = 'sent' AND sent_at >= ?"
+    params: list[Any] = [iso_since]
+    if domain:
+        sql += " AND lower(sent_to) LIKE ?"
+        params.append(f"%@{domain.lower()}")
+    with connect() as connection:
+        return int(connection.execute(sql, params).fetchone()[0])
+
+
+def last_sent_at() -> str:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT MAX(sent_at) FROM outreach_events WHERE status = 'sent'"
+        ).fetchone()
+    return row[0] or ""
+
+
+def mark_outreach_sent(event_id: int, *, message_id: str = "") -> dict[str, Any] | None:
+    now = _now()
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            "UPDATE outreach_events SET status = 'sent', message_id = ?, sent_at = ? WHERE id = ?",
+            (message_id, now, event_id),
+        )
+        connection.execute(
+            "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
+            ("emailed", now, row["lead_id"]),
+        )
+        updated = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = ?", (event_id,)
+        ).fetchone()
+    return _row_to_dict(updated)
+
+
+def mark_outreach_status(event_id: int, status: str, *, error: str = "") -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE outreach_events SET status = ? WHERE id = ?", (status, event_id)
+        )
+
+
 def list_draft_events() -> list[dict[str, Any]]:
     with connect() as connection:
         rows = connection.execute(
@@ -376,17 +515,438 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
 
 
+# ── Auth: users, roles, RBAC ───────────────────────────
+
+def seed_auth() -> None:
+    """Seed default roles and a superadmin on first run (idempotent)."""
+    from app.auth import (
+        DEFAULT_ADMIN_PASSWORD,
+        DEFAULT_ADMIN_USERNAME,
+        DEFAULT_ROLES,
+        hash_password,
+    )
+
+    with connect() as connection:
+        existing_roles = {
+            row["name"] for row in connection.execute("SELECT name FROM roles").fetchall()
+        }
+        for role in DEFAULT_ROLES:
+            if role["name"] in existing_roles:
+                continue
+            connection.execute(
+                """
+                INSERT INTO roles (name, description, permissions, is_system, created_at, updated_at)
+                VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    role["name"],
+                    role["description"],
+                    json.dumps(role["permissions"]),
+                    _now(),
+                    _now(),
+                ),
+            )
+
+        user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if user_count == 0:
+            connection.execute(
+                """
+                INSERT INTO users (username, password_hash, display_name, is_active, is_superadmin, must_change_password, created_at, updated_at)
+                VALUES (?, ?, ?, 1, 1, 1, ?, ?)
+                """,
+                (
+                    DEFAULT_ADMIN_USERNAME,
+                    hash_password(DEFAULT_ADMIN_PASSWORD),
+                    "系统管理员",
+                    _now(),
+                    _now(),
+                ),
+            )
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USERNAME,)
+            ).fetchone()["id"]
+            admin_role = connection.execute(
+                "SELECT id FROM roles WHERE name = ?", ("管理员",)
+            ).fetchone()
+            if admin_role:
+                connection.execute(
+                    "INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)",
+                    (admin_id, admin_role["id"]),
+                )
+
+
+def _role_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    try:
+        data["permissions"] = json.loads(data.get("permissions") or "[]")
+    except (ValueError, TypeError):
+        data["permissions"] = []
+    data["is_system"] = bool(data.get("is_system"))
+    return data
+
+
+def list_roles() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT r.*, (SELECT COUNT(*) FROM user_roles WHERE role_id = r.id) AS user_count
+            FROM roles r ORDER BY r.id
+            """
+        ).fetchall()
+    return [_role_to_dict(row) for row in rows]
+
+
+def get_role(role_id: int) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM roles WHERE id = ?", (role_id,)).fetchone()
+    return _role_to_dict(row) if row else None
+
+
+def get_role_by_name(name: str) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM roles WHERE name = ?", (name,)).fetchone()
+    return _role_to_dict(row) if row else None
+
+
+def create_role(*, name: str, description: str, permissions: list[str]) -> dict[str, Any]:
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO roles (name, description, permissions, is_system, created_at, updated_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+            """,
+            (name, description, json.dumps(permissions), _now(), _now()),
+        )
+        row = connection.execute(
+            "SELECT * FROM roles WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+    return _role_to_dict(row)
+
+
+def update_role(
+    role_id: int,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any] | None:
+    current = get_role(role_id)
+    if current is None:
+        return None
+    new_name = name if name is not None else current["name"]
+    new_desc = description if description is not None else current["description"]
+    new_perms = permissions if permissions is not None else current["permissions"]
+    with connect() as connection:
+        connection.execute(
+            "UPDATE roles SET name = ?, description = ?, permissions = ?, updated_at = ? WHERE id = ?",
+            (new_name, new_desc, json.dumps(new_perms), _now(), role_id),
+        )
+    return get_role(role_id)
+
+
+def delete_role(role_id: int) -> bool:
+    with connect() as connection:
+        cursor = connection.execute(
+            "DELETE FROM roles WHERE id = ? AND is_system = 0", (role_id,)
+        )
+        if cursor.rowcount == 0:
+            return False
+        connection.execute("DELETE FROM user_roles WHERE role_id = ?", (role_id,))
+        return True
+
+
+def _user_to_dict(row: sqlite3.Row, *, roles: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    data = dict(row)
+    data.pop("password_hash", None)
+    data["is_active"] = bool(data.get("is_active"))
+    data["is_superadmin"] = bool(data.get("is_superadmin"))
+    data["must_change_password"] = bool(data.get("must_change_password"))
+    if roles is not None:
+        data["roles"] = [{"id": r["id"], "name": r["name"]} for r in roles]
+        if data["is_superadmin"]:
+            from app.auth import PERMISSION_KEYS
+
+            data["permissions"] = sorted(PERMISSION_KEYS)
+        else:
+            perms: set[str] = set()
+            for r in roles:
+                perms.update(r["permissions"])
+            data["permissions"] = sorted(perms)
+    return data
+
+
+def _roles_for_user(connection: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT r.* FROM roles r
+        JOIN user_roles ur ON ur.role_id = r.id
+        WHERE ur.user_id = ? ORDER BY r.id
+        """,
+        (user_id,),
+    ).fetchall()
+    return [_role_to_dict(row) for row in rows]
+
+
+def list_users() -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM users ORDER BY id").fetchall()
+        return [
+            _user_to_dict(row, roles=_roles_for_user(connection, row["id"])) for row in rows
+        ]
+
+
+def get_user(user_id: int) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            return None
+        return _user_to_dict(row, roles=_roles_for_user(connection, user_id))
+
+
+def get_user_auth_row(username: str) -> dict[str, Any] | None:
+    """Return the raw user row (including password_hash) for login verification."""
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM users WHERE username = ?", (username,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_principal(user_id: int):
+    """Build an auth.Principal for an active user, or None if missing/inactive."""
+    from app.auth import Principal
+
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None or not row["is_active"]:
+            return None
+        roles = _roles_for_user(connection, user_id)
+
+    perms: set[str] = set()
+    for r in roles:
+        perms.update(r["permissions"])
+    return Principal(
+        user_id=int(row["id"]),
+        username=str(row["username"]),
+        permissions=frozenset(perms),
+        is_superadmin=bool(row["is_superadmin"]),
+    )
+
+
+def create_user(
+    *,
+    username: str,
+    password: str,
+    display_name: str = "",
+    is_active: bool = True,
+    is_superadmin: bool = False,
+    role_ids: list[int] | None = None,
+    must_change_password: bool = True,
+) -> dict[str, Any]:
+    from app.auth import hash_password
+
+    with connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO users (username, password_hash, display_name, is_active, is_superadmin, must_change_password, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                username,
+                hash_password(password),
+                display_name,
+                int(is_active),
+                int(is_superadmin),
+                int(must_change_password),
+                _now(),
+                _now(),
+            ),
+        )
+        user_id = cursor.lastrowid
+        for rid in role_ids or []:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)",
+                (user_id, rid),
+            )
+    return get_user(user_id)
+
+
+def update_user(
+    user_id: int,
+    *,
+    display_name: str | None = None,
+    is_active: bool | None = None,
+    is_superadmin: bool | None = None,
+    role_ids: list[int] | None = None,
+) -> dict[str, Any] | None:
+    current = get_user(user_id)
+    if current is None:
+        return None
+    new_name = display_name if display_name is not None else current["display_name"]
+    new_active = is_active if is_active is not None else current["is_active"]
+    new_super = is_superadmin if is_superadmin is not None else current["is_superadmin"]
+    with connect() as connection:
+        connection.execute(
+            "UPDATE users SET display_name = ?, is_active = ?, is_superadmin = ?, updated_at = ? WHERE id = ?",
+            (new_name, int(new_active), int(new_super), _now(), user_id),
+        )
+        if role_ids is not None:
+            connection.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+            for rid in role_ids:
+                connection.execute(
+                    "INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)",
+                    (user_id, rid),
+                )
+    return get_user(user_id)
+
+
+def set_user_password(user_id: int, password: str, *, must_change: bool = False) -> bool:
+    from app.auth import hash_password
+
+    with connect() as connection:
+        cursor = connection.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = ?, updated_at = ? WHERE id = ?",
+            (hash_password(password), int(must_change), _now(), user_id),
+        )
+        return cursor.rowcount > 0
+
+
+def delete_user(user_id: int) -> bool:
+    with connect() as connection:
+        cursor = connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        if cursor.rowcount == 0:
+            return False
+        connection.execute("DELETE FROM user_roles WHERE user_id = ?", (user_id,))
+        return True
+
+
+def count_active_superadmins(exclude_user_id: int | None = None) -> int:
+    with connect() as connection:
+        if exclude_user_id is None:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE is_superadmin = 1 AND is_active = 1"
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM users WHERE is_superadmin = 1 AND is_active = 1 AND id != ?",
+                (exclude_user_id,),
+            ).fetchone()
+    return int(row[0])
+
+
+# ── Suppression list (do-not-email) ────────────────────
+
+def add_suppression(email: str, *, reason: str = "unsubscribe", source: str = "", notes: str = "") -> dict[str, Any]:
+    norm = email.strip().lower()
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO suppressions (email, reason, source, notes, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET reason = excluded.reason, source = excluded.source
+            """,
+            (norm, reason, source, notes, _now()),
+        )
+        row = connection.execute("SELECT * FROM suppressions WHERE email = ?", (norm,)).fetchone()
+    return _row_to_dict(row)
+
+
+def is_suppressed(email: str) -> bool:
+    norm = email.strip().lower()
+    if not norm:
+        return False
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM suppressions WHERE email = ? LIMIT 1", (norm,)
+        ).fetchone()
+    return row is not None
+
+
+def list_suppressions(q: str | None = None) -> list[dict[str, Any]]:
+    with connect() as connection:
+        if q:
+            rows = connection.execute(
+                "SELECT * FROM suppressions WHERE email LIKE ? ORDER BY id DESC",
+                (f"%{q.strip().lower()}%",),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM suppressions ORDER BY id DESC"
+            ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
+def remove_suppression(email: str) -> bool:
+    norm = email.strip().lower()
+    with connect() as connection:
+        cursor = connection.execute("DELETE FROM suppressions WHERE email = ?", (norm,))
+        return cursor.rowcount > 0
+
+
+# ── Audit log ──────────────────────────────────────────
+
+def add_audit(
+    *,
+    actor: str,
+    action: str,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+) -> None:
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO audit_log (actor, action, target_type, target_id, detail, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (actor, action, target_type, str(target_id), detail, _now()),
+        )
+
+
+def list_audit(*, limit: int = 200, action: str | None = None, actor: str | None = None) -> list[dict[str, Any]]:
+    filters: list[str] = []
+    params: list[Any] = []
+    if action:
+        filters.append("action = ?")
+        params.append(action)
+    if actor:
+        filters.append("actor = ?")
+        params.append(actor)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    params.append(max(1, min(limit, 1000)))
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM audit_log {where} ORDER BY id DESC LIMIT ?", params
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 # ── Settings ───────────────────────────────────────────
+
+# Settings whose values are encrypted at rest (transparently de/encrypted here).
+_SECRET_SETTING_KEYS = {"agent_key", "email_password"}
+
 
 def get_setting(key: str, default: str = "") -> str:
     with connect() as connection:
         row = connection.execute(
             "SELECT value FROM settings WHERE key = ?", (key,)
         ).fetchone()
-    return row["value"] if row else default
+    if not row:
+        return default
+    value = row["value"]
+    if key in _SECRET_SETTING_KEYS:
+        from app.crypto import decrypt_secret
+
+        return decrypt_secret(value)
+    return value
 
 
 def set_setting(key: str, value: str) -> None:
+    if key in _SECRET_SETTING_KEYS and value:
+        from app.crypto import encrypt_secret
+
+        value = encrypt_secret(value)
     with connect() as connection:
         connection.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) "
@@ -398,7 +958,13 @@ def set_setting(key: str, value: str) -> None:
 def get_all_settings() -> dict[str, str]:
     with connect() as connection:
         rows = connection.execute("SELECT key, value FROM settings").fetchall()
-    return {row["key"]: row["value"] for row in rows}
+    from app.crypto import decrypt_secret
+
+    result: dict[str, str] = {}
+    for row in rows:
+        key, value = row["key"], row["value"]
+        result[key] = decrypt_secret(value) if key in _SECRET_SETTING_KEYS else value
+    return result
 
 
 # ── Helpers ────────────────────────────────────────────

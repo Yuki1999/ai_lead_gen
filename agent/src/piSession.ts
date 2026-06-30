@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 
-import { getModel } from "@earendil-works/pi-ai";
+import { getModel, type Model } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
   createAgentSession,
@@ -301,6 +301,46 @@ async function runPiChatPrompt(
   });
 }
 
+// OpenAI-compatible providers that pi-ai doesn't ship a model registry for, but
+// expose an OpenAI-style /chat/completions endpoint we can target directly.
+const OPENAI_COMPATIBLE_BASE_URLS: Record<string, string> = {
+  bailian: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+};
+
+function buildOpenAiCompatibleModel(
+  config: AgentConfig,
+): Model<"openai-completions"> | null {
+  const baseUrl = OPENAI_COMPATIBLE_BASE_URLS[config.modelProvider];
+  if (!baseUrl) {
+    return null;
+  }
+  // The openai-completions streamer reads model.baseUrl and resolves the API key
+  // from AuthStorage by provider (set above via setRuntimeApiKey).
+  // DashScope's OpenAI-compatible mode rejects `store`, the `developer` role, and
+  // `max_completion_tokens` — auto-detected defaults assume real OpenAI, so pin
+  // compat explicitly for these third-party endpoints.
+  return {
+    id: config.modelName,
+    name: config.modelName,
+    api: "openai-completions",
+    provider: config.modelProvider as Model<"openai-completions">["provider"],
+    baseUrl,
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 131072,
+    maxTokens: 8192,
+    compat: {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      maxTokensField: "max_tokens",
+      supportsStrictMode: false,
+    },
+  };
+}
+
 async function createManagedPiSession(
   config: AgentConfig,
 ): Promise<{ session: AgentSession; configKey: string }> {
@@ -319,7 +359,8 @@ async function createManagedPiSession(
   const model =
     config.modelProvider === "openai" && config.modelName === "gpt-5-mini"
       ? getModel("openai", "gpt-5-mini")
-      : modelRegistry.find(config.modelProvider, config.modelName);
+      : buildOpenAiCompatibleModel(config) ??
+        modelRegistry.find(config.modelProvider, config.modelName);
 
   if (!model) {
     throw new Error(
@@ -327,7 +368,7 @@ async function createManagedPiSession(
     );
   }
 
-  const backend = new BackendClient(config.backendBaseUrl);
+  const backend = new BackendClient(config.backendBaseUrl, config.backendServiceToken);
   const businessTools = createBusinessTools(backend);
   const resourceLoader = new DefaultResourceLoader({
     cwd: projectRoot,

@@ -29,6 +29,8 @@ class LeadCreateRequest(BaseModel):
     category: str = Field(default="medical device distributor", max_length=200)
     match_reason: str = Field(default="手动添加", max_length=1000)
     source: str = Field(default="manual", max_length=500)
+    # "distributor" | "kol" | "" — selects which approved email template is used.
+    lead_type: str = Field(default="", max_length=20)
 
 
 class LeadUpdateRequest(BaseModel):
@@ -82,3 +84,53 @@ class EmailTestRequest(BaseModel):
     to: str = Field(min_length=3, max_length=320)
     subject: str = Field(default="[Medbot Test]", max_length=200)
     body: str = Field(default="This is a test email from Medbot.", max_length=5000)
+
+
+# ── Auth & RBAC ───────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=6, max_length=200)
+
+
+class RoleCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    description: str = Field(default="", max_length=300)
+    permissions: list[str] = Field(default_factory=list)
+
+
+class RoleUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+    description: str | None = Field(default=None, max_length=300)
+    permissions: list[str] | None = None
+
+
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=6, max_length=200)
+    display_name: str = Field(default="", max_length=120)
+    is_active: bool = True
+    is_superadmin: bool = False
+    role_ids: list[int] = Field(default_factory=list)
+
+
+class UserUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=120)
+    is_active: bool | None = None
+    is_superadmin: bool | None = None
+    role_ids: list[int] | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    new_password: str = Field(min_length=6, max_length=200)
+
+
+class SuppressionCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    reason: str = Field(default="manual", max_length=40)
+    notes: str = Field(default="", max_length=500)

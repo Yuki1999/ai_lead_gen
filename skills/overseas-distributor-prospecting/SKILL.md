@@ -1,9 +1,23 @@
 ---
 name: overseas-distributor-prospecting
-description: Use when conducting overseas distributor prospecting for Medbot, 微创畅行机器人, SkyWalker TKA, orthopedic surgical robotics, orthopedic navigation, joint replacement, TKA, or medical device channel development.
+description: Use when conducting overseas distributor or KOL prospecting for Medbot, 微创畅行机器人, SkyWalker TKA, MEDBOT NaviBot Skywalker, orthopedic surgical robotics, orthopedic navigation, joint replacement, TKA, or medical device channel development.
 ---
 
 # Overseas Distributor Prospecting
+
+## 0. 业务配置更新（客户批准版 V2.0，2026-06）
+
+权威业务输入见仓库 `docs/business/`（代理商/KOL 筛选标准、邮件模板、渠道开发信息表、领导版邮件样例）。以下是相对本文档其余部分的**生效变更**，冲突时以本节为准：
+
+1. **目标对象扩展到两类**，每条线索都要标注 `lead_type`：
+   - `distributor`：医疗器械分销商 / 骨科植入物代理商 / 关节置换渠道商 / 手术机器人经销商。
+   - `kol`：骨科主任医师、学科带头人、KOL、医院采购负责人、手术中心负责人。判断规则见 `docs/business/README.md`（职位与公司类型关键词）。
+   - 通过 `add_leads` / `search_leads` 保存线索时带上 `lead_type`，外联会据此选用对应的批准版邮件模板。
+2. **联系方式放宽**：公开邮箱、官网联系页、LinkedIn 均可接受，能建立有效触达即视为合格（优先级：官网邮箱 > LinkedIn > 官网联系表）。
+3. **竞品代理不再一刀切排除**：代理 Mako / ROSA / Cori 等竞品者改为个案评估，在评分中酌情降级，而非直接 reject。
+4. **评分权重**：渠道匹配度 40% · 目标市场战略优先级 25% · 学术/品牌公开资历 20% · 联系方式可用性 10% · 公开 KOL/医院合作记录 5%。
+5. **外联与发送由后端按批准模板处理**：本 skill 仍**不撰写邮件正文**；调用 `create_outreach_records` 后，后端用批准版模板（代理商/KOL、中英文、统一署名、专人对接 CTA）生成邮件。是否自动发送由后端 `auto_send_enabled` 设置控制（默认存草稿，需人工审核）。
+6. **回复转人工触发词**（价格/报价、独家、注册证/认证/FDA/CE、招投标、合同、付款、临床声明/适应症/疗效、样机/试用/演示）由后端 `analyze_reply` 统一判断，命中即转人工。
 
 ## 1. Skill Purpose
 

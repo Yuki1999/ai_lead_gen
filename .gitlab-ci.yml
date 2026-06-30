@@ -1,0 +1,64 @@
+# GitLab CI/CD 流水线 —— 第 1 步：自动测试 + 构建验证（暂不自动部署）
+#
+# 每次 push 或合并请求，GitLab 会自动在云端机器上跑下面这些任务：
+#   1) test  阶段：后端 59 个单元测试
+#   2) build 阶段：前端、Agent 的生产构建（确认镜像能构建出来）
+# 任一任务失败 → 流水线标红 ✗，你会收到通知；全过 → 绿勾 ✓。
+#
+# 说明：这些任务跑在 GitLab 云端 runner 上，从官方镜像源拉取依赖，
+#       不受你本地网络/镜像影响。需要在项目里启用 Shared Runners（默认开启）。
+
+stages:
+  - test
+  - build
+
+# ── 后端：跑 pytest ───────────────────────────────────────────────
+backend-test:
+  stage: test
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  variables:
+    UV_LINK_MODE: copy
+  cache:
+    key:
+      files:
+        - backend/uv.lock
+    paths:
+      - backend/.venv/
+  script:
+    - cd backend
+    - uv sync --locked       # 安装依赖（含测试用的 pytest/httpx）
+    - uv run pytest -q       # 跑全部单元测试
+
+# ── Agent：TypeScript 编译 ────────────────────────────────────────
+agent-build:
+  stage: build
+  image: node:22-bookworm-slim
+  cache:
+    key:
+      files:
+        - agent/package-lock.json
+    paths:
+      - agent/node_modules/
+  script:
+    - cd agent
+    - npm ci                 # 按 lockfile 精确安装依赖
+    - npm run build          # tsc 编译，验证能构建
+
+# ── 前端：类型检查 + 生产构建 ─────────────────────────────────────
+frontend-build:
+  stage: build
+  image: node:22-bookworm-slim
+  cache:
+    key:
+      files:
+        - frontend/package-lock.json
+    paths:
+      - frontend/node_modules/
+  script:
+    - cd frontend
+    - npm ci
+    - npm run build          # vue-tsc 类型检查 + vite 生产构建
+  artifacts:
+    paths:
+      - frontend/dist/        # 保留构建产物，可在流水线页面下载查看
+    expire_in: 1 week

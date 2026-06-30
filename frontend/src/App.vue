@@ -43,6 +43,7 @@ import {
   NTag,
   type SelectOption,
 } from "naive-ui";
+import AdminPanel from "./components/AdminPanel.vue";
 import {
   countAgentHistoryItems,
   splitAgentProcessHistory,
@@ -117,6 +118,8 @@ interface DraftListResponse {
 
 interface SendResponse {
   sent_count: number;
+  queued_count?: number;
+  note?: string;
   events: EmailEvent[];
 }
 
@@ -173,6 +176,10 @@ interface AgentChatResponse {
 interface SettingsResponse {
   sync_enabled: boolean;
   sync_interval_minutes: number;
+  auto_send_enabled: boolean;
+  send_daily_cap: number;
+  send_min_interval_seconds: number;
+  send_per_domain_daily_cap: number;
   agent_provider: string;
   agent_model: string;
   has_agent_key: boolean;
@@ -196,6 +203,141 @@ interface AgentConfigResponse {
 }
 
 const apiBase = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+// ── Auth state ───────────────────────────────────────────────────────────────
+interface MeUser {
+  id?: number;
+  username: string;
+  display_name?: string;
+  is_superadmin: boolean;
+  is_service?: boolean;
+  must_change_password?: boolean;
+  permissions: string[];
+  roles: { id: number; name: string }[];
+}
+
+const TOKEN_KEY = "medbot_token";
+const authToken = ref<string | null>(localStorage.getItem(TOKEN_KEY));
+const me = ref<MeUser | null>(null);
+const isAuthenticated = computed(() => !!authToken.value && !!me.value);
+
+const loginUsername = ref("");
+const loginPassword = ref("");
+const loginError = ref("");
+const loginLoading = ref(false);
+
+const changePwdOpen = ref(false);
+const forcePwdChange = ref(false);
+const oldPassword = ref("");
+const newPassword = ref("");
+const changePwdMsg = ref("");
+
+function maybeForcePasswordChange(): void {
+  if (me.value?.must_change_password) {
+    forcePwdChange.value = true;
+    changePwdOpen.value = true;
+  }
+}
+
+function can(permission: string): boolean {
+  if (!me.value) return false;
+  if (me.value.is_superadmin) return true;
+  return me.value.permissions.includes(permission);
+}
+
+function setToken(token: string | null): void {
+  authToken.value = token;
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
+async function doLogin(): Promise<void> {
+  loginError.value = "";
+  if (!loginUsername.value.trim() || !loginPassword.value) {
+    loginError.value = "请输入用户名和密码";
+    return;
+  }
+  loginLoading.value = true;
+  try {
+    const resp = await fetch(`${apiBase}/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: loginUsername.value.trim(),
+        password: loginPassword.value,
+      }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      loginError.value = (detail as { detail?: string }).detail || "登录失败";
+      return;
+    }
+    const data = (await resp.json()) as { token: string; user: MeUser };
+    setToken(data.token);
+    me.value = data.user;
+    loginPassword.value = "";
+    await bootstrapAfterLogin();
+    maybeForcePasswordChange();
+  } catch (error) {
+    loginError.value = error instanceof Error ? error.message : "登录失败";
+  } finally {
+    loginLoading.value = false;
+  }
+}
+
+function logout(): void {
+  setToken(null);
+  me.value = null;
+  sidebarUserMenuOpen.value = false;
+  activePage.value = "workspace";
+}
+
+async function fetchMe(): Promise<boolean> {
+  if (!authToken.value) return false;
+  try {
+    const resp = await fetch(`${apiBase}/auth/me`, {
+      headers: { Authorization: `Bearer ${authToken.value}` },
+    });
+    if (!resp.ok) {
+      setToken(null);
+      me.value = null;
+      return false;
+    }
+    me.value = (await resp.json()) as MeUser;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function submitChangePassword(): Promise<void> {
+  changePwdMsg.value = "";
+  if (newPassword.value.length < 6) {
+    changePwdMsg.value = "新密码至少 6 位";
+    return;
+  }
+  try {
+    await request("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        old_password: oldPassword.value,
+        new_password: newPassword.value,
+      }),
+    });
+    changePwdMsg.value = "密码已修改";
+    oldPassword.value = "";
+    newPassword.value = "";
+    if (me.value) me.value.must_change_password = false;
+    forcePwdChange.value = false;
+    setTimeout(() => {
+      changePwdOpen.value = false;
+      changePwdMsg.value = "";
+    }, 1200);
+  } catch (error) {
+    changePwdMsg.value = error instanceof Error ? error.message : "修改失败";
+  }
+}
+
 const naiveThemeOverrides = {
   common: {
     primaryColor: "#2563EB",
@@ -220,6 +362,7 @@ const statusFilterOptions: SelectOption[] = [
 const providerOptions: SelectOption[] = [
   { label: "OpenAI", value: "openai" },
   { label: "DeepSeek", value: "deepseek" },
+  { label: "百炼 (通义千问)", value: "bailian" },
 ];
 
 const leads = ref<Lead[]>([]);
@@ -289,6 +432,10 @@ const agentConfigNotice = ref("");
 const settings = ref<SettingsResponse>({
   sync_enabled: false,
   sync_interval_minutes: 0,
+  auto_send_enabled: false,
+  send_daily_cap: 200,
+  send_min_interval_seconds: 20,
+  send_per_domain_daily_cap: 25,
   agent_provider: "deepseek",
   agent_model: "deepseek-v4-pro",
   has_agent_key: false,
@@ -311,7 +458,7 @@ const outreachPreviews = ref<Array<{ lead_id: number; company_name: string; emai
 const showCreateLead = ref(false);
 const createError = ref("");
 const newLead = ref({ company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" });
-const activePage = ref<"workspace" | "agent" | "settings">("workspace");
+const activePage = ref<"workspace" | "agent" | "settings" | "admin">("workspace");
 const editingSessionId = ref("");
 const editingSessionTitle = ref("");
 const agentConfigExpanded = ref(false);
@@ -451,9 +598,16 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...(authToken.value ? { Authorization: `Bearer ${authToken.value}` } : {}),
       ...(options.headers || {}),
     },
   });
+
+  if (response.status === 401) {
+    // Token expired or invalid → drop back to the login screen.
+    logout();
+    throw new Error("登录已过期，请重新登录");
+  }
 
   if (!response.ok) {
     throw new Error(await response.text());
@@ -694,7 +848,10 @@ async function sendAgentPrompt(): Promise<void> {
   try {
     const response = await fetch(`${apiBase}/agent/chat/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(authToken.value ? { Authorization: `Bearer ${authToken.value}` } : {}),
+      },
       body: JSON.stringify({
         message,
         session_id: agentSessionId.value || undefined,
@@ -798,7 +955,7 @@ async function confirmSendOutreach(): Promise<void> {
       body: JSON.stringify({ lead_ids: leadIds, custom_emails: customEmails }),
     });
     showOutreachPreview.value = false;
-    notice.value = `已发送 ${payload.sent_count} 封外联`;
+    notice.value = payload.note || `已处理 ${payload.sent_count} 条外联`;
     await loadDashboard();
   });
 }
@@ -1006,7 +1163,7 @@ function applyAgentConfig(config: AgentConfigResponse): void {
   agentBackendBaseUrl.value = config.backend_base_url;
 }
 
-function showPage(page: "workspace" | "agent" | "settings", sectionId?: string): void {
+function showPage(page: "workspace" | "agent" | "settings" | "admin", sectionId?: string): void {
   activePage.value = page;
   agentGuideOpen.value = false;
   agentNotificationsOpen.value = false;
@@ -1015,7 +1172,13 @@ function showPage(page: "workspace" | "agent" | "settings", sectionId?: string):
   globalThis.history?.replaceState(null, "", `#${hash}`);
 
   if (page === "settings") {
-    loadSettings();
+    // Land on a tab the user is actually allowed to see.
+    if (!can("settings.manage") && can("agent.config")) {
+      settingsTab.value = "agent";
+    } else if (can("settings.manage")) {
+      settingsTab.value = "email";
+    }
+    if (can("settings.manage")) loadSettings();
     return;
   }
   const targetId = sectionId || (page === "agent" ? "overview" : "");
@@ -1029,10 +1192,28 @@ async function loadSettings(): Promise<void> {
   settingsLoading.value = true;
   try {
     settings.value = await request<SettingsResponse>("/settings");
+    void loadQueueStatus();
   } catch {
     // use defaults
   } finally {
     settingsLoading.value = false;
+  }
+}
+
+interface QueueStatus {
+  queued: number;
+  sent_today: number;
+  daily_cap: number;
+  min_interval_seconds: number;
+  per_domain_daily_cap: number;
+  email_configured: boolean;
+}
+const queueStatus = ref<QueueStatus | null>(null);
+async function loadQueueStatus(): Promise<void> {
+  try {
+    queueStatus.value = await request<QueueStatus>("/campaigns/queue");
+  } catch {
+    queueStatus.value = null;
   }
 }
 
@@ -1043,6 +1224,10 @@ async function saveSettings(): Promise<void> {
     const body: Record<string, unknown> = {
       sync_enabled: settings.value.sync_enabled,
       sync_interval_minutes: settings.value.sync_interval_minutes,
+      auto_send_enabled: settings.value.auto_send_enabled,
+      send_daily_cap: settings.value.send_daily_cap,
+      send_min_interval_seconds: settings.value.send_min_interval_seconds,
+      send_per_domain_daily_cap: settings.value.send_per_domain_daily_cap,
       agent_provider: agentProviderName.value,
       agent_model: agentModelName.value,
       backend_base_url: agentBackendBaseUrl.value,
@@ -1435,22 +1620,68 @@ function formatAgentEvent(event: AgentEvent): string {
   return tool ? `${labels[type] || type}: ${String(tool)}` : labels[type] || type;
 }
 
-onMounted(() => {
+async function bootstrapAfterLogin(): Promise<void> {
+  // Load only what the signed-in user is allowed to see.
+  const tasks: Promise<unknown>[] = [];
+  if (can("leads.view")) {
+    tasks.push(
+      runAction("dashboard", async () => {
+        await Promise.all([loadProductProfile(), loadDashboard()]);
+      }),
+    );
+  } else {
+    activePage.value = can("agent.use") ? "agent" : "settings";
+  }
+  if (can("agent.config")) tasks.push(loadAgentConfig());
+  await Promise.all(tasks);
+}
+
+onMounted(async () => {
   applyAgentSessionState(loadAgentSessionState(getAgentStorage()));
   if (globalThis.location?.hash === "#agent") {
     activePage.value = "agent";
   }
-  void runAction("dashboard", async () => {
-    await Promise.all([loadProductProfile(), loadDashboard()]);
-  });
-  void loadAgentConfig();
+  if (authToken.value) {
+    const ok = await fetchMe();
+    if (ok) {
+      await bootstrapAfterLogin();
+      maybeForcePasswordChange();
+    }
+  }
 });
 </script>
 
 <template>
   <n-config-provider :theme-overrides="naiveThemeOverrides">
   <n-global-style />
-  <div class="app-shell app-frame">
+
+  <!-- Login gate: the whole app is hidden until authenticated. -->
+  <div v-if="!isAuthenticated" class="login-overlay">
+    <form class="login-card" @submit.prevent="doLogin">
+      <div class="login-brand">
+        <div class="brand-mark">SW</div>
+        <div>
+          <strong>SkyWalker 海外渠道拓展系统</strong>
+          <span>请登录后使用</span>
+        </div>
+      </div>
+      <label class="field">
+        <span>用户名</span>
+        <input v-model="loginUsername" type="text" autocomplete="username" placeholder="用户名" />
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input v-model="loginPassword" type="password" autocomplete="current-password" placeholder="密码" />
+      </label>
+      <p v-if="loginError" class="login-error">{{ loginError }}</p>
+      <button class="login-submit" type="submit" :disabled="loginLoading">
+        {{ loginLoading ? "登录中..." : "登 录" }}
+      </button>
+      <p class="login-hint">默认管理员：admin / admin123（首次登录后请尽快修改密码）</p>
+    </form>
+  </div>
+
+  <div v-else class="app-shell app-frame">
     <aside class="sidebar" aria-label="系统导航">
       <div class="brand-lockup">
         <div class="brand-mark">SW</div>
@@ -1461,6 +1692,7 @@ onMounted(() => {
       </div>
       <nav class="side-nav" aria-label="主导航">
         <button
+          v-if="can('agent.use')"
           type="button"
           :class="{ active: activePage === 'agent' }"
           @click="showPage('agent')"
@@ -1469,6 +1701,7 @@ onMounted(() => {
           渠道拓展Agent
         </button>
         <button
+          v-if="can('leads.view')"
           type="button"
           :class="{ active: activePage === 'workspace' }"
           @click="showPage('workspace', 'overview')"
@@ -1478,6 +1711,16 @@ onMounted(() => {
           <span v-if="draftCount > 0" class="nav-badge">{{ draftCount }}</span>
         </button>
         <button
+          v-if="can('users.manage')"
+          type="button"
+          :class="{ active: activePage === 'admin' }"
+          @click="showPage('admin')"
+        >
+          <span class="nav-icon"><ShieldCheck :size="18" aria-hidden="true" /></span>
+          用户与权限
+        </button>
+        <button
+          v-if="can('settings.manage') || can('agent.config')"
           type="button"
           :class="{ active: activePage === 'settings' }"
           @click="showPage('settings')"
@@ -1494,10 +1737,10 @@ onMounted(() => {
           aria-controls="sidebar-user-menu"
           @click="toggleSidebarUserMenu"
         >
-          <span class="user-avatar">张</span>
+          <span class="user-avatar">{{ (me?.display_name || me?.username || "U").slice(0, 1) }}</span>
           <div>
-            <strong>张明</strong>
-            <small>医疗器械 · 管理员</small>
+            <strong>{{ me?.display_name || me?.username }}</strong>
+            <small>{{ me?.is_superadmin ? "超级管理员" : (me?.roles?.map(r => r.name).join(" / ") || "无角色") }}</small>
           </div>
           <ChevronDown :size="16" aria-hidden="true" />
         </button>
@@ -1508,9 +1751,9 @@ onMounted(() => {
           role="menu"
           aria-label="用户快捷操作"
         >
-          <button type="button" role="menuitem" @click="openAgentFromUserMenu">打开 Agent</button>
-          <button type="button" role="menuitem" @click="copyCurrentPageLink">复制当前链接</button>
+          <button type="button" role="menuitem" @click="changePwdOpen = true; sidebarUserMenuOpen = false">修改密码</button>
           <button type="button" role="menuitem" @click="refreshDashboardFromUserMenu">刷新数据</button>
+          <button type="button" role="menuitem" @click="logout">退出登录</button>
         </div>
       </div>
     </aside>
@@ -1632,19 +1875,19 @@ onMounted(() => {
               </span>
               <div class="product-title-copy">
                 <p class="panel-label">产品画像</p>
-                <strong>{{ productProfile.product_name }}</strong>
-                <span class="product-procedure">{{ productProfile.procedure }}</span>
+                <strong>{{ productProfile?.product_name }}</strong>
+                <span class="product-procedure">{{ productProfile?.procedure }}</span>
               </div>
             </div>
-            <p>{{ productProfile.summary }}</p>
+            <p>{{ productProfile?.summary }}</p>
             <div class="chip-row">
-              <span v-for="point in productProfile.value_points.slice(0, 2)" :key="point">
+              <span v-for="point in productProfile?.value_points.slice(0, 2)" :key="point">
                 {{ point }}
               </span>
             </div>
             <small>
-              资料：{{ productProfile.source_files.length }} PDF ·
-              {{ productProfile.video_assets.length }} 视频
+              资料：{{ productProfile?.source_files.length }} PDF ·
+              {{ productProfile?.video_assets.length }} 视频
             </small>
           </n-card>
 
@@ -1717,9 +1960,9 @@ onMounted(() => {
           <p class="selection-copy">已选择 {{ selectedCount }} 个邮箱</p>
 
           <n-card v-if="lastEmail" class="email-preview" aria-label="触达内容预览" :bordered="false">
-            <strong>{{ lastEmail.subject }}</strong>
-            <span>{{ lastEmail.sent_to }}</span>
-            <p>{{ lastEmail.body }}</p>
+            <strong>{{ lastEmail?.subject }}</strong>
+            <span>{{ lastEmail?.sent_to }}</span>
+            <p>{{ lastEmail?.body }}</p>
           </n-card>
         </section>
 
@@ -2461,8 +2704,8 @@ onMounted(() => {
                   <p class="panel-label">外联记录</p>
                   <article v-for="ev in detailOutreach" :key="ev.id" class="history-card">
                     <div class="history-head">
-                      <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : 'info'" size="small" round :bordered="false">
-                        {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : '已记录' }}
+                      <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : ev.status === 'queued' ? 'warning' : ev.status === 'suppressed' ? 'error' : 'info'" size="small" round :bordered="false">
+                        {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : ev.status === 'queued' ? '排队中' : ev.status === 'suppressed' ? '已抑制' : ev.status === 'draft' ? '草稿' : '已记录' }}
                       </n-tag>
                       <small>{{ formatTime(ev.created_at) }}</small>
                     </div>
@@ -2506,18 +2749,23 @@ onMounted(() => {
         </div>
       </section>
 
+        <AdminPanel
+          v-if="activePage === 'admin' && can('users.manage')"
+          :request="request"
+        />
+
         <section
           v-if="activePage === 'settings'"
           class="settings-page"
           aria-labelledby="settings-title"
         >
           <div class="settings-tabs">
-            <button :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
-            <button :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
-            <button :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
+            <button v-if="can('settings.manage')" :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
+            <button v-if="can('settings.manage')" :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
+            <button v-if="can('agent.config')" :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
           </div>
 
-          <section v-if="settingsTab === 'email'" class="settings-card">
+          <section v-if="settingsTab === 'email' && can('settings.manage')" class="settings-card">
             <div class="settings-card-head">
               <div>
                 <p class="panel-label">邮箱配置</p>
@@ -2535,7 +2783,7 @@ onMounted(() => {
             </div>
           </section>
 
-          <section v-if="settingsTab === 'sync'" class="settings-card">
+          <section v-if="settingsTab === 'sync' && can('settings.manage')" class="settings-card">
             <div class="settings-card-head">
               <div>
                 <p class="panel-label">邮件同步</p>
@@ -2549,9 +2797,41 @@ onMounted(() => {
             <label class="toggle-field"><n-checkbox v-model:checked="settings.sync_enabled">启用自动同步</n-checkbox></label>
             <label class="field" v-if="settings.sync_enabled"><span>同步间隔（分钟）</span><n-input-number v-model:value="settings.sync_interval_minutes" :min="5" :max="1440" /></label>
             <p class="setting-hint" v-if="settings.sync_enabled && settings.sync_interval_minutes > 0">每 {{ settings.sync_interval_minutes }} 分钟自动扫描收件箱，仅同步新回复。</p>
+
+            <div class="settings-card-head" style="margin-top: 24px;">
+              <div>
+                <p class="panel-label">AI 自动发送</p>
+                <h3>让 AI 自行发送首封邮件</h3>
+                <p>开启后，Agent 生成的首封冷邮件会直接通过 Exchange 发出，无需人工逐封审核。关闭时（默认）一律存为草稿，需人工批准后发送。回复仍按人工审核规则触发转人工。</p>
+              </div>
+              <n-tag :type="settings.auto_send_enabled ? 'warning' : 'default'" size="small" round :bordered="false">
+                {{ settings.auto_send_enabled ? '自动发送' : '草稿模式' }}
+              </n-tag>
+            </div>
+            <label class="toggle-field"><n-checkbox v-model:checked="settings.auto_send_enabled">允许 AI 自动发送首封邮件</n-checkbox></label>
+            <p class="setting-hint" v-if="settings.auto_send_enabled" style="color: var(--warning-color, #d97706);">⚠️ 已开启自动发送：Agent 创建外联后将进入发送队列，按下方节流速率发出。</p>
+
+            <div class="settings-card-head" style="margin-top: 24px;">
+              <div>
+                <p class="panel-label">发送节流</p>
+                <h3>发送队列与速率限制</h3>
+                <p>外联邮件不会瞬时群发，而是进入队列按速率发出，避免触发垃圾邮件过滤、保护域名声誉。退订/退信地址自动跳过。</p>
+              </div>
+            </div>
+            <div v-if="queueStatus" class="queue-stats">
+              <div class="queue-stat"><strong>{{ queueStatus.queued }}</strong><span>排队中</span></div>
+              <div class="queue-stat"><strong>{{ queueStatus.sent_today }}</strong><span>今日已发</span></div>
+              <div class="queue-stat"><strong>{{ queueStatus.daily_cap }}</strong><span>每日上限</span></div>
+              <button class="queue-refresh" type="button" @click="loadQueueStatus">刷新</button>
+            </div>
+            <p v-if="queueStatus && !queueStatus.email_configured" class="setting-hint" style="color: var(--warning-color, #d97706);">⚠️ 邮箱未配置，队列中的邮件暂不会发出，配置邮箱后会自动开始发送。</p>
+            <label class="field"><span>每日发送上限（封）</span><n-input-number v-model:value="settings.send_daily_cap" :min="1" :max="5000" /></label>
+            <label class="field"><span>发送最小间隔（秒）</span><n-input-number v-model:value="settings.send_min_interval_seconds" :min="1" :max="3600" /></label>
+            <label class="field"><span>同一域名每日上限（封）</span><n-input-number v-model:value="settings.send_per_domain_daily_cap" :min="1" :max="1000" /></label>
+            <p class="setting-hint">推荐：起步阶段间隔 20–60 秒、每日 100–200 封、单域名 ≤25 封，随着域名信誉建立再逐步放宽。</p>
           </section>
 
-          <section v-if="settingsTab === 'agent'" class="settings-card">
+          <section v-if="settingsTab === 'agent' && can('agent.config')" class="settings-card">
             <div class="settings-card-head">
               <div>
                 <p class="panel-label">AI Agent</p>
@@ -2808,6 +3088,23 @@ onMounted(() => {
         </div>
       </section>
     </div>
+  </div>
+
+  <!-- Change-password modal -->
+  <div v-if="changePwdOpen" class="modal-overlay" @click.self="forcePwdChange || (changePwdOpen = false)">
+    <form class="modal-card" @submit.prevent="submitChangePassword">
+      <h3>{{ forcePwdChange ? "请先修改初始密码" : "修改密码" }}</h3>
+      <p v-if="forcePwdChange" class="setting-hint" style="margin: -4px 0 4px; color: var(--warning-color, #d97706);">
+        为了账号安全，首次登录或密码被重置后必须设置新密码才能继续使用。
+      </p>
+      <label class="field"><span>原密码</span><input v-model="oldPassword" type="password" autocomplete="current-password" /></label>
+      <label class="field"><span>新密码（至少 6 位）</span><input v-model="newPassword" type="password" autocomplete="new-password" /></label>
+      <p v-if="changePwdMsg" class="login-error">{{ changePwdMsg }}</p>
+      <div class="modal-actions">
+        <button v-if="!forcePwdChange" type="button" class="btn-ghost" @click="changePwdOpen = false">取消</button>
+        <button type="submit" class="login-submit">保存</button>
+      </div>
+    </form>
   </div>
   </n-config-provider>
 </template>

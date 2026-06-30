@@ -65,6 +65,25 @@ ensure_shared_agent_token() {
   set_env_value agent/.env AGENT_TOKEN "$token"
 }
 
+ensure_shared_service_token() {
+  # Token the Pi agent uses to authenticate to the RBAC-protected backend.
+  local root_token
+  local agent_token
+  local token
+
+  root_token="$(read_env_value .env MEDBOT_SERVICE_TOKEN)"
+  agent_token="$(read_env_value agent/.env BACKEND_SERVICE_TOKEN)"
+  token="${root_token:-$agent_token}"
+
+  if [ -z "$token" ]; then
+    token="$(generate_agent_token)"
+    echo "Generated MEDBOT_SERVICE_TOKEN for agent -> backend authentication"
+  fi
+
+  set_env_value .env MEDBOT_SERVICE_TOKEN "$token"
+  set_env_value agent/.env BACKEND_SERVICE_TOKEN "$token"
+}
+
 sync_agent_container_defaults() {
   local public_origin
   public_origin="$(read_env_value .env PUBLIC_ORIGIN)"
@@ -96,6 +115,7 @@ if [ ! -f agent/.env ]; then
 fi
 
 ensure_shared_agent_token
+ensure_shared_service_token
 sync_agent_container_defaults
 
 if ! grep -Eq '^(OPENAI_API_KEY|DEEPSEEK_API_KEY)=.+' agent/.env; then

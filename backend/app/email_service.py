@@ -14,6 +14,9 @@ and callers should fall back to recording outreach events without actual deliver
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import os
 from dataclasses import dataclass, field
 
@@ -30,6 +33,61 @@ from exchangelib import (
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+# ── Unsubscribe tokens & footer (CAN-SPAM / GDPR compliance) ──────────────────
+
+def _unsub_secret() -> bytes:
+    from app.auth import _secret
+
+    return _secret()
+
+
+def make_unsubscribe_token(email: str) -> str:
+    """Signed, non-guessable token so a recipient can only unsubscribe themselves."""
+    norm = email.strip().lower().encode("utf-8")
+    sig = hmac.new(_unsub_secret(), b"unsub:" + norm, hashlib.sha256).hexdigest()[:20]
+    return base64.urlsafe_b64encode(norm).rstrip(b"=").decode("ascii") + "." + sig
+
+
+def verify_unsubscribe_token(token: str) -> str | None:
+    """Return the email if the token is valid, else None."""
+    try:
+        email_b64, sig = token.split(".", 1)
+        pad = "=" * (-len(email_b64) % 4)
+        email = base64.urlsafe_b64decode(email_b64 + pad).decode("utf-8")
+        expected = hmac.new(_unsub_secret(), b"unsub:" + email.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+        return email if hmac.compare_digest(sig, expected) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def public_base_url() -> str:
+    """Base URL recipients reach for the unsubscribe page (the backend's public origin)."""
+    from app.db import get_setting
+
+    url = _env("MEDBOT_PUBLIC_URL") or get_setting("public_base_url") or "http://localhost:8000"
+    return url.rstrip("/")
+
+
+def _has_cjk(text: str) -> bool:
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
+def append_unsubscribe_footer(body: str, to: str) -> str:
+    """Append a compliant unsubscribe footer (language matched to the body)."""
+    link = f"{public_base_url()}/unsubscribe?token={make_unsubscribe_token(to)}"
+    if _has_cjk(body):
+        footer = (
+            "\n\n—\nMEDBOT Skywalker Team · 微创畅行（苏州）医疗科技\n"
+            f"如不希望再收到此类邮件，请点击退订：{link}"
+        )
+    else:
+        footer = (
+            "\n\n—\nMEDBOT Skywalker Team · MicroPort NaviBot (Suzhou)\n"
+            f"If you'd prefer not to receive these emails, unsubscribe here: {link}"
+        )
+    return body + footer
 
 
 @dataclass(frozen=True)
@@ -150,6 +208,9 @@ def send_email(
     try:
         account = _get_account()
 
+        # Every outbound email carries a compliant, per-recipient unsubscribe footer.
+        body_with_footer = append_unsubscribe_footer(body, to)
+
         kwargs: dict = {
             "account": account,
             "subject": subject,
@@ -157,9 +218,9 @@ def send_email(
         }
 
         if html:
-            kwargs["body"] = HTMLBody(body)
+            kwargs["body"] = HTMLBody(body_with_footer)
         else:
-            kwargs["body"] = body
+            kwargs["body"] = body_with_footer
 
         if cc:
             kwargs["cc_recipients"] = cc

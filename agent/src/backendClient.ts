@@ -33,6 +33,7 @@ export interface AddLeadsInput {
     category?: string;
     match_reason?: string;
     source?: string;
+    lead_type?: string;
   }>;
 }
 
@@ -53,9 +54,11 @@ type JsonObject = Record<string, unknown>;
 
 export class BackendClient {
   readonly #baseUrl: string;
+  readonly #serviceToken: string | undefined;
 
-  constructor(baseUrl: string) {
+  constructor(baseUrl: string, serviceToken?: string) {
     this.#baseUrl = baseUrl.replace(/\/+$/, "");
+    this.#serviceToken = serviceToken;
   }
 
   getProductProfile(options: BackendRequestOptions = {}): Promise<JsonObject> {
@@ -138,9 +141,18 @@ export class BackendClient {
     body?: object,
     options: BackendRequestOptions = {},
   ): Promise<JsonObject> {
+    const headers: Record<string, string> = {};
+    if (body) {
+      headers["Content-Type"] = "application/json";
+    }
+    if (this.#serviceToken) {
+      // Authenticate to the RBAC-protected backend as a trusted service principal.
+      headers["X-Service-Token"] = this.#serviceToken;
+    }
+
     const response = await fetch(`${this.#baseUrl}${path}`, {
       method,
-      headers: body ? { "Content-Type": "application/json" } : undefined,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
       body: body ? JSON.stringify(body) : undefined,
       signal: options.signal,
     });
