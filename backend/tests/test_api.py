@@ -1055,6 +1055,25 @@ def test_unsubscribe_link_suppresses_recipient(tmp_path, monkeypatch):
         assert "无效" in bad.text or "Invalid" in bad.text
 
 
+def test_unsubscribe_one_click_post_suppresses_without_html(tmp_path, monkeypatch):
+    """RFC 8058 target: mail clients POST here directly (no user interaction),
+    so it must not render an HTML page — just suppress and return empty 200."""
+    from app.email_service import make_unsubscribe_token
+
+    with _client(tmp_path, monkeypatch) as client:
+        token = make_unsubscribe_token("one-click@hospital.example")
+        response = client.post("/unsubscribe", params={"token": token})
+        assert response.status_code == 200
+        assert response.text == ""
+
+        supp = client.get("/admin/suppressions").json()
+        emails = [s["email"] for s in supp["suppressions"]]
+        assert "one-click@hospital.example" in emails
+
+        bad = client.post("/unsubscribe", params={"token": "garbage.deadbeef"})
+        assert bad.status_code == 400
+
+
 def test_suppressed_address_is_not_emailed(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         created = client.post(

@@ -51,11 +51,13 @@
 
 面向真实医生的冷邮件需要满足 CAN-SPAM / GDPR，系统内置三道合规机制：
 
-- **退订**：每封发出的邮件自动附带一个**按收件人签名**的退订链接（语言随正文中英自适应）。收件人点击 `GET /unsubscribe?token=...`（公开、无需登录）即被加入抑制名单并停止跟进。
+- **退订**：每封发出的邮件自动附带一个**按收件人签名**的退订链接（语言随正文中英自适应）。收件人点击 `GET /unsubscribe?token=...`（公开、无需登录）即被加入抑制名单并停止跟进。同时按 RFC 8058 设置了 `List-Unsubscribe` / `List-Unsubscribe-Post` 邮件头（`POST /unsubscribe` 是给邮箱客户端一键退订用的目标地址，不渲染网页），Gmail/Outlook/Yahoo 会据此在收件箱直接显示原生"退订"按钮，也是判断"正规发件人"、避免被判定为垃圾邮件的重要信号。
 - **抑制名单（do-not-email）**：抑制名单内的邮箱**永不发送**。来源包括：退订链接点击、回复"不感兴趣"自动入库、手动添加退信/投诉地址。所有发送入口（手动、自动、草稿批准、全部批准）都会在发送前检查并跳过，记录为 `suppressed` 状态。
 - **审计日志**：关键操作落库可追溯——登录、邮件发送、退订、抑制名单增删、用户/角色/权限变更、线索删除、系统设置变更（密钥值不记录）。
 
-接口：`GET /unsubscribe`（公开）；`GET/POST/DELETE /admin/suppressions`、`GET /admin/audit`（需 `users.manage`）。前端在「用户与权限」页的「抑制名单」「审计日志」两个标签管理。退订页可访问的对外地址由 `MEDBOT_PUBLIC_URL`（或 settings `public_base_url`）配置，默认 `http://localhost:8000`。
+接口：`GET/POST /unsubscribe`（公开）；`GET/POST/DELETE /admin/suppressions`、`GET /admin/audit`（需 `users.manage`）。前端在「用户与权限」页的「抑制名单」「审计日志」两个标签管理。退订页可访问的对外地址由 `MEDBOT_PUBLIC_URL`（或 settings `public_base_url`）配置，默认 `http://localhost:8000`。
+
+**反垃圾邮件（deliverability）**：除退订头外，系统还有发送节流（日上限/单域名上限/发送间隔）、默认草稿模式（人工审核后再发）、纯文本无附件邮件正文。`SPF`/`DKIM`/`DMARC` 是发件域名的 DNS 配置，应用层管不了，需要在企业邮箱/DNS 那边单独配置——这是比任何应用层策略优先级都高的一环。
 
 ### Agent 调用后端的服务令牌
 

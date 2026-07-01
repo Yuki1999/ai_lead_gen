@@ -4,7 +4,7 @@ from dataclasses import asdict
 import asyncio
 import logging
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -109,23 +109,41 @@ def create_app() -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/unsubscribe", response_class=HTMLResponse, include_in_schema=False)
-    def unsubscribe(token: str = Query(default="")) -> str:
-        """Public one-click unsubscribe target embedded in every outbound email."""
+    def _process_unsubscribe(token: str) -> str | None:
+        """Suppress the token's email and stop contacting any matching lead.
+        Returns the unsubscribed email, or None if the token is invalid."""
         email = verify_unsubscribe_token(token)
         if not email:
-            return _unsub_page("链接无效或已过期 / Invalid or expired link", ok=False)
+            return None
         db.add_suppression(email, reason="unsubscribe", source="email-link")
         db.add_audit(actor=email, action="unsubscribe", target_type="email", target_id=email)
         # If we know this lead, stop contacting it.
         for lead in db.list_leads():
             if str(lead.get("email", "")).strip().lower() == email.lower():
                 db.update_lead(int(lead["id"]), status="rejected")
+        return email
+
+    @app.get("/unsubscribe", response_class=HTMLResponse, include_in_schema=False)
+    def unsubscribe(token: str = Query(default="")) -> str:
+        """Public unsubscribe landing page a human sees after clicking the link
+        in an email, or the List-Unsubscribe header's URL in a mail client."""
+        email = _process_unsubscribe(token)
+        if not email:
+            return _unsub_page("链接无效或已过期 / Invalid or expired link", ok=False)
         return _unsub_page(
             f"已退订：{email}<br>您将不会再收到我们的邮件。<br><br>"
             f"You have been unsubscribed.<br>You will no longer receive emails from us.",
             ok=True,
         )
+
+    @app.post("/unsubscribe", include_in_schema=False)
+    def unsubscribe_one_click(token: str = Query(default="")) -> Response:
+        """RFC 8058 one-click unsubscribe target: mail clients (Gmail/Outlook/
+        Yahoo) POST here directly from the List-Unsubscribe-Post header with no
+        user interaction, so this must not render HTML — just process and
+        return an empty success response."""
+        email = _process_unsubscribe(token)
+        return Response(status_code=200 if email else 400)
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 

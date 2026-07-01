@@ -25,10 +25,33 @@ from exchangelib import (
     Configuration,
     Credentials,
     DELEGATE,
+    ExtendedProperty,
     HTMLBody,
     Mailbox,
     Message,
 )
+
+
+# RFC 8058 one-click unsubscribe headers. Exchange maps MAPI named properties
+# in the "InternetHeaders" property set directly onto outbound RFC 5322
+# headers, so this is the documented way to set arbitrary email headers via
+# EWS. Mail clients (Gmail/Outlook/Yahoo) use these to show a native
+# "Unsubscribe" button and treat the sender as a well-behaved bulk sender —
+# a real deliverability signal, not just a link in the body text.
+class _ListUnsubscribeHeader(ExtendedProperty):
+    distinguished_property_set_id = "InternetHeaders"
+    property_name = "List-Unsubscribe"
+    property_type = "String"
+
+
+class _ListUnsubscribePostHeader(ExtendedProperty):
+    distinguished_property_set_id = "InternetHeaders"
+    property_name = "List-Unsubscribe-Post"
+    property_type = "String"
+
+
+Message.register("list_unsubscribe_header", _ListUnsubscribeHeader)
+Message.register("list_unsubscribe_post_header", _ListUnsubscribePostHeader)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -74,9 +97,13 @@ def _has_cjk(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
 
+def unsubscribe_url(to: str) -> str:
+    return f"{public_base_url()}/unsubscribe?token={make_unsubscribe_token(to)}"
+
+
 def append_unsubscribe_footer(body: str, to: str) -> str:
     """Append a compliant unsubscribe footer (language matched to the body)."""
-    link = f"{public_base_url()}/unsubscribe?token={make_unsubscribe_token(to)}"
+    link = unsubscribe_url(to)
     if _has_cjk(body):
         footer = (
             "\n\n—\nMEDBOT Skywalker Team · 微创畅行（苏州）医疗科技\n"
@@ -215,6 +242,8 @@ def send_email(
             "account": account,
             "subject": subject,
             "to_recipients": [to],
+            "list_unsubscribe_header": f"<{unsubscribe_url(to)}>",
+            "list_unsubscribe_post_header": "List-Unsubscribe=One-Click",
         }
 
         if html:
