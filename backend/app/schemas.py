@@ -39,6 +39,7 @@ class LeadCreateRequest(BaseModel):
 class LeadUpdateRequest(BaseModel):
     status: str | None = Field(default=None, min_length=2, max_length=40)
     notes: str | None = Field(default=None, max_length=2000)
+    lead_type: str | None = Field(default=None, max_length=20)
 
 
 class OutreachRequest(BaseModel):

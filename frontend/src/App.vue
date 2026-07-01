@@ -36,7 +36,7 @@ import {
   X,
 } from "lucide-vue-next";
 import {
-  NAlert,
+  createDiscreteApi,
   NButton,
   NCard,
   NCheckbox,
@@ -48,6 +48,7 @@ import {
   NInputNumber,
   NSelect,
   NTag,
+  type ConfigProviderProps,
   type SelectOption,
 } from "naive-ui";
 import AdminPanel from "./components/AdminPanel.vue";
@@ -79,6 +80,7 @@ interface Lead {
   score: number;
   status: string;
   notes: string;
+  lead_type?: string;
   reply_count?: number;
   created_at?: string;
   updated_at?: string;
@@ -89,6 +91,10 @@ interface Metrics {
   interested_leads: number;
   sent_emails: number;
   human_review: number;
+  distributor_leads?: number;
+  kol_leads?: number;
+  distributor_qualified?: number;
+  kol_qualified?: number;
 }
 
 interface SearchResponse {
@@ -189,6 +195,9 @@ interface AgentTurn {
   stopped: boolean;
   startedAt: number;
   resultSummary?: { leadsAdded: number; draftsAdded: number };
+  /** Tool-call timeline starts expanded while running, then auto-collapses to
+   * a one-line summary once the turn finishes; the user can still toggle it. */
+  toolTimelineExpanded?: boolean;
 }
 
 interface AgentChatResponse {
@@ -374,6 +383,17 @@ const naiveThemeOverrides = {
       'Inter, "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   },
 };
+
+// Floating, auto-dismissing toasts instead of a static inline banner. Uses
+// naive-ui's discrete API (not useMessage()) because this is a single root
+// component, so there's no separate child component to host the provider.
+const configProviderPropsRef = computed<ConfigProviderProps>(() => ({
+  themeOverrides: naiveThemeOverrides,
+}));
+const { message } = createDiscreteApi(["message"], {
+  configProviderProps: configProviderPropsRef,
+  messageProviderProps: { placement: "top", duration: 3200, keepAliveOnHover: true },
+});
 const statusFilterOptions: SelectOption[] = [
   { label: "全部", value: "" },
   { label: "新线索", value: "new" },
@@ -383,6 +403,18 @@ const statusFilterOptions: SelectOption[] = [
   { label: "已确认", value: "qualified" },
   { label: "拒绝", value: "rejected" },
 ];
+const leadTypeFilterOptions: SelectOption[] = [
+  { label: "全部类型", value: "" },
+  { label: "代理商", value: "distributor" },
+  { label: "KOL", value: "kol" },
+];
+const leadTypeLabels: Record<string, string> = {
+  distributor: "代理商",
+  kol: "KOL",
+};
+function leadTypeLabel(leadType: string | undefined): string {
+  return leadTypeLabels[leadType || ""] || "未分类";
+}
 // Whitelist mirrors backend `_SORT_EXPRS` in backend/app/db.py — keep in sync.
 const sortFieldOptions: SelectOption[] = [
   { label: "最新入库", value: "id" },
@@ -415,6 +447,15 @@ const AGENT_TOOL_META: Record<string, { label: string; icon: typeof FileText }> 
 function toolMeta(name: string): { label: string; icon: typeof FileText } {
   return AGENT_TOOL_META[name] || { label: name, icon: Wrench };
 }
+function toggleToolTimeline(turn: AgentTurn): void {
+  turn.toolTimelineExpanded = !turn.toolTimelineExpanded;
+}
+function collapseToolTimelineIfClean(turn: AgentTurn): void {
+  // Keep it expanded if something failed — that's exactly when the detail
+  // is worth seeing without an extra click.
+  const hasFailure = Boolean(turn.error) || turn.toolCalls.some((c) => c.status === "error");
+  if (!hasFailure) turn.toolTimelineExpanded = false;
+}
 function renderTurnBlocks(text: string) {
   return parseMarkdown(text);
 }
@@ -444,14 +485,9 @@ const metrics = ref<Metrics>({
   human_review: 0,
 });
 const selectedLeadIds = ref<number[]>([]);
-const targetRegions = ref("Germany, United Arab Emirates, Singapore, Saudi Arabia");
-const productKeywords = ref(
-  "orthopedic implant distributor, total knee arthroplasty distributor, joint replacement distributor"
-);
-const maxResults = ref(5);
-const requireEmail = ref(true);
 const filterRegion = ref("");
 const filterStatus = ref("");
+const filterLeadType = ref("");
 const query = ref("");
 const sortField = ref("id");
 const sortDir = ref<"asc" | "desc">("desc");
@@ -460,7 +496,6 @@ const replyLeadId = ref<number | "">("");
 const replyText = ref(
   "We are interested. Please send product details, certificates, and partner requirements."
 );
-const lastEmail = ref<EmailEvent | null>(null);
 const analysis = ref<ReplyAnalysis | null>(null);
 const sourcePreview = ref<SourcePreview | null>(null);
 const sourcePreviewLead = ref<Lead | null>(null);
@@ -473,12 +508,11 @@ const currentAction = ref<"dashboard" | "search" | "outreach" | "reply" | "quali
 // Lead detail panel
 const detailLeadId = ref<number | null>(null);
 const detailStatus = ref("");
+const detailLeadType = ref("");
 const detailNotes = ref("");
 const detailOutreach = ref<EmailEvent[]>([]);
 const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
-const notice = ref("");
-const error = ref("");
 const agentPrompt = ref("");
 const agentSessionId = ref("default");
 const agentSessions = ref<AgentSessionRecord[]>([]);
@@ -722,6 +756,7 @@ async function loadDashboard(): Promise<void> {
   const params = new URLSearchParams();
   if (filterRegion.value) params.set("region", filterRegion.value);
   if (filterStatus.value) params.set("status", filterStatus.value);
+  if (filterLeadType.value) params.set("lead_type", filterLeadType.value);
   if (query.value) params.set("q", query.value);
   params.set("sort", sortField.value);
   params.set("order", sortDir.value);
@@ -756,7 +791,11 @@ async function approveDraft(eventId: number): Promise<void> {
       `/campaigns/drafts/${eventId}/approve`,
       { method: "POST" }
     );
-    notice.value = result.sent ? "已批准并发送" : result.ok ? "已批准" : "批准失败";
+    if (result.ok) {
+      message.success(result.sent ? "已批准并发送" : "已批准");
+    } else {
+      message.error("批准失败");
+    }
     await loadDrafts();
     await loadDashboard();
   });
@@ -765,7 +804,7 @@ async function approveDraft(eventId: number): Promise<void> {
 async function rejectDraft(eventId: number): Promise<void> {
   await runAction("outreach", async () => {
     await request(`/campaigns/drafts/${eventId}/reject`, { method: "POST" });
-    notice.value = "已拒绝";
+    message.success("已拒绝");
     await loadDrafts();
   });
 }
@@ -800,7 +839,7 @@ async function createLead(): Promise<void> {
       body: JSON.stringify(newLead.value),
     });
     showCreateLead.value = false;
-    notice.value = "线索已添加";
+    message.success("线索已添加");
     await loadDashboard();
   } catch (caught) {
     const msg = caught instanceof Error ? caught.message : "创建失败";
@@ -826,7 +865,7 @@ async function batchDeleteLeads(): Promise<void> {
       body: JSON.stringify({ lead_ids: selectedLeadIds.value }),
     });
     selectedLeadIds.value = [];
-    notice.value = "已批量删除";
+    message.success("已批量删除");
     await loadDashboard();
   });
 }
@@ -837,7 +876,7 @@ async function deleteLead(leadId: number): Promise<void> {
   await runAction("qualify", async () => {
     await request(`/leads/${leadId}`, { method: "DELETE" });
     closeLeadDetail();
-    notice.value = "线索已删除";
+    message.success("线索已删除");
     await loadDashboard();
   });
 }
@@ -850,7 +889,7 @@ async function approveAllDrafts(): Promise<void> {
       { method: "POST" }
     );
     const sentCount = result.results.filter((r) => r.sent).length;
-    notice.value = `已批准 ${result.total} 条，成功发送 ${sentCount} 条`;
+    message.success(`已批准 ${result.total} 条，成功发送 ${sentCount} 条`);
     await loadDrafts();
     await loadDashboard();
   });
@@ -872,41 +911,6 @@ async function loadAgentConfig(): Promise<void> {
   }
 }
 
-async function generateLeads(): Promise<void> {
-  await runAction("search", async () => {
-    const payload = await request<SearchResponse>("/leads/search", {
-      method: "POST",
-      body: JSON.stringify({
-        target_regions: splitCsv(targetRegions.value),
-        product_keywords: splitCsv(productKeywords.value),
-        max_results: maxResults.value,
-        real_search: true,
-        require_email: requireEmail.value,
-      }),
-    });
-    selectedLeadIds.value = payload.leads.map((lead) => lead.id);
-    notice.value =
-      payload.created_count > 0
-        ? `新增 ${payload.created_count} 条真实网页线索`
-        : "本轮未发现符合条件的公开邮箱线索";
-    await loadDashboard();
-  });
-}
-
-async function createOutreachRecords(): Promise<void> {
-  if (selectedLeadIds.value.length === 0) return;
-
-  await runAction("outreach", async () => {
-    const payload = await request<SendResponse>("/campaigns/outreach-records", {
-      method: "POST",
-      body: JSON.stringify({ lead_ids: selectedLeadIds.value }),
-    });
-    lastEmail.value = payload.events[payload.events.length - 1] || null;
-    notice.value = `已生成 ${payload.sent_count} 条触达记录`;
-    await loadDashboard();
-  });
-}
-
 async function syncReplies(): Promise<void> {
   await runAction("sync", async () => {
     const payload = await request<{
@@ -917,9 +921,9 @@ async function syncReplies(): Promise<void> {
     }>("/replies/sync", { method: "POST" });
     if (payload.synced > 0) {
       const companies = [...new Set(payload.items.map((i) => i.company))].join("、");
-      notice.value = `同步了 ${payload.synced} 条回复（${companies}），跳过 ${payload.skipped} 条`;
+      message.success(`同步了 ${payload.synced} 条回复（${companies}），跳过 ${payload.skipped} 条`);
     } else {
-      notice.value = `未发现新回复（扫描 ${payload.total_inbox} 封邮件）`;
+      message.success(`未发现新回复（扫描 ${payload.total_inbox} 封邮件）`);
     }
     await loadDashboard();
   });
@@ -934,7 +938,7 @@ async function analyzeCurrentReply(): Promise<void> {
         reply_text: replyText.value,
       }),
     });
-    notice.value = "回复已完成理解";
+    message.success("回复已完成理解");
     await loadDashboard();
   });
 }
@@ -1030,11 +1034,11 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
     error: "",
     stopped: false,
     startedAt: Date.now(),
+    toolTimelineExpanded: true,
   };
   turns.push(assistantTurn);
 
   agentError.value = "";
-  notice.value = "";
   if (sessionKey === agentSessionId.value) agentLiveStatus.value = "已发送，等待 Agent 响应";
   scrollAgentChatToBottom();
   startAgentElapsedTicker();
@@ -1108,6 +1112,7 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
       if (call.status === "running") call.status = assistantTurn.stopped ? "error" : "done";
     }
     assistantTurn.pending = false;
+    collapseToolTimelineIfClean(assistantTurn);
     if (agentAbortControllers.get(sessionKey) === controller) {
       agentAbortControllers.delete(sessionKey);
     }
@@ -1183,7 +1188,7 @@ async function fetchOutreachPreview(leadIds: number[]): Promise<void> {
     });
     outreachPreviews.value = payload.previews;
   } catch (caught) {
-    error.value = "生成邮件失败";
+    message.error("生成邮件失败");
     showOutreachPreview.value = false;
   } finally {
     outreachLoading.value = false;
@@ -1202,7 +1207,7 @@ async function confirmSendOutreach(): Promise<void> {
       body: JSON.stringify({ lead_ids: leadIds, custom_emails: customEmails }),
     });
     showOutreachPreview.value = false;
-    notice.value = payload.note || `已处理 ${payload.sent_count} 条外联`;
+    message.success(payload.note || `已处理 ${payload.sent_count} 条外联`);
     await loadDashboard();
   });
 }
@@ -1217,7 +1222,7 @@ async function reactivateLead(leadId: number): Promise<void> {
       method: "PATCH",
       body: JSON.stringify({ status: "new", notes: "重新激活" }),
     });
-    notice.value = "线索已重新激活";
+    message.success("线索已重新激活");
     await loadDashboard();
   });
 }
@@ -1228,7 +1233,7 @@ async function markQualified(leadId: number): Promise<void> {
       method: "PATCH",
       body: JSON.stringify({ status: "qualified", notes: "人工确认：渠道匹配，进入商务跟进。" }),
     });
-    notice.value = "已标记为 qualified";
+    message.success("已标记为 qualified");
     await loadDashboard();
   });
 }
@@ -1242,6 +1247,7 @@ async function openLeadDetail(leadId: number): Promise<void> {
   detailLoading.value = true;
   const lead = leads.value.find((l) => l.id === leadId);
   detailStatus.value = lead?.status ?? "";
+  detailLeadType.value = lead?.lead_type ?? "";
   detailNotes.value = lead?.notes ?? "";
   try {
     const history = await request<{
@@ -1266,19 +1272,25 @@ function closeLeadDetail(): void {
 }
 
 function goToReply(): void {
-  notice.value = "回复已自动同步和分析，点击行查看详情";
+  message.success("回复已自动同步和分析，点击行查看详情");
 }
 
 async function saveLeadDetail(): Promise<void> {
   if (detailLeadId.value === null) return;
   const lead = leads.value.find((l) => l.id === detailLeadId.value);
-  if (lead && lead.status === detailStatus.value && (lead.notes || "") === (detailNotes.value || "")) {
+  if (
+    lead &&
+    lead.status === detailStatus.value &&
+    (lead.lead_type || "") === (detailLeadType.value || "") &&
+    (lead.notes || "") === (detailNotes.value || "")
+  ) {
     return; // no change
   }
   await request<Lead>(`/leads/${detailLeadId.value!}`, {
     method: "PATCH",
     body: JSON.stringify({
       status: detailStatus.value || undefined,
+      lead_type: detailLeadType.value || undefined,
       notes: detailNotes.value || undefined,
     }),
   });
@@ -1359,13 +1371,6 @@ function setLeadSelection(leadId: number, checked: boolean): void {
   }
 }
 
-function splitCsv(value: string): string[] {
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1387,12 +1392,10 @@ async function runAction(
 ): Promise<void> {
   loading.value = true;
   currentAction.value = actionName;
-  error.value = "";
-  notice.value = "";
   try {
     await action();
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "请求失败";
+    message.error(caught instanceof Error ? caught.message : "请求失败");
   } finally {
     loading.value = false;
     currentAction.value = null;
@@ -1516,9 +1519,9 @@ async function saveSettings(): Promise<void> {
     settingsEmailPasswordInput.value = "";
     // Also sync agent config
     await saveAgentConfig();
-    notice.value = "设置已保存";
+    message.success("设置已保存");
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : "设置保存失败";
+    message.error(caught instanceof Error ? caught.message : "设置保存失败");
   } finally {
     settingsSaving.value = false;
   }
@@ -1544,7 +1547,7 @@ function toggleAgentSkillDetails(): void {
 
 async function copyAgentOutput(): Promise<void> {
   if (!agentOutputText.value) {
-    notice.value = "暂无 Agent 输出可复制";
+    message.warning("暂无 Agent 输出可复制");
     return;
   }
   await copyTextToClipboard(agentOutputText.value, "Agent 输出已复制");
@@ -1552,14 +1555,14 @@ async function copyAgentOutput(): Promise<void> {
 
 function downloadAgentOutput(): void {
   if (!agentOutputText.value) {
-    notice.value = "暂无 Agent 输出可导出";
+    message.warning("暂无 Agent 输出可导出");
     return;
   }
 
   const documentRef = globalThis.document;
   const urlApi = globalThis.URL;
   if (!documentRef || !urlApi?.createObjectURL) {
-    notice.value = "当前环境不支持文件导出";
+    message.warning("当前环境不支持文件导出");
     return;
   }
 
@@ -1573,7 +1576,7 @@ function downloadAgentOutput(): void {
   anchor.click();
   anchor.remove();
   urlApi.revokeObjectURL(objectUrl);
-  notice.value = "Agent 输出已导出为 Markdown";
+  message.success("Agent 输出已导出为 Markdown");
 }
 
 async function copyAgentSessionId(): Promise<void> {
@@ -1601,14 +1604,18 @@ async function copyTextToClipboard(text: string, successMessage: string): Promis
     const clipboard = globalThis.navigator?.clipboard;
     if (clipboard?.writeText) {
       await clipboard.writeText(text);
-      notice.value = successMessage;
+      message.success(successMessage);
       return;
     }
   } catch {
     // Fall through to the textarea fallback below.
   }
 
-  notice.value = fallbackCopyText(text) ? successMessage : "复制失败，请手动选择内容";
+  if (fallbackCopyText(text)) {
+    message.success(successMessage);
+  } else {
+    message.error("复制失败，请手动选择内容");
+  }
 }
 
 function fallbackCopyText(text: string): boolean {
@@ -1639,7 +1646,7 @@ function startNewAgentSession(): void {
     createNextAgentSession(getAgentStorage(), currentAgentSessionState()),
   );
   agentError.value = "";
-  notice.value = "已创建新的 Agent 会话";
+  message.success("已创建新的 Agent 会话");
 }
 
 function switchAgentSession(sessionId: string): void {
@@ -1648,7 +1655,7 @@ function switchAgentSession(sessionId: string): void {
     activateAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
   );
   agentError.value = "";
-  notice.value = "已切换 Agent 会话";
+  message.success("已切换 Agent 会话");
   scrollAgentChatToBottom();
 }
 
@@ -1694,7 +1701,7 @@ function removeAgentSession(sessionId: string): void {
   );
   delete agentTurnsBySession[sessionId];
   delete agentSessionResultTotals[sessionId];
-  notice.value = "已删除 Agent 会话";
+  message.success("已删除 Agent 会话");
 }
 
 function applyAgentSessionState(state: AgentSessionState): void {
@@ -1767,6 +1774,10 @@ function loadAgentHistoryFromStorage(): void {
         ...turn,
         pending: false,
         stopped: turn.pending ? true : turn.stopped,
+        // Reloaded turns are already finished — start their tool timelines
+        // collapsed unless something in them actually failed.
+        toolTimelineExpanded:
+          Boolean(turn.error) || turn.toolCalls.some((c) => c.status === "error"),
       }));
       let maxTurnId = 0;
       let maxToolCallId = 0;
@@ -1882,7 +1893,7 @@ function handleAgentStreamEvent(
     for (const call of turn.toolCalls) {
       if (call.status === "running") call.status = "done";
     }
-    if (viewing) notice.value = "Agent 已返回渠道拓展建议";
+    if (viewing) message.success("Agent 已返回渠道拓展建议");
     return;
   }
 
@@ -2197,114 +2208,6 @@ onBeforeUnmount(() => {
       </section>
 
       <main class="dashboard-grid" :class="{ 'agent-route': activePage === 'agent' }">
-        <section
-          v-if="false"
-          class="tool-panel workspace-ops-panel"
-          aria-labelledby="prospecting-title"
-        >
-          <n-card
-            v-if="productProfile"
-            class="product-panel product-summary-card"
-            aria-label="产品画像"
-            :bordered="false"
-          >
-            <div class="product-heading">
-              <span class="product-icon">
-                <FileText :size="20" aria-hidden="true" />
-              </span>
-              <div class="product-title-copy">
-                <p class="panel-label">产品画像</p>
-                <strong>{{ productProfile?.product_name }}</strong>
-                <span class="product-procedure">{{ productProfile?.procedure }}</span>
-              </div>
-            </div>
-            <p>{{ productProfile?.summary }}</p>
-            <div class="chip-row">
-              <span v-for="point in productProfile?.value_points.slice(0, 2)" :key="point">
-                {{ point }}
-              </span>
-            </div>
-            <small>
-              资料：{{ productProfile?.source_files.length }} PDF ·
-              {{ productProfile?.video_assets.length }} 视频
-            </small>
-          </n-card>
-
-          <div class="section-title step-title">
-            <span class="step-index">1</span>
-            <div>
-              <h2 id="prospecting-title">获客搜索</h2>
-              <p>按地区和关键词扫描公开网页邮箱</p>
-            </div>
-          </div>
-
-          <label class="field">
-            <span>目标地区</span>
-            <n-input v-model:value="targetRegions" clearable />
-          </label>
-
-          <label class="field">
-            <span>搜索关键词</span>
-            <n-input v-model:value="productKeywords" clearable />
-          </label>
-
-          <div class="field-row">
-            <label class="field compact">
-              <span>返回数量</span>
-              <n-input-number v-model:value="maxResults" :min="1" :max="50" />
-            </label>
-
-            <label class="toggle-field">
-              <n-checkbox v-model:checked="requireEmail">仅保存已发现邮箱</n-checkbox>
-            </label>
-          </div>
-
-          <n-button
-            class="primary-button"
-            type="primary"
-            size="large"
-            block
-            :loading="currentAction === 'search'"
-            :disabled="loading"
-            @click="generateLeads"
-          >
-            <template #icon>
-              <n-icon><Search /></n-icon>
-            </template>
-            {{ currentAction === "search" ? "搜索中..." : "实时搜索并入库" }}
-          </n-button>
-
-          <div class="section-title step-title offset">
-            <span class="step-index">2</span>
-            <div>
-              <h2>触达记录</h2>
-              <p>生成邮件草稿并记录触达动作</p>
-            </div>
-          </div>
-
-          <n-button
-            class="primary-button secondary"
-            type="info"
-            size="large"
-            block
-            :loading="currentAction === 'outreach'"
-            :disabled="loading || selectedCount === 0"
-            @click="createOutreachRecords"
-          >
-            <template #icon>
-              <n-icon><MailCheck /></n-icon>
-            </template>
-            {{ currentAction === "outreach" ? "生成中..." : "生成触达记录" }}
-          </n-button>
-          <p class="selection-copy">已选择 {{ selectedCount }} 个邮箱</p>
-
-          <n-card v-if="lastEmail" class="email-preview" aria-label="触达内容预览" :bordered="false">
-            <strong>{{ lastEmail?.subject }}</strong>
-            <span>{{ lastEmail?.sent_to }}</span>
-            <p>{{ lastEmail?.body }}</p>
-          </n-card>
-        </section>
-
         <section class="content-area" aria-label="线索和回复工作区">
           <section
             v-if="activePage === 'agent'"
@@ -2461,21 +2364,45 @@ onBeforeUnmount(() => {
                     <span class="ag-avatar"><Bot :size="16" aria-hidden="true" /></span>
                     <div class="ag-turn-body">
                       <div v-if="turn.toolCalls.length > 0" class="ag-tool-timeline">
-                        <div
-                          v-for="call in turn.toolCalls"
-                          :key="call.id"
-                          :class="['ag-tool-row', `ag-tool-${call.status}`]"
+                        <button
+                          type="button"
+                          class="ag-tool-summary"
+                          :aria-expanded="turn.toolTimelineExpanded ? 'true' : 'false'"
+                          @click="toggleToolTimeline(turn)"
                         >
-                          <span class="ag-tool-dot">
-                            <Loader2 v-if="call.status === 'running'" :size="12" class="ag-spin" aria-hidden="true" />
-                            <X v-else-if="call.status === 'error'" :size="12" aria-hidden="true" />
-                            <Check v-else :size="12" aria-hidden="true" />
+                          <Wrench :size="13" aria-hidden="true" />
+                          <span class="ag-tool-summary-label">
+                            {{
+                              turn.toolCalls.some((c) => c.status === 'running')
+                                ? "工具执行中…"
+                                : `已使用 ${turn.toolCalls.length} 个工具`
+                            }}
+                            <template v-if="turn.toolCalls.some((c) => c.status === 'error')"> · 有失败</template>
                           </span>
-                          <component :is="toolMeta(call.toolName).icon" :size="14" class="ag-tool-icon" aria-hidden="true" />
-                          <span class="ag-tool-label">{{ call.detail || toolMeta(call.toolName).label }}</span>
-                          <span class="ag-tool-status">
-                            {{ call.status === 'running' ? '执行中' : call.status === 'error' ? '失败' : '已完成' }}
-                          </span>
+                          <ChevronDown
+                            :size="14"
+                            class="ag-tool-summary-chevron"
+                            :class="{ 'ag-tool-summary-chevron-open': turn.toolTimelineExpanded }"
+                            aria-hidden="true"
+                          />
+                        </button>
+                        <div v-if="turn.toolTimelineExpanded" class="ag-tool-list">
+                          <div
+                            v-for="call in turn.toolCalls"
+                            :key="call.id"
+                            :class="['ag-tool-row', `ag-tool-${call.status}`]"
+                          >
+                            <span class="ag-tool-dot">
+                              <Loader2 v-if="call.status === 'running'" :size="12" class="ag-spin" aria-hidden="true" />
+                              <X v-else-if="call.status === 'error'" :size="12" aria-hidden="true" />
+                              <Check v-else :size="12" aria-hidden="true" />
+                            </span>
+                            <component :is="toolMeta(call.toolName).icon" :size="14" class="ag-tool-icon" aria-hidden="true" />
+                            <span class="ag-tool-label">{{ call.detail || toolMeta(call.toolName).label }}</span>
+                            <span class="ag-tool-status">
+                              {{ call.status === 'running' ? '执行中' : call.status === 'error' ? '失败' : '已完成' }}
+                            </span>
+                          </div>
                         </div>
                       </div>
 
@@ -2686,6 +2613,19 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
+        <div v-if="activePage === 'workspace'" class="lead-type-metrics" aria-label="线索分类统计">
+          <div class="lead-type-metric-card">
+            <span class="lead-type-metric-label">代理商</span>
+            <strong class="lead-type-metric-value">{{ metrics.distributor_leads ?? 0 }}</strong>
+            <span class="lead-type-metric-sub">已确认 {{ metrics.distributor_qualified ?? 0 }}</span>
+          </div>
+          <div class="lead-type-metric-card">
+            <span class="lead-type-metric-label">KOL</span>
+            <strong class="lead-type-metric-value">{{ metrics.kol_leads ?? 0 }}</strong>
+            <span class="lead-type-metric-sub">已确认 {{ metrics.kol_qualified ?? 0 }}</span>
+          </div>
+        </div>
+
         <div v-if="activePage === 'workspace'" class="toolbar" aria-label="筛选线索">
           <div class="toolbar-search">
             <Search :size="15" class="toolbar-search-icon" aria-hidden="true" />
@@ -2712,6 +2652,17 @@ onBeforeUnmount(() => {
               :key="String(opt.value)"
               :class="['status-chip', { active: filterStatus === opt.value }]"
               @click="filterStatus = filterStatus === opt.value ? '' : String(opt.value); runAction('dashboard', loadDashboard)"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+
+          <div class="status-chips">
+            <button
+              v-for="opt in leadTypeFilterOptions"
+              :key="String(opt.value)"
+              :class="['status-chip', 'lead-type-chip', { active: filterLeadType === opt.value }]"
+              @click="filterLeadType = filterLeadType === opt.value ? '' : String(opt.value); runAction('dashboard', loadDashboard)"
             >
               {{ opt.label }}
             </button>
@@ -2818,7 +2769,7 @@ onBeforeUnmount(() => {
           <n-empty
             v-if="leads.length === 0"
             class="empty-state"
-            description="点击左侧'实时搜索并入库'后，结果会显示在这里。"
+            description="前往「渠道拓展 Agent」用对话搜索线索，结果会显示在这里。"
           >
             <template #icon>
               <n-icon><Globe2 /></n-icon>
@@ -2846,6 +2797,9 @@ onBeforeUnmount(() => {
                 <strong class="lead-name">{{ lead.company_name }}</strong>
                 <n-tag :type="statusTagType(lead.status)" size="small" round :bordered="false">
                   {{ formatStatus(lead.status) }}
+                </n-tag>
+                <n-tag :type="lead.lead_type === 'kol' ? 'warning' : 'info'" size="small" round :bordered="false">
+                  {{ leadTypeLabel(lead.lead_type) }}
                 </n-tag>
                 <span class="lead-region">{{ lead.country === lead.region ? lead.country : `${lead.country} · ${lead.region}` }}</span>
                 <span class="lead-category">{{ lead.category }}</span>
@@ -2918,6 +2872,10 @@ onBeforeUnmount(() => {
                   <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
                 </label>
                 <label class="field">
+                  <span>分类</span>
+                  <n-select v-model:value="detailLeadType" :options="leadTypeFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
+                </label>
+                <label class="field">
                   <span>备注</span>
                   <n-input
                     v-model:value="detailNotes"
@@ -2977,15 +2935,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </section>
-        </div>
-
-        <div class="feedback" aria-live="polite">
-          <n-alert v-if="notice" class="notice" type="success" :show-icon="false">
-            {{ notice }}
-          </n-alert>
-          <n-alert v-if="error" class="error" type="error" :show-icon="false">
-            {{ error }}
-          </n-alert>
         </div>
       </section>
 

@@ -1268,6 +1268,39 @@ textarea::placeholder {
   font-weight: 900;
 }
 
+.lead-type-metrics {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.lead-type-metric-card {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #ffffff;
+}
+
+.lead-type-metric-label {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--text-muted);
+}
+
+.lead-type-metric-value {
+  font-size: 18px;
+  font-weight: 900;
+  color: var(--text);
+}
+
+.lead-type-metric-sub {
+  font-size: 11.5px;
+  color: var(--text-soft);
+}
+
 .toolbar-region-input {
   width: 100px;
   height: 30px;
@@ -1987,31 +2020,16 @@ textarea::placeholder {
   line-height: 1.5;
 }
 
-.feedback {
-  display: grid;
-  gap: 8px;
-}
-
-.notice,
-.error {
+.notice {
   border-radius: var(--radius);
   margin: 0;
   padding: 10px 12px;
   font-size: 13px;
   font-weight: 800;
   line-height: 1.45;
-}
-
-.notice {
   border: 1px solid #bbf7d0;
   background: var(--success-soft);
   color: var(--success);
-}
-
-.error {
-  border: 1px solid #fecaca;
-  background: var(--danger-soft);
-  color: var(--danger);
 }
 
 .ag-shell {
@@ -2248,7 +2266,28 @@ textarea::placeholder {
 }
 .ag-turn-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 640px; }
 
-.ag-tool-timeline { display: flex; flex-direction: column; gap: 2px; }
+.ag-tool-timeline { display: flex; flex-direction: column; gap: 6px; }
+.ag-tool-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  align-self: flex-start;
+  max-width: 100%;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.ag-tool-summary:hover { background: var(--primary-soft); border-color: var(--primary-soft); color: var(--primary-strong); }
+.ag-tool-summary-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ag-tool-summary-chevron { flex-shrink: 0; transition: transform 0.15s ease; }
+.ag-tool-summary-chevron-open { transform: rotate(180deg); }
+.ag-tool-list { display: flex; flex-direction: column; gap: 2px; }
 .ag-tool-row {
   display: flex;
   align-items: center;

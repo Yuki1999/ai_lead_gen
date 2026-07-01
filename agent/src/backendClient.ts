@@ -19,7 +19,12 @@ export interface FetchUrlInput {
 export interface ListLeadsInput {
   region?: string;
   status?: string;
+  lead_type?: string;
   q?: string;
+}
+
+export interface GetScoringRulesInput {
+  lead_type?: string;
 }
 
 export interface AddLeadsInput {
@@ -83,8 +88,12 @@ export class BackendClient {
     return this.#request("GET", "/product/profile", undefined, options);
   }
 
-  getScoringRules(options: BackendRequestOptions = {}): Promise<JsonObject> {
-    return this.#request("GET", "/scoring/rules", undefined, options);
+  getScoringRules(
+    input: GetScoringRulesInput = {},
+    options: BackendRequestOptions = {},
+  ): Promise<JsonObject> {
+    const leadType = input.lead_type === "kol" ? "kol" : "distributor";
+    return this.#request("GET", `/scoring/rules?lead_type=${leadType}`, undefined, options);
   }
 
   searchLeads(
@@ -127,6 +136,7 @@ export class BackendClient {
     const params = new URLSearchParams();
     appendQueryParam(params, "region", input.region);
     appendQueryParam(params, "status", input.status);
+    appendQueryParam(params, "lead_type", input.lead_type);
     appendQueryParam(params, "q", input.q);
     const query = params.toString();
 

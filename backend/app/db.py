@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from app.services import CandidateLead, RenderedEmail, ReplyAnalysis
+from app.services import CandidateLead, RenderedEmail, ReplyAnalysis, infer_lead_type
 
 
 def get_db_path() -> Path:
@@ -176,6 +176,16 @@ def init_db() -> None:
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
     now = _now()
     payload = asdict(lead) | {"created_at": now, "updated_at": now}
+    # Resolve and persist lead_type at insert time instead of leaving it blank
+    # and re-inferring on every email render — the classification needs to be
+    # a stable, queryable column for filtering/dashboards/scoring-rule choice.
+    if not str(payload.get("lead_type") or "").strip():
+        payload["lead_type"] = infer_lead_type(lead)
+    # Every lead-creation path constructs a CandidateLead with the "new"
+    # default; apply the configured score thresholds here so a lead's initial
+    # status actually reflects its score instead of always starting at "new".
+    if payload["status"] == "new":
+        payload["status"] = status_for_score(int(payload["score"]), lead_type=payload.get("lead_type"))
     with connect() as connection:
         cursor = connection.execute(
             """
@@ -212,6 +222,7 @@ def list_leads(
     *,
     region: str | None = None,
     status: str | None = None,
+    lead_type: str | None = None,
     q: str | None = None,
     sort: str = "id",
     order: str = "desc",
@@ -224,6 +235,9 @@ def list_leads(
     if status:
         filters.append("status = :status")
         params["status"] = status
+    if lead_type:
+        filters.append("lead_type = :lead_type")
+        params["lead_type"] = lead_type
     if q:
         filters.append(
             "(company_name LIKE :q OR email LIKE :q OR country LIKE :q OR category LIKE :q)"
@@ -276,6 +290,7 @@ def update_lead(
     *,
     status: str | None = None,
     notes: str | None = None,
+    lead_type: str | None = None,
 ) -> dict[str, Any] | None:
     current = get_lead(lead_id)
     if current is None:
@@ -283,14 +298,15 @@ def update_lead(
 
     updated_status = status if status is not None else current["status"]
     updated_notes = notes if notes is not None else current["notes"]
+    updated_lead_type = lead_type if lead_type is not None else current["lead_type"]
     with connect() as connection:
         connection.execute(
             """
             UPDATE leads
-            SET status = ?, notes = ?, updated_at = ?
+            SET status = ?, notes = ?, lead_type = ?, updated_at = ?
             WHERE id = ?
             """,
-            (updated_status, updated_notes, _now(), lead_id),
+            (updated_status, updated_notes, updated_lead_type, _now(), lead_id),
         )
         return get_lead(lead_id, connection=connection)
 
@@ -524,11 +540,27 @@ def metrics() -> dict[str, int]:
         human_review = connection.execute(
             "SELECT COUNT(*) FROM leads WHERE status = 'human_review'"
         ).fetchone()[0]
+        distributor_leads = connection.execute(
+            "SELECT COUNT(*) FROM leads WHERE lead_type = 'distributor'"
+        ).fetchone()[0]
+        kol_leads = connection.execute(
+            "SELECT COUNT(*) FROM leads WHERE lead_type = 'kol'"
+        ).fetchone()[0]
+        distributor_qualified = connection.execute(
+            "SELECT COUNT(*) FROM leads WHERE lead_type = 'distributor' AND status = 'qualified'"
+        ).fetchone()[0]
+        kol_qualified = connection.execute(
+            "SELECT COUNT(*) FROM leads WHERE lead_type = 'kol' AND status = 'qualified'"
+        ).fetchone()[0]
     return {
         "total_leads": total_leads,
         "interested_leads": interested,
         "sent_emails": sent,
         "human_review": human_review,
+        "distributor_leads": distributor_leads,
+        "kol_leads": kol_leads,
+        "distributor_qualified": distributor_qualified,
+        "kol_qualified": kol_qualified,
     }
 
 
@@ -989,11 +1021,18 @@ def get_all_settings() -> dict[str, str]:
 
 
 # ── Lead scoring rules ───────────────────────────────────
-# Stored as a single JSON blob under the settings table. Defaults mirror the
-# overseas-distributor-prospecting SKILL.md Step 5 rules verbatim, so behavior
-# is unchanged until an admin actually customizes them.
+# Stored as a JSON blob per lead_type under the settings table. Defaults
+# mirror the overseas-distributor-prospecting SKILL.md Step 5 rules verbatim,
+# so behavior is unchanged until an admin actually customizes them.
+#
+# "scoring_rules" is the legacy single-set key (pre-dates the distributor/KOL
+# split) and is kept as the distributor key so any rules an admin already
+# customized are not silently discarded.
 
-_SCORING_RULES_SETTING_KEY = "scoring_rules"
+_SCORING_RULES_SETTING_KEYS = {
+    "distributor": "scoring_rules",
+    "kol": "scoring_rules_kol",
+}
 
 DEFAULT_SCORING_RULES: dict[str, Any] = {
     "weights": [
@@ -1027,22 +1066,89 @@ DEFAULT_SCORING_RULES: dict[str, Any] = {
     ],
 }
 
+# Mirrors SKILL.md Step 5 "KOL-specific scoring" — distinct from the
+# distributor rules above because the evidence that matters for a surgeon
+# (case volume, robotic experience, academic output) is nothing like what
+# matters for a distribution company.
+DEFAULT_KOL_SCORING_RULES: dict[str, Any] = {
+    "weights": [
+        {"key": "clinical_volume_fit", "label": "临床/手术量匹配度", "percent": 40},
+        {"key": "market_priority", "label": "目标市场战略优先级", "percent": 25},
+        {"key": "academic_brand", "label": "学术/品牌公开资历", "percent": 20},
+        {"key": "contact_availability", "label": "联系方式可用性", "percent": 10},
+        {"key": "mentorship_evidence", "label": "带教/机构合作证据（加分项）", "percent": 5},
+    ],
+    "positive_rules": [
+        {"points": 25, "description": "手术量证据充分（约150+ TKA/年）或有机器人/导航手术经验"},
+        {"points": 20, "description": "有'首例'类里程碑成就（本国/本地区首例机器人或导航手术等）"},
+        {"points": 15, "description": "有学术产出：骨科期刊发表论文，或具名教授/研究职称"},
+        {"points": 15, "description": "有会议/同行影响力：AAOS/AAHKS/CAOS 或区域关节置换学会演讲者，或学会任职"},
+        {"points": 10, "description": "任职于教学医院、学术医学中心或专科培训项目"},
+        {"points": 10, "description": "有带教、培训同行或接待观摩医生的记录"},
+        {"points": 10, "description": "有可见的商务/专业邮箱或官方联系方式"},
+        {"points": 5, "description": "所在机构或职务覆盖战略优先目标市场"},
+    ],
+    "negative_rules": [
+        {"points": -20, "description": "来源证据薄弱或间接（仅医院人员名录，无手术/学术细节）"},
+        {"points": -30, "description": "无手术量、机器人/导航经验或学术产出证据，缺乏可个性化的信息"},
+        {"points": -40, "description": "确认为重复线索"},
+    ],
+    "thresholds": [
+        {"min": 80, "max": 100, "status": "qualified", "label": "强匹配"},
+        {"min": 60, "max": 79, "status": "new", "label": "中度匹配"},
+        {"min": 40, "max": 59, "status": "human_review", "label": "需人工核验"},
+        {"min": 0, "max": 39, "status": "rejected", "label": "弱匹配/建议拒绝"},
+    ],
+}
 
-def get_scoring_rules() -> dict[str, Any]:
-    raw = get_setting(_SCORING_RULES_SETTING_KEY, "")
+DEFAULT_SCORING_RULES_BY_TYPE: dict[str, dict[str, Any]] = {
+    "distributor": DEFAULT_SCORING_RULES,
+    "kol": DEFAULT_KOL_SCORING_RULES,
+}
+
+
+def _normalize_scoring_lead_type(lead_type: str | None) -> str:
+    return "kol" if str(lead_type or "").strip().lower() == "kol" else "distributor"
+
+
+def get_scoring_rules(lead_type: str | None = None) -> dict[str, Any]:
+    normalized = _normalize_scoring_lead_type(lead_type)
+    setting_key = _SCORING_RULES_SETTING_KEYS[normalized]
+    defaults = DEFAULT_SCORING_RULES_BY_TYPE[normalized]
+    raw = get_setting(setting_key, "")
     if not raw:
-        return {**DEFAULT_SCORING_RULES, "updated_at": ""}
+        return {**defaults, "updated_at": ""}
     try:
         parsed = json.loads(raw)
     except (ValueError, TypeError):
-        return {**DEFAULT_SCORING_RULES, "updated_at": ""}
+        return {**defaults, "updated_at": ""}
     parsed.setdefault("updated_at", "")
     return parsed
 
 
-def set_scoring_rules(rules: dict[str, Any]) -> dict[str, Any]:
+def status_for_score(score: int, lead_type: str | None = None) -> str:
+    """Map a lead score to its initial status using the admin-configured
+    thresholds for that lead type, falling back to defaults if none/invalid
+    are configured."""
+    normalized = _normalize_scoring_lead_type(lead_type)
+    thresholds = get_scoring_rules(normalized).get("thresholds") or DEFAULT_SCORING_RULES_BY_TYPE[normalized]["thresholds"]
+    for rule in thresholds:
+        try:
+            lo, hi = int(rule["min"]), int(rule["max"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lo <= score <= hi:
+            status = str(rule.get("status") or "").strip()
+            if status:
+                return status
+    return "new"
+
+
+def set_scoring_rules(rules: dict[str, Any], lead_type: str | None = None) -> dict[str, Any]:
+    normalized = _normalize_scoring_lead_type(lead_type)
+    setting_key = _SCORING_RULES_SETTING_KEYS[normalized]
     payload = {**rules, "updated_at": _now()}
-    set_setting(_SCORING_RULES_SETTING_KEY, json.dumps(payload))
+    set_setting(setting_key, json.dumps(payload))
     return payload
 
 

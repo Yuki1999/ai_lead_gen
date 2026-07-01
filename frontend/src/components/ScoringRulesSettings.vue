@@ -32,6 +32,11 @@ const props = defineProps<{
 const loading = ref(true);
 const saving = ref(false);
 const toast = ref<{ text: string; kind: "ok" | "err" } | null>(null);
+const activeType = ref<"distributor" | "kol">("distributor");
+const typeTabs: { value: "distributor" | "kol"; label: string }[] = [
+  { value: "distributor", label: "代理商" },
+  { value: "kol", label: "KOL" },
+];
 const rules = ref<ScoringRules>({
   weights: [],
   positive_rules: [],
@@ -72,12 +77,18 @@ function fmtTime(iso: string): string {
 async function load(): Promise<void> {
   loading.value = true;
   try {
-    rules.value = await props.request<ScoringRules>("/scoring/rules");
+    rules.value = await props.request<ScoringRules>(`/scoring/rules?lead_type=${activeType.value}`);
   } catch (e) {
     flash(errText(e), "err");
   } finally {
     loading.value = false;
   }
+}
+
+function switchType(type: "distributor" | "kol"): void {
+  if (type === activeType.value) return;
+  activeType.value = type;
+  void load();
 }
 
 async function save(): Promise<void> {
@@ -92,7 +103,7 @@ async function save(): Promise<void> {
   }
   saving.value = true;
   try {
-    rules.value = await props.request<ScoringRules>("/scoring/rules", {
+    rules.value = await props.request<ScoringRules>(`/scoring/rules?lead_type=${activeType.value}`, {
       method: "PUT",
       body: JSON.stringify({
         weights: rules.value.weights,
@@ -101,7 +112,7 @@ async function save(): Promise<void> {
         thresholds: rules.value.thresholds,
       }),
     });
-    flash("评分规则已保存，Agent 下次打分时会读取新规则");
+    flash(`${activeType.value === "kol" ? "KOL" : "代理商"}评分规则已保存，Agent 下次打分时会读取新规则`);
   } catch (e) {
     flash(errText(e), "err");
   } finally {
@@ -150,6 +161,24 @@ onMounted(load);
       </div>
       <button class="btn-ghost" type="button" @click="load"><RotateCcw :size="14" /> 刷新</button>
     </div>
+
+    <div class="sr-type-tabs" role="tablist" aria-label="线索分类">
+      <button
+        v-for="tab in typeTabs"
+        :key="tab.value"
+        type="button"
+        role="tab"
+        :aria-selected="activeType === tab.value"
+        :class="['sr-type-tab', { active: activeType === tab.value }]"
+        @click="switchType(tab.value)"
+      >
+        {{ tab.label }}
+      </button>
+    </div>
+    <p class="sr-type-hint">
+      代理商和 KOL 各自独立配置一套评分规则，互不影响；Agent 调 <code>get_scoring_rules</code>
+      时会按线索的 <code>lead_type</code> 取对应的一套。
+    </p>
 
     <transition name="sr-fade">
       <div v-if="toast" :class="['sr-toast', toast.kind]">{{ toast.text }}</div>
@@ -270,6 +299,16 @@ onMounted(load);
 .sr-toast.err { background: #fef2f2; color: #b91c1c; }
 .sr-fade-enter-active, .sr-fade-leave-active { transition: opacity 200ms ease; }
 .sr-fade-enter-from, .sr-fade-leave-to { opacity: 0; }
+
+.sr-type-tabs { display: flex; gap: 6px; }
+.sr-type-tab {
+  border: 1px solid #e2e8f0; background: #fff; color: #64748b;
+  border-radius: 999px; padding: 6px 16px; font-size: 13px; font-weight: 700; cursor: pointer;
+}
+.sr-type-tab:hover { border-color: #cbd5e1; color: #0f172a; }
+.sr-type-tab.active { border-color: #2563eb; background: #eff6ff; color: #1d4ed8; }
+.sr-type-hint { margin: -6px 0 0; font-size: 12px; color: #94a3b8; line-height: 1.6; }
+.sr-type-hint code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
 
 .sr-loading { padding: 40px; text-align: center; color: #94a3b8; }
 .sr-updated { margin: -6px 0 0; font-size: 12px; color: #94a3b8; }

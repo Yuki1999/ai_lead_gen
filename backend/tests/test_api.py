@@ -96,6 +96,105 @@ def test_batch_create_leads_rejects_out_of_range_score(tmp_path, monkeypatch):
     assert response.status_code == 422
 
 
+def test_batch_create_leads_derives_status_from_score_thresholds(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Strong Fit Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@strong-fit.example",
+                    "score": 90,
+                },
+                {
+                    "company_name": "Needs Review Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@needs-review.example",
+                    "score": 45,
+                },
+                {
+                    "company_name": "Weak Fit Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@weak-fit.example",
+                    "score": 10,
+                },
+            ],
+        )
+
+    leads = created.json()["leads"]
+    assert leads[0]["status"] == "qualified"
+    assert leads[1]["status"] == "human_review"
+    assert leads[2]["status"] == "rejected"
+
+
+def test_batch_create_leads_dedups_against_existing_leads(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        first = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Existing Ortho",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@existing-ortho.example",
+                    "score": 80,
+                }
+            ],
+        )
+        second = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Existing Ortho",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@existing-ortho.example",
+                    "score": 80,
+                },
+                {
+                    "company_name": "New Ortho",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@new-ortho.example",
+                    "score": 80,
+                },
+            ],
+        )
+
+    assert first.json()["created_count"] == 1
+    assert second.json()["created_count"] == 1
+    assert second.json()["leads"][0]["company_name"] == "New Ortho"
+
+
+def test_batch_create_leads_dedups_within_the_same_batch(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Same Company Twice",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@same-company.example",
+                    "score": 80,
+                },
+                {
+                    "company_name": "Same Company Twice",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@same-company.example",
+                    "score": 80,
+                },
+            ],
+        )
+
+    assert created.json()["created_count"] == 1
+
+
 def test_product_profile_endpoint_reads_root_assets(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         response = client.get("/product/profile")
@@ -300,6 +399,31 @@ def test_update_lead_status_and_notes(tmp_path, monkeypatch):
     assert updated.status_code == 200
     assert updated.json()["status"] == "qualified"
     assert updated.json()["notes"] == "Owner confirmed channel fit."
+
+
+def test_update_lead_reclassifies_lead_type(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Misclassified Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@misclassified.example",
+                    "lead_type": "distributor",
+                    "score": 70,
+                }
+            ],
+        )
+        lead_id = created.json()["leads"][0]["id"]
+
+        updated = client.patch(f"/leads/{lead_id}", json={"lead_type": "kol"})
+        rejected = client.patch(f"/leads/{lead_id}", json={"lead_type": "not-a-real-type"})
+
+    assert updated.status_code == 200
+    assert updated.json()["lead_type"] == "kol"
+    assert rejected.status_code == 400
 
 
 def test_source_preview_endpoint_returns_page_text_and_email_match(tmp_path, monkeypatch):
@@ -1148,6 +1272,116 @@ def test_update_scoring_rules_persists_and_requires_settings_manage(tmp_path, mo
         _authenticate(c2, "score_reader", "reader123x")
         assert c2.get("/scoring/rules").status_code == 200
         assert c2.put("/scoring/rules", json=custom).status_code == 403
+
+
+def test_scoring_rules_kol_and_distributor_are_independent(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        distributor_defaults = client.get("/scoring/rules").json()
+        kol_defaults = client.get("/scoring/rules", params={"lead_type": "kol"}).json()
+
+        # Defaults differ — KOL rules are not just the distributor rules relabeled.
+        assert distributor_defaults["weights"][0]["key"] == "channel_fit"
+        assert kol_defaults["weights"][0]["key"] == "clinical_volume_fit"
+        assert distributor_defaults["positive_rules"] != kol_defaults["positive_rules"]
+
+        # Updating one set never touches the other.
+        kol_custom = {
+            "weights": [{"key": "clinical_volume_fit", "label": "临床匹配度", "percent": 100}],
+            "positive_rules": [{"points": 50, "description": "自定义KOL规则"}],
+            "negative_rules": [{"points": -50, "description": "自定义KOL扣分"}],
+            "thresholds": [{"min": 0, "max": 100, "status": "new", "label": "全部待核验"}],
+        }
+        client.put("/scoring/rules", params={"lead_type": "kol"}, json=kol_custom)
+
+        distributor_after = client.get("/scoring/rules").json()
+        kol_after = client.get("/scoring/rules", params={"lead_type": "kol"}).json()
+        assert distributor_after == distributor_defaults
+        assert kol_after["positive_rules"][0]["description"] == "自定义KOL规则"
+
+
+def test_leads_filter_by_lead_type(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Dr. Filter Test",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "surgeon@filter-test.example",
+                    "lead_type": "kol",
+                    "score": 80,
+                },
+                {
+                    "company_name": "Filter Test Distribution",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@filter-test-distribution.example",
+                    "lead_type": "distributor",
+                    "score": 80,
+                },
+            ],
+        )
+
+        kol_only = client.get("/leads", params={"lead_type": "kol"}).json()
+        distributor_only = client.get("/leads", params={"lead_type": "distributor"}).json()
+
+    assert kol_only["total"] == 1
+    assert kol_only["leads"][0]["company_name"] == "Dr. Filter Test"
+    assert distributor_only["total"] == 1
+    assert distributor_only["leads"][0]["company_name"] == "Filter Test Distribution"
+
+
+def test_batch_create_leads_infers_and_persists_lead_type_when_unset(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Auto Infer Distribution Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@auto-infer-distribution.example",
+                    "category": "orthopedic implant distributor",
+                    "score": 70,
+                }
+            ],
+        )
+
+    # lead_type wasn't supplied — insert_lead must resolve and persist it,
+    # not leave it blank for every downstream query/dashboard to re-infer.
+    assert created.json()["leads"][0]["lead_type"] == "distributor"
+
+
+def test_dashboard_metrics_break_down_leads_by_type(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Metrics KOL",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "kol@metrics-test.example",
+                    "lead_type": "kol",
+                    "score": 90,
+                },
+                {
+                    "company_name": "Metrics Distributor",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "dist@metrics-test.example",
+                    "lead_type": "distributor",
+                    "score": 90,
+                },
+            ],
+        )
+        metrics = client.get("/metrics").json()
+
+    assert metrics["kol_leads"] >= 1
+    assert metrics["distributor_leads"] >= 1
+    assert metrics["kol_qualified"] >= 1
+    assert metrics["distributor_qualified"] >= 1
 
 
 def test_leads_sort_multiple_fields(tmp_path, monkeypatch):

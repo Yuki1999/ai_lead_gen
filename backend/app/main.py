@@ -384,11 +384,14 @@ def create_app() -> FastAPI:
         response_model=ScoringRulesResponse,
         dependencies=[Depends(get_current_principal)],
     )
-    def scoring_rules() -> dict[str, object]:
-        """Current lead-scoring weights/rules. Readable by any authenticated
-        principal (including the Agent's delegated/service token) so the
-        prospecting skill can fetch live values instead of hardcoded ones."""
-        return db.get_scoring_rules()
+    def scoring_rules(
+        lead_type: str = Query(default="distributor", description="distributor 或 kol，两套规则独立配置。"),
+    ) -> dict[str, object]:
+        """Current lead-scoring weights/rules for the given lead type. Readable
+        by any authenticated principal (including the Agent's delegated/service
+        token) so the prospecting skill can fetch live values instead of
+        hardcoded ones."""
+        return db.get_scoring_rules(lead_type)
 
     @app.put(
         "/scoring/rules",
@@ -397,10 +400,11 @@ def create_app() -> FastAPI:
     )
     def update_scoring_rules(
         request: ScoringRulesUpdateRequest,
+        lead_type: str = Query(default="distributor", description="distributor 或 kol，两套规则独立配置。"),
         principal: Principal = Depends(require("settings.manage")),
     ) -> dict[str, object]:
-        updated = db.set_scoring_rules(request.model_dump())
-        db.add_audit(actor=principal.username, action="scoring_rules.update")
+        updated = db.set_scoring_rules(request.model_dump(), lead_type)
+        db.add_audit(actor=principal.username, action="scoring_rules.update", detail=lead_type)
         return updated
 
     @app.post("/agent/chat", response_model=AgentChatResponse, dependencies=[Depends(require("agent.use"))])
@@ -464,9 +468,8 @@ def create_app() -> FastAPI:
     @app.post("/leads/batch", status_code=201, dependencies=[Depends(require("leads.edit"))])
     def batch_create_leads(request: list[LeadCreateRequest]) -> dict[str, object]:
         """Batch create leads (used by Agent to save discovered leads)."""
-        created = []
-        for item in request:
-            lead = CandidateLead(
+        candidates = [
+            CandidateLead(
                 company_name=item.company_name,
                 region=item.region,
                 country=item.country,
@@ -481,7 +484,12 @@ def create_app() -> FastAPI:
                 notes="Agent discovered",
                 lead_type=item.lead_type,
             )
-            created.append(db.insert_lead(lead))
+            for item in request
+        ]
+        # Dedup against existing leads — do not rely solely on the Agent
+        # remembering to call list_leads before add_leads.
+        candidates = _filter_existing_leads(candidates)
+        created = [db.insert_lead(candidate) for candidate in candidates]
         return {"created_count": len(created), "leads": created}
 
     @app.post("/leads", status_code=201, dependencies=[Depends(require("leads.edit"))])
@@ -535,6 +543,7 @@ def create_app() -> FastAPI:
     def list_leads(
         region: str | None = Query(default=None),
         status: str | None = Query(default=None),
+        lead_type: str | None = Query(default=None, description="distributor 或 kol，留空为全部。"),
         q: str | None = Query(default=None),
         sort: str = Query(
             default="id",
@@ -549,7 +558,7 @@ def create_app() -> FastAPI:
             description="\u6392\u5e8f\u65b9\u5411\uff1aasc \u6216 desc\uff0c\u9ed8\u8ba4 desc\u3002",
         ),
     ) -> dict[str, object]:
-        leads = db.list_leads(region=region, status=status, q=q, sort=sort, order=order)
+        leads = db.list_leads(region=region, status=status, lead_type=lead_type, q=q, sort=sort, order=order)
         return {"total": len(leads), "leads": leads}
 
     @app.get("/sources/preview", dependencies=[Depends(require("leads.search"))])
@@ -592,7 +601,14 @@ def create_app() -> FastAPI:
 
     @app.patch("/leads/{lead_id}", dependencies=[Depends(require("leads.edit"))])
     def update_lead(lead_id: int, request: LeadUpdateRequest) -> dict[str, object]:
-        updated = db.update_lead(lead_id, status=request.status, notes=request.notes)
+        if request.lead_type is not None and request.lead_type not in ("distributor", "kol"):
+            raise HTTPException(status_code=400, detail="lead_type must be 'distributor' or 'kol'")
+        updated = db.update_lead(
+            lead_id,
+            status=request.status,
+            notes=request.notes,
+            lead_type=request.lead_type,
+        )
         if updated is None:
             raise HTTPException(status_code=404, detail="Lead not found")
         return updated
@@ -1223,6 +1239,13 @@ def _filter_existing_leads(candidates: list[CandidateLead]) -> list[CandidateLea
             continue
 
         filtered.append(c)
+        # Also guard against duplicates within this same batch.
+        if c_email:
+            existing_emails.add(c_email)
+        if c_domain:
+            existing_domains.add(c_domain)
+        if c_name:
+            existing_names.add(c_name)
 
     return filtered
 

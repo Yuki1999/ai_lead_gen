@@ -361,13 +361,26 @@ def _build_email_prompt(lead: CandidateLead, lead_type: str, lang: str) -> str:
     if lead_type == "kol":
         role_instructions = (
             "Audience: KEY OPINION LEADER / surgeon / hospital procurement decision-maker.\n"
-            "Write a [Personalized Intro] sentence that references THIS recipient's specific public "
-            "achievements, role, or focus drawn ONLY from the evidence/notes above (e.g. landmark "
-            "cases, sub-specialty, institution, training). If the evidence is thin, write a brief, "
-            "honest, non-fabricated compliment instead. Then introduce the MEDBOT NaviBot platform "
-            "featuring the Skywalker Total Knee System, frame it as a compatible addition to their "
-            "practice, and close by offering to discuss how its personalized preoperative planning "
-            "and real-time accuracy compensation align with their clinical/academic objectives.\n"
+            "Write a [Personalized Intro] sentence following this structure (style distilled from "
+            "approved gold-standard examples — do not copy their wording, just the pattern):\n"
+            "  1. A short 2-4 word reputation label grounded in the evidence (e.g. 'an efficiency "
+            "champion and digital innovator', 'a rapid-recovery advocate and safety expert') plus "
+            "their institution by name.\n"
+            "  2. One or two concrete, verifiable achievements from the evidence/notes above — a "
+            "'first' milestone (first in their country/region to perform a robotic or navigated "
+            "procedure), a case-volume figure, or a leadership/academic title. Never invent a "
+            "figure or milestone that isn't in the evidence.\n"
+            "  3. Pick ONE specific clinical/technical theme from that achievement (e.g. 3D "
+            "planning, rapid recovery, sensor-based balancing, high-volume efficiency) and echo "
+            "that SAME theme later when explaining why Skywalker fits their practice, and again in "
+            "the closing line — this creates one connected thread instead of generic flattery "
+            "bolted onto boilerplate.\n"
+            "If the evidence is thin, skip steps 1-2 and write a brief, honest, non-fabricated "
+            "compliment instead — do not force a fake achievement. Then introduce the MEDBOT "
+            "NaviBot platform featuring the Skywalker Total Knee System, frame it as a compatible "
+            "addition to their practice, and close by offering to discuss how its personalized "
+            "preoperative planning and real-time accuracy compensation align with their clinical/"
+            "academic objectives (tied back to the theme from step 3 when there is one).\n"
         )
     else:
         role_instructions = (

@@ -18,6 +18,13 @@ description: Use when conducting overseas distributor or KOL prospecting for Med
 4. **评分权重可配置**：默认为渠道匹配度 40% · 目标市场战略优先级 25% · 学术/品牌公开资历 20% · 联系方式可用性 10% · 公开 KOL/医院合作记录 5%，管理员可在「设置 → 评分规则」页调整权重、加减分项与分数区间。**打分前必须调用 `get_scoring_rules` 工具获取当前生效的规则**，不要凭本文档记忆的默认值打分（见第 5 步）。
 5. **外联与发送由后端按批准模板处理**：本 skill 仍**不撰写邮件正文**；调用 `create_outreach_records` 后，后端用批准版模板（代理商/KOL、中英文、统一署名、专人对接 CTA）生成邮件。是否自动发送由后端 `auto_send_enabled` 设置控制（默认存草稿，需人工审核）。
 6. **回复转人工触发词**（价格/报价、独家、注册证/认证/FDA/CE、招投标、合同、付款、临床声明/适应症/疗效、样机/试用/演示）由后端 `analyze_reply` 统一判断，命中即转人工。
+7. **硬性排除对象**：以下几类无论评分多高，一律判定为 `rejected`，不得标记为 `qualified`/`new`/`human_review`，也不得通过 `add_leads` 保存或出现在最终报告中。这是判断题，不是打分题——命中即拒绝，不需要先算分再看阈值：
+   - **终端医院作为直接采购方机构**：把医院当作批量渠道/终端客户去联系、推销采购的情形。**注意区分**：医院里的具名 KOL（科室主任、学科带头人、采购负责人等个人）不在此列，应正常按 `kol` 类型评估——这条排除的是"以医院整体作为经销/采购对象"，不是"医院里的某位医生/负责人"。
+   - **纯媒体、纯咨询公司**：以资讯报道、行业分析、咨询服务为主业，不从事实际渠道分销或临床应用。
+   - **非医疗领域的工业机器人公司**：机器人业务与骨科/医疗器械无关（如工业自动化、物流机器人）。
+   - **纯科研机构**：高校实验室、研究所等无临床转化能力、不具备商业化产品或分销渠道的机构。
+   - 竞品机器人代理商（Mako / ROSA / Cori 等）**不属于**硬性排除——按第 3 条个案评估、评分中酌情降级，而不是直接拒绝。
+   - 判断依据主要来自搜索证据（公司简介、业务范围描述），证据不足以确认命中时不要臆断排除，按第 6 步正常评分即可。
 
 ## 1. Skill Purpose
 
@@ -265,6 +272,34 @@ Examples:
 - German: `Orthopädie Implantate Vertrieb`, `Medizintechnik Distributor`, `Knieendoprothetik`
 - Arabic: use English plus local market terms when reliable local-language search is difficult
 
+#### E. KOL / Surgeon Search
+
+Use these when the target `lead_type` is `kol` (surgeons, department heads, fellowship
+directors, hospital clinical/procurement leaders) instead of the distributor terms
+above — those surface companies, these surface individual clinicians and their public
+track record. Based on `docs/business/Skywalker_KOL_Selection_Criteria.docx`.
+
+- `robotic TKA surgeon {country}`
+- `robotic knee replacement surgeon {country}`
+- `first robotic total knee replacement {country}`
+- `first robotic TKA {country}`
+- `computer navigated knee replacement surgeon {country}`
+- `high volume knee replacement surgeon {country}`
+- `arthroplasty society {country}`
+- `orthopedic association president {country}`
+- `joint replacement fellowship director {country}`
+- `head of orthopedics {country} hospital`
+- `orthopedic department chief {country}`
+- `site:{hospital_domain} orthopedic surgeon`
+- `site:{hospital_domain} joint replacement department`
+
+Once a named candidate surfaces, run a follow-up search on their name (e.g.
+`{surgeon name} robotic TKA`, `{surgeon name} orthopedic society`) to gather the
+concrete, verifiable achievements Step 4/5 and the KOL email personalization need —
+first-in-country/region milestones, case volume, publications, conference talks,
+teaching/fellowship roles. Adapt with local-language equivalents for non-English
+markets, same approach as Section D.
+
 ---
 
 ### Step 3: Collect Candidate Leads
@@ -312,11 +347,18 @@ For every retained lead, capture:
 
 ### Step 5: Score Each Lead
 
-**Call the `get_scoring_rules` tool before scoring any lead in this session.** The
-weights, point values, and thresholds are admin-configurable and may have been
-customized — always use the values the tool returns. The rules below are only
-the illustrative default shown to a human reader of this document; if the tool
-call fails or is unavailable, fall back to these defaults instead of guessing.
+**Before scoring, check the candidate against the hard exclusion list in Section 0.7.**
+If it clearly matches one of those categories, skip scoring entirely and mark it
+`rejected` directly — do not let a high score override a hard exclusion.
+
+**Call the `get_scoring_rules` tool before scoring any lead in this session, passing
+`lead_type: "distributor"` or `lead_type: "kol"` to match the candidate.** Distributor
+and KOL leads use SEPARATE, independently admin-configurable rule sets — calling
+without the right `lead_type` fetches the wrong set. The weights, point values, and
+thresholds are admin-configurable and may have been customized — always use the
+values the tool returns. The rules below are only the illustrative default shown to
+a human reader of this document; if the tool call fails or is unavailable, fall back
+to these defaults instead of guessing.
 
 Start from 0 and apply the rules returned by `get_scoring_rules` (or the
 defaults below as a fallback).
@@ -338,6 +380,34 @@ Default negative scoring:
 - -30 if the company is unrelated to healthcare robotics, orthopedic devices, medical distribution, surgical equipment, or hospital equipment.
 - -30 if the company appears to be hospital-only, media-only, consultant-only, job-board-only, consumer-only, or unrelated industrial robotics.
 - -40 if the lead is a confirmed duplicate.
+
+**KOL-specific scoring** — use this set instead of the distributor rules above when
+`lead_type` is `kol`. Based on `docs/business/Skywalker_KOL_Selection_Criteria.docx`;
+the admin-configured weights from `get_scoring_rules` still apply as the overall
+frame (channel fit ≈ clinical/volume fit, academic/brand resume, contact availability,
+etc.) — this just tells you what evidence to look for within each bucket for a
+surgeon instead of a company.
+
+KOL positive scoring:
+
+- +25 if evidence confirms high surgical volume (roughly 150+ TKA/year, or an explicit "high-volume" description from a credible source) or prior robotic/computer-navigated surgery experience.
+- +20 if evidence shows a notable "first" achievement — first in their country/region to perform a robotic or navigated procedure, or a comparable landmark case/milestone.
+- +15 if evidence shows academic output: publications in orthopedic journals, or a named professorship/research title.
+- +15 if evidence shows peer/conference visibility: speaker at AAOS, AAHKS, CAOS, or a regional arthroplasty/orthopedic society, or a leadership role in such a society.
+- +10 if affiliated with a teaching hospital, academic medical center, or fellowship program.
+- +10 if evidence shows a history of proctoring, training peers, or hosting visiting surgeons.
+- +10 if a visible business/professional email or official contact route is available.
+- +5 if their institution or role covers a strategically prioritized target market.
+
+KOL negative scoring:
+
+- -20 if source evidence is weak or indirect (e.g., only a hospital staff directory listing, no procedure or academic detail).
+- -30 if there is no evidence of surgical volume, robotic/navigated experience, or academic output — a generic orthopedic listing with nothing to personalize around.
+- -40 if the lead is a confirmed duplicate.
+
+A KOL candidate can still hit the hard exclusion list in Section 0.7 (e.g., a
+pure researcher with no clinical practice) — check that first, regardless of how
+strong their academic profile looks.
 
 Clamp score to 0–100.
 
@@ -391,6 +461,9 @@ Use when:
 
 Use when:
 
+- **It matches the hard exclusion list in Section 0.7** (end-user hospital as a
+  direct-purchase target, pure media/consulting, non-medical industrial robotics,
+  or pure research institutes) — this overrides any score, high or low.
 - The company is clearly unrelated.
 - The company is a duplicate.
 - The company is hospital-only.

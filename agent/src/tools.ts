@@ -8,6 +8,7 @@ import type {
   BackendClient,
   CreateOutreachRecordsInput,
   FetchUrlInput,
+  GetScoringRulesInput,
   ListLeadsInput,
   SearchLeadsInput,
   WebSearchInput,
@@ -74,12 +75,22 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
       name: "get_scoring_rules",
       label: "Get Scoring Rules",
       description:
-        "Fetch the CURRENT lead-scoring weights, positive/negative point rules, and score thresholds. " +
-        "These are admin-configurable and may differ from any values described elsewhere — always call " +
-        "this before scoring leads and use the returned values instead of guessing or assuming defaults.",
-      parameters: Type.Object({}),
-      execute: async (_toolCallId, _params, signal) =>
-        toolResult(await client.getScoringRules(signalOptions(signal))),
+        "Fetch the CURRENT lead-scoring weights, positive/negative point rules, and score thresholds " +
+        "for the given lead_type. Distributor and KOL leads use SEPARATE, independently configurable " +
+        "rule sets — always pass the correct lead_type. These are admin-configurable and may differ " +
+        "from any values described elsewhere — always call this before scoring leads and use the " +
+        "returned values instead of guessing or assuming defaults.",
+      parameters: Type.Object({
+        lead_type: Type.Optional(
+          Type.String({
+            description: "'distributor' or 'kol'. Defaults to 'distributor' if omitted.",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params, signal) =>
+        toolResult(
+          await client.getScoringRules(params as unknown as GetScoringRulesInput, signalOptions(signal)),
+        ),
     }),
     defineTool({
       name: "web_search",
@@ -168,10 +179,13 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
     defineTool({
       name: "list_leads",
       label: "List Leads",
-      description: "List saved distributor leads, optionally filtering by region, status, or query.",
+      description: "List saved leads, optionally filtering by region, status, lead_type, or query.",
       parameters: Type.Object({
         region: Type.Optional(Type.String({ description: "Region or country filter." })),
         status: Type.Optional(Type.String({ description: "Lead status filter." })),
+        lead_type: Type.Optional(
+          Type.String({ description: "Filter by 'distributor' or 'kol'. Omit for all." }),
+        ),
         q: Type.Optional(Type.String({ description: "Free-text search query." })),
       }),
       execute: async (_toolCallId, params, signal) =>

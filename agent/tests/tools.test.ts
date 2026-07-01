@@ -6,6 +6,7 @@ import type {
   BackendClient,
   CreateOutreachRecordsInput,
   FetchUrlInput,
+  GetScoringRulesInput,
   ListLeadsInput,
   SearchLeadsInput,
   WebSearchInput,
@@ -175,11 +176,13 @@ describe("createBusinessTools", () => {
 
   it("executes get_scoring_rules through the backend client", async () => {
     const signal = new AbortController().signal;
-    let calledWith: { signal?: AbortSignal } | undefined;
+    let calledWith:
+      | { input: GetScoringRulesInput; options: { signal?: AbortSignal } | undefined }
+      | undefined;
     const rules = { weights: [{ key: "channel_fit", label: "渠道匹配度", percent: 40 }], positive_rules: [], negative_rules: [], thresholds: [] };
     const client = mockClient({
-      getScoringRules: async (options) => {
-        calledWith = options;
+      getScoringRules: async (input, options) => {
+        calledWith = { input: input ?? {}, options };
         return rules;
       },
     });
@@ -187,13 +190,13 @@ describe("createBusinessTools", () => {
 
     const result = await tool.execute(
       "call-1",
-      {},
+      { lead_type: "kol" },
       signal,
       undefined,
       undefined as never,
     );
 
-    assert.deepEqual(calledWith, { signal });
+    assert.deepEqual(calledWith, { input: { lead_type: "kol" }, options: { signal } });
     assertToolResult(result, rules);
   });
 
