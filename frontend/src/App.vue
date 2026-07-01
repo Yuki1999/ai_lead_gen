@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   Bell,
   Bot,
   BookOpen,
@@ -14,8 +16,11 @@ import {
   FileText,
   Globe2,
   Home,
+  Link2,
+  Loader2,
   MailCheck,
   Maximize2,
+  MessageSquare,
   Pencil,
   Plus,
   RefreshCw,
@@ -24,8 +29,10 @@ import {
   Send,
   ShieldCheck,
   SlidersHorizontal,
+  Square,
   Trash2,
   UserCheck,
+  Wrench,
   X,
 } from "lucide-vue-next";
 import {
@@ -44,11 +51,7 @@ import {
   type SelectOption,
 } from "naive-ui";
 import AdminPanel from "./components/AdminPanel.vue";
-import {
-  countAgentHistoryItems,
-  splitAgentProcessHistory,
-  type AgentProcessItem,
-} from "./agentProcess";
+import ScoringRulesSettings from "./components/ScoringRulesSettings.vue";
 import {
   activateAgentSession,
   createNextAgentSession,
@@ -77,6 +80,8 @@ interface Lead {
   status: string;
   notes: string;
   reply_count?: number;
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface Metrics {
@@ -165,6 +170,25 @@ interface AgentEvent {
   tool_name?: string;
   name?: string;
   [key: string]: unknown;
+}
+
+interface AgentToolCall {
+  id: number;
+  toolName: string;
+  status: "running" | "done" | "error";
+  detail?: string;
+}
+
+interface AgentTurn {
+  id: number;
+  role: "user" | "assistant";
+  text: string;
+  toolCalls: AgentToolCall[];
+  pending: boolean;
+  error: string;
+  stopped: boolean;
+  startedAt: number;
+  resultSummary?: { leadsAdded: number; draftsAdded: number };
 }
 
 interface AgentChatResponse {
@@ -359,11 +383,57 @@ const statusFilterOptions: SelectOption[] = [
   { label: "已确认", value: "qualified" },
   { label: "拒绝", value: "rejected" },
 ];
+// Whitelist mirrors backend `_SORT_EXPRS` in backend/app/db.py — keep in sync.
+const sortFieldOptions: SelectOption[] = [
+  { label: "最新入库", value: "id" },
+  { label: "评分", value: "score" },
+  { label: "最近更新", value: "updated_at" },
+  { label: "回复数", value: "reply_count" },
+  { label: "公司名", value: "company_name" },
+  { label: "国家", value: "country" },
+  { label: "状态", value: "status" },
+];
 const providerOptions: SelectOption[] = [
   { label: "OpenAI", value: "openai" },
   { label: "DeepSeek", value: "deepseek" },
   { label: "百炼 (通义千问)", value: "bailian" },
 ];
+
+// Friendly label + icon per business tool the Agent can call (agent/src/tools.ts).
+// Unknown/future tool names fall back to the raw name + a generic wrench icon.
+const AGENT_TOOL_META: Record<string, { label: string; icon: typeof FileText }> = {
+  get_product_profile: { label: "读取产品画像", icon: FileText },
+  web_search: { label: "网页搜索", icon: Globe2 },
+  fetch_url: { label: "抓取网页", icon: Link2 },
+  search_leads: { label: "搜索线索", icon: Search },
+  list_leads: { label: "查看线索库", icon: Database },
+  add_leads: { label: "保存线索", icon: UserCheck },
+  create_outreach_records: { label: "生成外联记录", icon: MailCheck },
+  analyze_reply: { label: "分析回复", icon: MessageSquare },
+  __skill__: { label: "技能加载", icon: BookOpen },
+};
+function toolMeta(name: string): { label: string; icon: typeof FileText } {
+  return AGENT_TOOL_META[name] || { label: name, icon: Wrench };
+}
+function renderTurnBlocks(text: string) {
+  return parseMarkdown(text);
+}
+function applySuggestion(text: string): void {
+  agentPrompt.value = text;
+  nextTick(() => agentComposerRef.value?.focus());
+}
+function autoGrowComposer(): void {
+  const el = agentComposerRef.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+}
+function scrollAgentChatToBottom(): void {
+  nextTick(() => {
+    const el = agentChatScrollRef.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  });
+}
 
 const leads = ref<Lead[]>([]);
 const productProfile = ref<ProductProfile | null>(null);
@@ -385,6 +455,7 @@ const filterStatus = ref("");
 const query = ref("");
 const sortField = ref("id");
 const sortDir = ref<"asc" | "desc">("desc");
+const sortDropdownOpen = ref(false);
 const replyLeadId = ref<number | "">("");
 const replyText = ref(
   "We are interested. Please send product details, certificates, and partner requirements."
@@ -408,15 +479,25 @@ const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
 const notice = ref("");
 const error = ref("");
-const agentPrompt = ref(
-  "帮我找 SkyWalker TKA 在印度的渠道商，优先找骨科植入物、关节置换、TKA 分销商，要求公开邮箱和来源证据。"
-);
-const agentResponse = ref("");
+const agentPrompt = ref("");
 const agentSessionId = ref("default");
 const agentSessions = ref<AgentSessionRecord[]>([]);
-const agentEvents = ref<AgentEvent[]>([]);
-const agentProcessItems = ref<AgentProcessItem[]>([]);
-const agentLoading = ref(false);
+const agentTurnsBySession = reactive<Record<string, AgentTurn[]>>({});
+const agentChatScrollRef = ref<HTMLElement | null>(null);
+const agentComposerRef = ref<HTMLTextAreaElement | null>(null);
+let agentTurnSeq = 0;
+let agentToolCallSeq = 0;
+// One abort controller per session id, so different sessions can stream concurrently
+// (each independently stoppable) without stepping on each other.
+const agentAbortControllers = new Map<string, AbortController>();
+const agentEditingUserTurnId = ref<number | null>(null);
+const agentEditingText = ref("");
+// Announced via a visually-hidden aria-live region — updated at meaningful
+// STATE changes (not per character delta, which would overwhelm screen readers).
+const agentLiveStatus = ref("");
+const agentElapsedTick = ref(0);
+let agentElapsedTimer: ReturnType<typeof setInterval> | undefined;
+const agentSessionResultTotals = reactive<Record<string, { leadsAdded: number; draftsAdded: number }>>({});
 const agentError = ref("");
 const agentConfig = ref<AgentConfigResponse | null>(null);
 const agentApiKeyInput = ref("");
@@ -449,7 +530,7 @@ const settingsAgentKeyInput = ref("");
 const settingsEmailPasswordInput = ref("");
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
-const settingsTab = ref<"email" | "sync" | "agent">("email");
+const settingsTab = ref<"email" | "sync" | "agent" | "scoring">("email");
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -465,13 +546,11 @@ const agentConfigExpanded = ref(false);
 const agentGuideOpen = ref(false);
 const agentNotificationsOpen = ref(false);
 const sidebarUserMenuOpen = ref(false);
-const agentSettingsOpen = ref(false);
 const agentSkillDetailsOpen = ref(false);
-const agentLogsOpen = ref(false);
-const agentReportFullscreen = ref(false);
+// On narrow viewports the context rail collapses behind this toggle instead of
+// disappearing entirely — desktop widths ignore it and always show the rail.
+const agentContextOpen = ref(false);
 const agentSessionSearch = ref("");
-let agentProcessId = 0;
-let agentGenerationStarted = false;
 
 const selectedCount = computed(() => selectedLeadIds.value.length);
 const topbarContent = computed(() => {
@@ -495,16 +574,39 @@ const topbarContent = computed(() => {
     copy: "面向 SkyWalker TKA 的代理商发现、邮箱证据审阅、触达记录和回复处理。",
   };
 });
-const agentProcessDisplay = computed(() => splitAgentProcessHistory(agentProcessItems.value));
-const currentAgentProcessItem = computed(() => agentProcessDisplay.value.current);
-const historicalAgentProcessItems = computed(() => agentProcessDisplay.value.history);
-const historicalAgentStatusItems = computed(() =>
-  historicalAgentProcessItems.value.filter((item) => item.kind !== "event")
+const agentTurns = computed(() => agentTurnsBySession[agentSessionId.value] ?? []);
+function isSessionBusy(sessionId: string): boolean {
+  const turns = agentTurnsBySession[sessionId];
+  if (!turns || turns.length === 0) return false;
+  const last = turns[turns.length - 1];
+  return last.role === "assistant" && last.pending;
+}
+// Busy state of the CURRENTLY VIEWED session only — a generation running in a
+// different session doesn't disable this one's composer.
+const agentLoading = computed(() => isSessionBusy(agentSessionId.value));
+const agentElapsedSeconds = computed(() => {
+  void agentElapsedTick.value; // reactive dependency for the 1s ticker
+  const last = agentTurns.value[agentTurns.value.length - 1];
+  if (!last || last.role !== "assistant" || !last.pending) return 0;
+  return Math.max(0, Math.floor((Date.now() - last.startedAt) / 1000));
+});
+const agentSessionResultTotal = computed(
+  () => agentSessionResultTotals[agentSessionId.value] ?? { leadsAdded: 0, draftsAdded: 0 },
 );
-const agentHistoryCount = computed(() =>
-  countAgentHistoryItems(historicalAgentStatusItems.value, agentEvents.value)
-);
-const agentMarkdownBlocks = computed(() => parseMarkdown(agentResponse.value));
+// Edit/regenerate are only offered for the LAST message of each role — editing
+// or redoing something buried mid-history would require branching history,
+// which this chat model doesn't support.
+const lastAgentTurnId = computed(() => {
+  const turns = agentTurns.value;
+  return turns.length > 0 ? turns[turns.length - 1].id : null;
+});
+const lastUserTurnId = computed(() => {
+  const turns = agentTurns.value;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    if (turns[i].role === "user") return turns[i].id;
+  }
+  return null;
+});
 const activeAgentSession = computed(() =>
   agentSessions.value.find((session) => session.id === agentSessionId.value)
 );
@@ -512,18 +614,24 @@ const filteredAgentSessions = computed(() => {
   const keyword = agentSessionSearch.value.trim().toLowerCase();
   if (!keyword) return agentSessions.value;
 
-  return agentSessions.value.filter((session) =>
-    [session.title, session.id, shortAgentSessionId(session.id)].some((value) =>
-      value.toLowerCase().includes(keyword),
-    ),
-  );
+  return agentSessions.value.filter((session) => {
+    const matchesMeta = [session.title, session.id, shortAgentSessionId(session.id)].some(
+      (value) => value.toLowerCase().includes(keyword),
+    );
+    if (matchesMeta) return true;
+    const turns = agentTurnsBySession[session.id];
+    return turns?.some((turn) => turn.text.toLowerCase().includes(keyword)) ?? false;
+  });
 });
 const agentOutputText = computed(() => {
-  const blocks = [
-    agentError.value ? `Agent 请求失败\n${agentError.value}` : "",
-    agentResponse.value,
-  ].filter(Boolean);
-  return blocks.join("\n\n").trim();
+  return agentTurns.value
+    .map((turn) => {
+      if (turn.role === "user") return `You: ${turn.text}`;
+      if (turn.error) return `Agent (失败): ${turn.error}`;
+      return `Agent: ${turn.text}`;
+    })
+    .join("\n\n")
+    .trim();
 });
 const agentNotificationItems = computed(() => [
   {
@@ -541,21 +649,6 @@ const agentNotificationItems = computed(() => [
     detail: `${agentSessions.value.length} 个本地会话已保存`,
   },
 ]);
-const agentLogRows = computed(() => {
-  const processRows = agentProcessItems.value.map((item) => ({
-    id: `process-${item.id}`,
-    kind: item.kind,
-    title: item.label,
-    detail: item.detail || "流程状态",
-  }));
-  const eventRows = agentEvents.value.map((event, index) => ({
-    id: `event-${index}`,
-    kind: "event",
-    title: formatAgentEvent(event),
-    detail: String(event.type || event.toolName || event.tool_name || "tool event"),
-  }));
-  return [...processRows, ...eventRows].slice(-60).reverse();
-});
 const selectedLead = computed(() =>
   leads.value.find((lead) => lead.id === Number(replyLeadId.value))
 );
@@ -634,7 +727,7 @@ async function loadDashboard(): Promise<void> {
   if (replyLeadId.value === "" && leads.value.length > 0) {
     replyLeadId.value = leads.value[0].id;
   }
-  loadDrafts();
+  await loadDrafts();
 }
 
 async function loadDrafts(): Promise<void> {
@@ -839,12 +932,110 @@ async function analyzeCurrentReply(): Promise<void> {
 
 async function sendAgentPrompt(): Promise<void> {
   const message = agentPrompt.value.trim();
-  if (!message || agentLoading.value) return;
+  const sessionKey = agentSessionId.value;
+  if (!message || isSessionBusy(sessionKey)) return;
 
-  agentLoading.value = true;
-  clearAgentOutput();
+  const turns = agentTurnsBySession[sessionKey] ?? (agentTurnsBySession[sessionKey] = []);
+  turns.push({
+    id: ++agentTurnSeq,
+    role: "user",
+    text: message,
+    toolCalls: [],
+    pending: false,
+    error: "",
+    stopped: false,
+    startedAt: Date.now(),
+  });
+  agentPrompt.value = "";
+  nextTick(() => autoGrowComposer());
+  scrollAgentChatToBottom();
+
+  await dispatchAssistantResponse(sessionKey, message);
+}
+
+function regenerateLastResponse(): void {
+  const sessionKey = agentSessionId.value;
+  if (isSessionBusy(sessionKey)) return;
+  const turns = agentTurnsBySession[sessionKey];
+  if (!turns || turns.length === 0) return;
+
+  if (turns[turns.length - 1].role === "assistant") {
+    turns.pop();
+  }
+  const lastUser = turns[turns.length - 1];
+  if (!lastUser || lastUser.role !== "user") return;
+
+  scrollAgentChatToBottom();
+  void dispatchAssistantResponse(sessionKey, lastUser.text);
+}
+
+function beginEditLastUserMessage(turn: AgentTurn): void {
+  if (isSessionBusy(agentSessionId.value)) return;
+  agentEditingUserTurnId.value = turn.id;
+  agentEditingText.value = turn.text;
+}
+
+function cancelEditUserMessage(): void {
+  agentEditingUserTurnId.value = null;
+  agentEditingText.value = "";
+}
+
+function submitEditedMessage(): void {
+  const sessionKey = agentSessionId.value;
+  const newText = agentEditingText.value.trim();
+  const editingId = agentEditingUserTurnId.value;
+  if (!newText || editingId === null || isSessionBusy(sessionKey)) return;
+
+  const turns = agentTurnsBySession[sessionKey];
+  if (!turns) return;
+  const editIndex = turns.findIndex((turn) => turn.id === editingId);
+  if (editIndex === -1) return;
+
+  // Editing is only supported for the LAST user message: drop it and any
+  // reply that followed, then resend the edited text as a fresh turn.
+  turns.splice(editIndex);
+  cancelEditUserMessage();
+
+  turns.push({
+    id: ++agentTurnSeq,
+    role: "user",
+    text: newText,
+    toolCalls: [],
+    pending: false,
+    error: "",
+    stopped: false,
+    startedAt: Date.now(),
+  });
+  scrollAgentChatToBottom();
+  void dispatchAssistantResponse(sessionKey, newText);
+}
+
+async function dispatchAssistantResponse(sessionKey: string, message: string): Promise<void> {
+  const turns = agentTurnsBySession[sessionKey] ?? (agentTurnsBySession[sessionKey] = []);
+  const assistantTurn: AgentTurn = {
+    id: ++agentTurnSeq,
+    role: "assistant",
+    text: "",
+    toolCalls: [],
+    pending: true,
+    error: "",
+    stopped: false,
+    startedAt: Date.now(),
+  };
+  turns.push(assistantTurn);
+
+  agentError.value = "";
   notice.value = "";
-  appendAgentProcess("running", "连接 Agent", `Session ${agentSessionId.value || "default"}`);
+  if (sessionKey === agentSessionId.value) agentLiveStatus.value = "已发送，等待 Agent 响应";
+  scrollAgentChatToBottom();
+  startAgentElapsedTicker();
+
+  const leadsBefore = metrics.value.total_leads;
+  const draftsBefore = draftCount.value;
+
+  const controller = new AbortController();
+  agentAbortControllers.set(sessionKey, controller);
+
   try {
     const response = await fetch(`${apiBase}/agent/chat/stream`, {
       method: "POST",
@@ -854,8 +1045,9 @@ async function sendAgentPrompt(): Promise<void> {
       },
       body: JSON.stringify({
         message,
-        session_id: agentSessionId.value || undefined,
+        session_id: sessionKey || undefined,
       }),
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -873,19 +1065,65 @@ async function sendAgentPrompt(): Promise<void> {
       if (done) break;
       buffer = consumeAgentStreamBuffer(
         buffer + decoder.decode(value, { stream: true }),
+        assistantTurn,
       );
     }
-    buffer = consumeAgentStreamBuffer(buffer + decoder.decode());
+    buffer = consumeAgentStreamBuffer(buffer + decoder.decode(), assistantTurn);
     if (buffer.trim()) {
-      handleAgentSseFrame(buffer);
+      handleAgentSseFrame(buffer, assistantTurn);
     }
+    if (sessionKey === agentSessionId.value) agentLiveStatus.value = "回复已完成";
     await loadDashboard();
+
+    const leadsAdded = Math.max(0, metrics.value.total_leads - leadsBefore);
+    const draftsAdded = Math.max(0, draftCount.value - draftsBefore);
+    if (leadsAdded > 0 || draftsAdded > 0) {
+      assistantTurn.resultSummary = { leadsAdded, draftsAdded };
+      const totals = agentSessionResultTotals[sessionKey] ?? { leadsAdded: 0, draftsAdded: 0 };
+      agentSessionResultTotals[sessionKey] = {
+        leadsAdded: totals.leadsAdded + leadsAdded,
+        draftsAdded: totals.draftsAdded + draftsAdded,
+      };
+    }
   } catch (caught) {
-    agentError.value = caught instanceof Error ? caught.message : "Agent 请求失败";
-    appendAgentProcess("error", "Agent 请求失败", agentError.value);
+    if (caught instanceof DOMException && caught.name === "AbortError") {
+      assistantTurn.stopped = true;
+      if (sessionKey === agentSessionId.value) agentLiveStatus.value = "已停止生成";
+    } else {
+      assistantTurn.error = caught instanceof Error ? caught.message : "Agent 请求失败";
+      agentError.value = assistantTurn.error;
+      if (sessionKey === agentSessionId.value) agentLiveStatus.value = `请求失败：${assistantTurn.error}`;
+    }
   } finally {
-    agentLoading.value = false;
+    for (const call of assistantTurn.toolCalls) {
+      if (call.status === "running") call.status = assistantTurn.stopped ? "error" : "done";
+    }
+    assistantTurn.pending = false;
+    if (agentAbortControllers.get(sessionKey) === controller) {
+      agentAbortControllers.delete(sessionKey);
+    }
+    stopAgentElapsedTickerIfIdle();
+    scrollAgentChatToBottom();
   }
+}
+
+function startAgentElapsedTicker(): void {
+  if (agentElapsedTimer) return;
+  agentElapsedTimer = setInterval(() => {
+    agentElapsedTick.value += 1;
+  }, 1000);
+}
+
+function stopAgentElapsedTickerIfIdle(): void {
+  if (agentAbortControllers.size > 0) return;
+  if (agentElapsedTimer) {
+    clearInterval(agentElapsedTimer);
+    agentElapsedTimer = undefined;
+  }
+}
+
+function stopAgentPrompt(sessionId: string = agentSessionId.value): void {
+  agentAbortControllers.get(sessionId)?.abort();
 }
 
 async function saveAgentConfig(): Promise<void> {
@@ -1073,14 +1311,35 @@ function toggleSelectAll(checked: boolean): void {
   }
 }
 
-function toggleSort(field: string): void {
-  if (sortField.value === field) {
-    sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
-  } else {
-    sortField.value = field;
-    sortDir.value = "asc";
-  }
+function selectSortField(field: string): void {
+  sortDropdownOpen.value = false;
+  if (sortField.value === field) return;
+  sortField.value = field;
   runAction("dashboard", loadDashboard);
+}
+
+function toggleSortDir(): void {
+  sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
+  runAction("dashboard", loadDashboard);
+}
+
+function toggleSortDropdown(): void {
+  sortDropdownOpen.value = !sortDropdownOpen.value;
+}
+
+const currentSortLabel = computed(() => {
+  return sortFieldOptions.find((opt) => opt.value === sortField.value)?.label
+    ?? "最新入库";
+});
+
+function handleSortOutsideClick(event: MouseEvent): void {
+  if (!sortDropdownOpen.value) return;
+  const target = event.target as Node | null;
+  if (!target) return;
+  const container = document.querySelector(".toolbar-sort");
+  if (container && !container.contains(target)) {
+    sortDropdownOpen.value = false;
+  }
 }
 
 function setLeadSelection(leadId: number, checked: boolean): void {
@@ -1270,25 +1529,8 @@ function toggleSidebarUserMenu(): void {
   sidebarUserMenuOpen.value = !sidebarUserMenuOpen.value;
 }
 
-function toggleAgentSettings(): void {
-  agentSettingsOpen.value = !agentSettingsOpen.value;
-  if (agentSettingsOpen.value) agentConfigExpanded.value = true;
-}
-
 function toggleAgentSkillDetails(): void {
   agentSkillDetailsOpen.value = !agentSkillDetailsOpen.value;
-}
-
-function toggleAgentLogs(): void {
-  agentLogsOpen.value = !agentLogsOpen.value;
-}
-
-function toggleAgentReportFullscreen(): void {
-  if (!agentOutputText.value) {
-    notice.value = "暂无 Agent 输出可全屏查看";
-    return;
-  }
-  agentReportFullscreen.value = !agentReportFullscreen.value;
 }
 
 async function copyAgentOutput(): Promise<void> {
@@ -1381,31 +1623,24 @@ function fallbackCopyText(text: string): boolean {
   }
 }
 
-function clearAgentOutput(): void {
-  agentError.value = "";
-  agentResponse.value = "";
-  agentEvents.value = [];
-  agentProcessItems.value = [];
-  agentReportFullscreen.value = false;
-  agentGenerationStarted = false;
-}
-
 function startNewAgentSession(): void {
-  if (agentLoading.value) return;
+  // Creating a session never conflicts with a generation running in another
+  // session — each session streams and can be stopped independently.
   applyAgentSessionState(
     createNextAgentSession(getAgentStorage(), currentAgentSessionState()),
   );
-  clearAgentOutput();
+  agentError.value = "";
   notice.value = "已创建新的 Agent 会话";
 }
 
 function switchAgentSession(sessionId: string): void {
-  if (agentLoading.value || sessionId === agentSessionId.value) return;
+  if (sessionId === agentSessionId.value) return;
   applyAgentSessionState(
     activateAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
   );
-  clearAgentOutput();
+  agentError.value = "";
   notice.value = "已切换 Agent 会话";
+  scrollAgentChatToBottom();
 }
 
 function beginEditAgentSession(session: AgentSessionRecord): void {
@@ -1431,17 +1666,25 @@ function saveAgentSessionTitle(sessionId: string): void {
 }
 
 function removeAgentSession(sessionId: string): void {
-  if (agentLoading.value) return;
   const session = agentSessions.value.find((item) => item.id === sessionId);
   const title = session?.title || "当前会话";
-  const confirmed = globalThis.confirm?.(`删除会话“${title}”？`) ?? true;
+  const busy = isSessionBusy(sessionId);
+  const confirmMessage = busy
+    ? `删除会话"${title}"？该会话正在生成中，将同时停止生成。`
+    : `删除会话"${title}"？`;
+  const confirmed = globalThis.confirm?.(confirmMessage) ?? true;
   if (!confirmed) return;
 
-  const wasActive = agentSessionId.value === sessionId;
+  // Don't let a deleted session's request keep running in the background —
+  // stop it before the turns it would mutate disappear.
+  agentAbortControllers.get(sessionId)?.abort();
+  agentAbortControllers.delete(sessionId);
+
   applyAgentSessionState(
     deleteAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
   );
-  if (wasActive) clearAgentOutput();
+  delete agentTurnsBySession[sessionId];
+  delete agentSessionResultTotals[sessionId];
   notice.value = "已删除 Agent 会话";
 }
 
@@ -1495,24 +1738,72 @@ function getAgentStorage(): Storage | undefined {
   }
 }
 
-function appendAgentProcess(
-  kind: AgentProcessItem["kind"],
-  label: string,
-  detail?: string,
-): void {
-  agentProcessItems.value = [
-    ...agentProcessItems.value,
-    { id: ++agentProcessId, kind, label, detail },
-  ].slice(-40);
+// ── Chat history persistence (survives page reloads) ─────────────────────────
+const AGENT_HISTORY_STORAGE_KEY = "medbot.agent.history";
+const AGENT_HISTORY_MAX_TURNS_PER_SESSION = 60;
+let agentHistoryPersistTimer: ReturnType<typeof setTimeout> | undefined;
+
+function loadAgentHistoryFromStorage(): void {
+  const storage = getAgentStorage();
+  const raw = storage?.getItem(AGENT_HISTORY_STORAGE_KEY);
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, AgentTurn[]>;
+    if (typeof parsed !== "object" || parsed === null) return;
+    for (const [sessionId, turns] of Object.entries(parsed)) {
+      if (!Array.isArray(turns)) continue;
+      // A turn still "pending" when the page was closed was never really
+      // finished — surface it as stopped rather than an eternal spinner.
+      agentTurnsBySession[sessionId] = turns.map((turn) => ({
+        ...turn,
+        pending: false,
+        stopped: turn.pending ? true : turn.stopped,
+      }));
+      let maxTurnId = 0;
+      let maxToolCallId = 0;
+      for (const turn of turns) {
+        maxTurnId = Math.max(maxTurnId, turn.id);
+        for (const call of turn.toolCalls) {
+          maxToolCallId = Math.max(maxToolCallId, call.id);
+        }
+      }
+      // Reseed both id counters past anything rehydrated from storage so newly
+      // created turns/tool-calls after reload never collide with old :key ids.
+      agentTurnSeq = Math.max(agentTurnSeq, maxTurnId);
+      agentToolCallSeq = Math.max(agentToolCallSeq, maxToolCallId);
+    }
+  } catch {
+    // Corrupt/foreign storage payload — start fresh rather than crash.
+  }
 }
 
-function consumeAgentStreamBuffer(buffer: string): string {
+function scheduleAgentHistoryPersist(): void {
+  if (agentHistoryPersistTimer) clearTimeout(agentHistoryPersistTimer);
+  agentHistoryPersistTimer = setTimeout(persistAgentHistoryNow, 400);
+}
+
+function persistAgentHistoryNow(): void {
+  const storage = getAgentStorage();
+  if (!storage) return;
+  const trimmed: Record<string, AgentTurn[]> = {};
+  for (const [sessionId, turns] of Object.entries(agentTurnsBySession)) {
+    trimmed[sessionId] = turns.slice(-AGENT_HISTORY_MAX_TURNS_PER_SESSION);
+  }
+  try {
+    storage.setItem(AGENT_HISTORY_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch {
+    // Storage full or unavailable (e.g. private browsing) — skip silently,
+    // history just won't survive this reload.
+  }
+}
+
+function consumeAgentStreamBuffer(buffer: string, turn: AgentTurn): string {
   let remaining = buffer;
   let boundary = remaining.indexOf("\n\n");
   while (boundary >= 0) {
     const frame = remaining.slice(0, boundary);
     if (frame.trim()) {
-      handleAgentSseFrame(frame);
+      handleAgentSseFrame(frame, turn);
     }
     remaining = remaining.slice(boundary + 2);
     boundary = remaining.indexOf("\n\n");
@@ -1520,7 +1811,7 @@ function consumeAgentStreamBuffer(buffer: string): string {
   return remaining;
 }
 
-function handleAgentSseFrame(frame: string): void {
+function handleAgentSseFrame(frame: string, turn: AgentTurn): void {
   let eventName = "message";
   const dataLines: string[] = [];
 
@@ -1535,61 +1826,111 @@ function handleAgentSseFrame(frame: string): void {
   if (dataLines.length === 0) return;
 
   try {
-    handleAgentStreamEvent(eventName, JSON.parse(dataLines.join("\n")));
+    handleAgentStreamEvent(eventName, JSON.parse(dataLines.join("\n")), turn);
   } catch (caught) {
-    appendAgentProcess(
-      "error",
-      "流式事件解析失败",
-      caught instanceof Error ? caught.message : "Invalid stream frame",
-    );
+    turn.error = caught instanceof Error ? caught.message : "流式事件解析失败";
   }
 }
 
-function handleAgentStreamEvent(eventName: string, payload: Record<string, unknown>): void {
+function handleAgentStreamEvent(
+  eventName: string,
+  payload: Record<string, unknown>,
+  turn: AgentTurn,
+): void {
+  // Concurrency guard: a background session's events must never yank the
+  // globally-viewed session or pop a toast about a conversation the user
+  // isn't currently looking at.
+  const viewing = isViewingTurn(turn);
+
   if (eventName === "start") {
-    if (typeof payload.session_id === "string") {
+    if (viewing && typeof payload.session_id === "string") {
       applyIncomingAgentSession(payload.session_id);
     }
-    appendAgentProcess("running", "会话已开始", `Session ${agentSessionId.value}`);
     return;
   }
 
   if (eventName === "delta") {
-    const text = typeof payload.text === "string" ? payload.text : "";
-    if (!agentGenerationStarted) {
-      agentGenerationStarted = true;
-      appendAgentProcess("running", "模型开始输出");
-    }
-    agentResponse.value += text;
+    turn.text += typeof payload.text === "string" ? payload.text : "";
+    scrollAgentChatToBottom();
     return;
   }
 
   if (eventName === "agent_event") {
     const event = asAgentEvent(payload.event);
     if (!event) return;
-    agentEvents.value = [...agentEvents.value, event].slice(-50);
-    appendAgentProcess("event", formatAgentEvent(event));
+    applyAgentEventToTurn(turn, event);
+    scrollAgentChatToBottom();
     return;
   }
 
   if (eventName === "done") {
     if (typeof payload.message === "string" && payload.message) {
-      agentResponse.value = payload.message;
+      turn.text = payload.message;
     }
-    if (typeof payload.session_id === "string") {
+    if (viewing && typeof payload.session_id === "string") {
       applyIncomingAgentSession(payload.session_id);
     }
-    if (Array.isArray(payload.events)) {
-      agentEvents.value = payload.events.map((event) => event as AgentEvent).slice(-50);
+    for (const call of turn.toolCalls) {
+      if (call.status === "running") call.status = "done";
     }
-    appendAgentProcess("done", "Agent 已完成");
-    notice.value = "Agent 已返回渠道拓展建议";
+    if (viewing) notice.value = "Agent 已返回渠道拓展建议";
     return;
   }
 
   if (eventName === "error") {
-    agentError.value = typeof payload.detail === "string" ? payload.detail : "Agent 流式请求失败";
-    appendAgentProcess("error", "Agent 请求失败", agentError.value);
+    turn.error = typeof payload.detail === "string" ? payload.detail : "Agent 流式请求失败";
+    if (viewing) agentError.value = turn.error;
+  }
+}
+
+function isViewingTurn(turn: AgentTurn): boolean {
+  return agentTurns.value.includes(turn);
+}
+
+function applyAgentEventToTurn(turn: AgentTurn, event: AgentEvent): void {
+  const type = String(event.type || "");
+  const toolName = String(event.toolName || event.tool_name || event.name || "");
+
+  if (type === "tool_execution_start" && toolName) {
+    turn.toolCalls.push({ id: ++agentToolCallSeq, toolName, status: "running" });
+    if (isViewingTurn(turn)) agentLiveStatus.value = `正在执行：${toolMeta(toolName).label}`;
+    return;
+  }
+
+  if ((type === "tool_execution_end" || type === "tool_execution_done") && toolName) {
+    const running = [...turn.toolCalls].reverse().find(
+      (call) => call.toolName === toolName && call.status === "running",
+    );
+    if (running) {
+      running.status = "done";
+    } else {
+      turn.toolCalls.push({ id: ++agentToolCallSeq, toolName, status: "done" });
+    }
+    if (isViewingTurn(turn)) agentLiveStatus.value = `已完成：${toolMeta(toolName).label}`;
+    return;
+  }
+
+  if (type === "tool_execution_error" && toolName) {
+    const running = [...turn.toolCalls].reverse().find(
+      (call) => call.toolName === toolName && call.status === "running",
+    );
+    if (running) running.status = "error";
+    return;
+  }
+
+  if (type === "skill_loaded") {
+    const skill = event.skillName || event.skill_name;
+    turn.toolCalls.push({
+      id: ++agentToolCallSeq,
+      toolName: "__skill__",
+      status: "done",
+      detail: skill ? `已加载技能：${String(skill)}` : "已加载技能",
+    });
+    return;
+  }
+
+  if (type === "setup_error") {
+    turn.error = `Agent 未配置：缺少 ${String(event.missing || "API Key")}，请在右侧完成配置`;
   }
 }
 
@@ -1597,27 +1938,6 @@ function asAgentEvent(value: unknown): AgentEvent | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as AgentEvent)
     : null;
-}
-
-function formatAgentEvent(event: AgentEvent): string {
-  const type = String(event.type || "event");
-  const tool = event.toolName || event.tool_name || event.name;
-  const skill = event.skillName || event.skill_name;
-  const labels: Record<string, string> = {
-    assistant_message_delta: "回复生成",
-    setup_error: "配置提示",
-    skill_loaded: "Skill 已加载",
-    tool_call: "工具调用",
-    tool_execution_start: "工具开始",
-    tool_execution_update: "工具更新",
-    tool_execution_end: "工具完成",
-    tool_execution_done: "工具完成",
-    tool_execution_error: "工具失败",
-  };
-  if (skill) {
-    return `${labels[type] || type}: ${String(skill)}`;
-  }
-  return tool ? `${labels[type] || type}: ${String(tool)}` : labels[type] || type;
 }
 
 async function bootstrapAfterLogin(): Promise<void> {
@@ -1638,6 +1958,7 @@ async function bootstrapAfterLogin(): Promise<void> {
 
 onMounted(async () => {
   applyAgentSessionState(loadAgentSessionState(getAgentStorage()));
+  loadAgentHistoryFromStorage();
   if (globalThis.location?.hash === "#agent") {
     activePage.value = "agent";
   }
@@ -1648,6 +1969,15 @@ onMounted(async () => {
       maybeForcePasswordChange();
     }
   }
+  document.addEventListener("mousedown", handleSortOutsideClick);
+});
+
+watch(agentTurnsBySession, scheduleAgentHistoryPersist, { deep: true });
+
+onBeforeUnmount(() => {
+  if (agentHistoryPersistTimer) clearTimeout(agentHistoryPersistTimer);
+  if (agentElapsedTimer) clearInterval(agentElapsedTimer);
+  document.removeEventListener("mousedown", handleSortOutsideClick);
 });
 </script>
 
@@ -1969,329 +2299,291 @@ onMounted(async () => {
         <section class="content-area" aria-label="线索和回复工作区">
           <section
             v-if="activePage === 'agent'"
-            class="agent-panel agent-page-panel agent-console-layout agent-chat-shell agent-design-shell"
+            class="ag-shell"
             aria-labelledby="agent-title"
           >
-            <header class="agent-head">
-              <div class="agent-title">
-                <span class="agent-icon">
-                  <Bot :size="21" aria-hidden="true" />
-                </span>
-                <div>
-                  <p class="panel-label">Pi / pi-mono</p>
-                  <h2 id="agent-title">渠道拓展 Agent</h2>
-                  <p>默认使用 overseas-distributor-prospecting skill，并通过后台工具写入线索库。</p>
-                </div>
-              </div>
-              <span class="agent-session">
-                {{ activeAgentSession?.title || "当前会话" }} · {{ shortAgentSessionId(agentSessionId) }}
-              </span>
-            </header>
+            <h2 id="agent-title" class="sr-only">渠道拓展 Agent 对话</h2>
 
-            <section class="agent-session-manager agent-sidebar-panel" aria-label="会话管理">
-              <div class="session-manager-head">
-                <div>
-                  <p class="panel-label">会话管理</p>
-                  <strong>{{ agentSessions.length }} 个会话</strong>
-                </div>
-                <n-button class="ghost-button" secondary :disabled="agentLoading" @click="startNewAgentSession">
-                  <template #icon>
-                    <n-icon><Plus /></n-icon>
-                  </template>
-                  新建会话
-                </n-button>
-              </div>
-              <n-input
-                v-model:value="agentSessionSearch"
-                class="agent-session-search"
-                placeholder="搜索会话..."
-                clearable
+            <aside class="ag-sidebar" aria-label="会话列表">
+              <button
+                type="button"
+                class="ag-new-chat"
+                @click="startNewAgentSession"
               >
-                <template #prefix>
-                  <n-icon><Search /></n-icon>
-                </template>
-              </n-input>
+                <Plus :size="16" aria-hidden="true" /> 新建会话
+              </button>
 
-              <div class="session-list" role="list">
+              <label class="ag-sidebar-search">
+                <Search :size="14" aria-hidden="true" />
+                <input v-model="agentSessionSearch" type="text" placeholder="搜索会话..." />
+              </label>
+
+              <div class="ag-session-list" role="list">
                 <article
                   v-for="session in filteredAgentSessions"
                   :key="session.id"
-                  :class="['session-row', { active: session.id === agentSessionId }]"
+                  :class="['ag-session-row', { active: session.id === agentSessionId }]"
                   role="listitem"
                 >
                   <form
                     v-if="editingSessionId === session.id"
-                    class="session-rename"
+                    class="ag-session-rename"
                     @submit.prevent="saveAgentSessionTitle(session.id)"
                   >
-                    <n-input
-                      v-model="editingSessionTitle"
-                      aria-label="会话名称"
-                      maxlength="80"
-                    />
-                    <n-button class="icon-only-button" type="primary" circle attr-type="submit" aria-label="保存会话名称">
-                      <template #icon>
-                        <n-icon><Check /></n-icon>
-                      </template>
-                    </n-button>
-                    <n-button
-                      class="icon-only-button"
-                      circle
-                      aria-label="取消重命名"
-                      @click="cancelEditAgentSession"
-                    >
-                      <template #icon>
-                        <n-icon><X /></n-icon>
-                      </template>
-                    </n-button>
+                    <input v-model="editingSessionTitle" aria-label="会话名称" maxlength="80" />
+                    <button type="submit" aria-label="保存会话名称"><Check :size="14" aria-hidden="true" /></button>
+                    <button type="button" aria-label="取消重命名" @click="cancelEditAgentSession"><X :size="14" aria-hidden="true" /></button>
                   </form>
-
                   <template v-else>
                     <button
-                      class="session-select-button"
                       type="button"
-                      :disabled="agentLoading"
+                      class="ag-session-btn"
                       @click="switchAgentSession(session.id)"
                     >
-                      <strong>{{ session.title }}</strong>
-                      <small>
-                        {{ formatAgentSessionTime(session.updatedAt) }} ·
-                        {{ shortAgentSessionId(session.id) }}
-                      </small>
+                      <MessageSquare :size="15" class="ag-session-icon" aria-hidden="true" />
+                      <span class="ag-session-text">
+                        <strong>{{ session.title }}</strong>
+                        <small>
+                          {{ formatAgentSessionTime(session.updatedAt) }}
+                          <i v-if="isSessionBusy(session.id)" class="ag-session-busy-dot" aria-label="生成中"></i>
+                        </small>
+                      </span>
                     </button>
-                    <div class="session-row-actions">
-                      <n-button
-                        class="icon-only-button"
-                        circle
-                        :disabled="agentLoading"
+                    <div class="ag-session-actions">
+                      <button
+                        type="button"
                         :aria-label="`重命名 ${session.title}`"
                         @click="beginEditAgentSession(session)"
                       >
-                        <template #icon>
-                          <n-icon><Pencil /></n-icon>
-                        </template>
-                      </n-button>
-                      <n-button
-                        class="icon-only-button danger-action"
-                        circle
-                        :disabled="agentLoading"
+                        <Pencil :size="13" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        class="danger"
                         :aria-label="`删除 ${session.title}`"
                         @click="removeAgentSession(session.id)"
                       >
-                        <template #icon>
-                          <n-icon><Trash2 /></n-icon>
-                        </template>
-                      </n-button>
+                        <Trash2 :size="13" aria-hidden="true" />
+                      </button>
                     </div>
                   </template>
                 </article>
-                <div v-if="filteredAgentSessions.length === 0" class="session-empty-state">
+                <div v-if="filteredAgentSessions.length === 0" class="ag-session-empty">
                   没有匹配的会话
                 </div>
               </div>
-              <div class="session-manager-foot">
-                共 {{ filteredAgentSessions.length }} / {{ agentSessions.length }} 个会话
+            </aside>
+
+            <section class="ag-chat" aria-label="对话">
+              <header class="ag-chat-bar">
+                <div class="ag-chat-bar-title">
+                  <strong>{{ activeAgentSession?.title || "当前会话" }}</strong>
+                  <span class="ag-skill-tag">overseas-distributor-prospecting</span>
+                </div>
+                <div class="ag-chat-bar-actions">
+                  <button type="button" title="复制会话内容" :disabled="!agentOutputText" @click="copyAgentOutput">
+                    <Check :size="15" aria-hidden="true" />
+                  </button>
+                  <button type="button" title="导出为 Markdown" :disabled="!agentOutputText" @click="downloadAgentOutput">
+                    <ExternalLink :size="15" aria-hidden="true" />
+                  </button>
+                  <button type="button" title="复制会话 ID" @click="copyAgentSessionId">
+                    <Clock3 :size="15" aria-hidden="true" />
+                  </button>
+                </div>
+              </header>
+
+              <div class="sr-only" aria-live="polite" aria-atomic="true">{{ agentLiveStatus }}</div>
+
+              <div ref="agentChatScrollRef" class="ag-chat-scroll">
+                <div v-if="agentTurns.length === 0" class="ag-chat-empty">
+                  <span class="ag-chat-empty-icon"><Bot :size="26" aria-hidden="true" /></span>
+                  <strong>向 Agent 发起一个渠道拓展任务</strong>
+                  <p>Agent 会调用网页搜索、抓取、线索评分等工具，并把执行过程实时显示在下面。</p>
+                  <div class="ag-suggestions">
+                    <button
+                      type="button"
+                      @click="applySuggestion('帮我找 SkyWalker TKA 在印度的渠道商，优先找骨科植入物、关节置换、TKA 分销商，要求公开邮箱和来源证据。')"
+                    >
+                      找印度的 TKA 渠道商
+                    </button>
+                    <button
+                      type="button"
+                      @click="applySuggestion('搜索德国的骨科机器人代理商，并给出匹配理由和证据来源。')"
+                    >
+                      搜索德国骨科机器人代理商
+                    </button>
+                    <button
+                      type="button"
+                      @click="applySuggestion('帮我分析这条客户回复的意向：暂不确定预算，需要先了解产品资质。')"
+                    >
+                      分析一条客户回复
+                    </button>
+                  </div>
+                </div>
+
+                <template v-for="turn in agentTurns" :key="turn.id">
+                  <div v-if="turn.role === 'user'" class="ag-turn ag-turn-user">
+                    <form
+                      v-if="agentEditingUserTurnId === turn.id"
+                      class="ag-edit-form"
+                      @submit.prevent="submitEditedMessage"
+                    >
+                      <textarea v-model="agentEditingText" rows="2" aria-label="编辑消息"></textarea>
+                      <div class="ag-edit-actions">
+                        <button type="button" class="ag-edit-cancel" @click="cancelEditUserMessage">取消</button>
+                        <button type="submit" class="ag-edit-submit" :disabled="!agentEditingText.trim()">重新发送</button>
+                      </div>
+                    </form>
+                    <template v-else>
+                      <div class="ag-bubble ag-bubble-user">{{ turn.text }}</div>
+                      <button
+                        v-if="turn.id === lastUserTurnId && !agentLoading"
+                        type="button"
+                        class="ag-turn-tool-btn"
+                        title="编辑并重新发送"
+                        @click="beginEditLastUserMessage(turn)"
+                      >
+                        <Pencil :size="13" aria-hidden="true" />
+                      </button>
+                    </template>
+                  </div>
+                  <div v-else class="ag-turn ag-turn-assistant">
+                    <span class="ag-avatar"><Bot :size="16" aria-hidden="true" /></span>
+                    <div class="ag-turn-body">
+                      <div v-if="turn.toolCalls.length > 0" class="ag-tool-timeline">
+                        <div
+                          v-for="call in turn.toolCalls"
+                          :key="call.id"
+                          :class="['ag-tool-row', `ag-tool-${call.status}`]"
+                        >
+                          <span class="ag-tool-dot">
+                            <Loader2 v-if="call.status === 'running'" :size="12" class="ag-spin" aria-hidden="true" />
+                            <X v-else-if="call.status === 'error'" :size="12" aria-hidden="true" />
+                            <Check v-else :size="12" aria-hidden="true" />
+                          </span>
+                          <component :is="toolMeta(call.toolName).icon" :size="14" class="ag-tool-icon" aria-hidden="true" />
+                          <span class="ag-tool-label">{{ call.detail || toolMeta(call.toolName).label }}</span>
+                          <span class="ag-tool-status">
+                            {{ call.status === 'running' ? '执行中' : call.status === 'error' ? '失败' : '已完成' }}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div v-if="turn.text" class="ag-bubble ag-bubble-assistant">
+                        <MarkdownRenderer :blocks="renderTurnBlocks(turn.text)" />
+                      </div>
+                      <div v-else-if="turn.pending" class="ag-typing-wrap">
+                        <div class="ag-typing" aria-hidden="true"><span></span><span></span><span></span></div>
+                        <small v-if="agentElapsedSeconds >= 3" class="ag-typing-elapsed">
+                          {{ turn.toolCalls.some((c) => c.status === 'running') ? '工具执行中' : '模型思考中' }}
+                          · {{ agentElapsedSeconds }}s
+                          <template v-if="agentElapsedSeconds >= 15">（思考模型可能需要 30–90 秒）</template>
+                        </small>
+                      </div>
+
+                      <p v-if="turn.error" class="ag-turn-error">{{ turn.error }}</p>
+                      <p v-else-if="turn.stopped" class="ag-turn-stopped">已停止生成</p>
+
+                      <div v-if="turn.resultSummary" class="ag-result-chip">
+                        <CheckCircle2 :size="13" aria-hidden="true" />
+                        本轮
+                        <template v-if="turn.resultSummary.leadsAdded > 0">新增 {{ turn.resultSummary.leadsAdded }} 条线索</template>
+                        <template v-if="turn.resultSummary.leadsAdded > 0 && turn.resultSummary.draftsAdded > 0"> · </template>
+                        <template v-if="turn.resultSummary.draftsAdded > 0">生成 {{ turn.resultSummary.draftsAdded }} 封草稿</template>
+                      </div>
+
+                      <button
+                        v-if="turn.id === lastAgentTurnId && !turn.pending && !agentLoading"
+                        type="button"
+                        class="ag-turn-tool-btn"
+                        title="重新生成"
+                        @click="regenerateLastResponse"
+                      >
+                        <RefreshCw :size="13" aria-hidden="true" /> 重新生成
+                      </button>
+                    </div>
+                  </div>
+                </template>
               </div>
+
+              <form class="ag-composer" @submit.prevent="sendAgentPrompt">
+                <textarea
+                  ref="agentComposerRef"
+                  v-model="agentPrompt"
+                  class="ag-composer-input"
+                  placeholder="向 Agent 发起渠道拓展任务，Enter 发送，Shift+Enter 换行"
+                  rows="1"
+                  :disabled="agentLoading"
+                  @input="autoGrowComposer"
+                  @keydown.enter.exact.prevent="sendAgentPrompt"
+                ></textarea>
+                <button
+                  v-if="agentLoading"
+                  type="button"
+                  class="ag-send-button ag-stop-button"
+                  aria-label="停止生成"
+                  title="停止生成"
+                  @click="stopAgentPrompt()"
+                >
+                  <Square :size="14" fill="currentColor" aria-hidden="true" />
+                </button>
+                <button
+                  v-else
+                  type="submit"
+                  class="ag-send-button"
+                  :disabled="!agentPrompt.trim()"
+                  aria-label="发送"
+                >
+                  <Send :size="17" aria-hidden="true" />
+                </button>
+              </form>
             </section>
 
-            <section class="agent-main-panel agent-conversation-panel" aria-label="Agent 任务和输出">
-              <div class="agent-composer-card agent-compose-surface">
-                <div class="agent-composer-heading">
-                  <strong>向 Agent 发起任务</strong>
-                  <span>{{ agentPrompt.length }} / 2000</span>
-                </div>
-                <label class="field agent-field">
-                  <span>任务指令</span>
-                  <n-input
-                    v-model:value="agentPrompt"
-                    type="textarea"
-                    :autosize="{ minRows: 5, maxRows: 10 }"
-                  />
-                </label>
+            <button
+              type="button"
+              class="ag-context-toggle"
+              :aria-expanded="agentContextOpen"
+              aria-label="打开 Agent 配置面板"
+              @click="agentContextOpen = !agentContextOpen"
+            >
+              <SlidersHorizontal :size="18" aria-hidden="true" />
+            </button>
+            <div v-if="agentContextOpen" class="ag-context-scrim" @click="agentContextOpen = false"></div>
 
-                <div class="agent-actions">
-                  <span class="agent-skill-pill">overseas-distributor-prospecting</span>
-                  <div class="agent-action-buttons">
-                    <n-button
-                      class="icon-only-button agent-tune-button"
-                      circle
-                      secondary
-                      aria-label="高级设置"
-                      :aria-expanded="agentSettingsOpen"
-                      @click="toggleAgentSettings"
-                    >
-                      <template #icon>
-                        <n-icon><SlidersHorizontal /></n-icon>
-                      </template>
-                    </n-button>
-                    <n-button
-                      class="ghost-button"
-                      secondary
-                      :disabled="agentLoading"
-                      @click="startNewAgentSession"
-                    >
-                      <template #icon>
-                        <n-icon><RefreshCw /></n-icon>
-                      </template>
-                      新建会话
-                    </n-button>
-                    <n-button
-                      class="primary-button"
-                      type="primary"
-                      size="large"
-                      :loading="agentLoading"
-                      :disabled="agentLoading || !agentPrompt.trim()"
-                      @click="sendAgentPrompt"
-                    >
-                      <template #icon>
-                        <n-icon><Send /></n-icon>
-                      </template>
-                      {{ agentLoading ? "处理中..." : "发送任务" }}
-                    </n-button>
-                  </div>
-                </div>
+            <aside class="ag-context" :class="{ 'ag-context-visible': agentContextOpen }" aria-label="Agent 上下文">
+              <button type="button" class="ag-context-close" aria-label="关闭面板" @click="agentContextOpen = false">
+                <X :size="16" aria-hidden="true" />
+              </button>
 
-                <section
-                  v-if="agentSettingsOpen"
-                  class="agent-settings-panel"
-                  aria-label="Agent 高级设置"
-                >
-                  <div>
-                    <span>Provider</span>
-                    <strong>{{ agentProviderName }}</strong>
-                  </div>
-                  <div>
-                    <span>Model</span>
-                    <strong>{{ agentModelName }}</strong>
-                  </div>
-                  <div>
-                    <span>Session</span>
-                    <strong>{{ shortAgentSessionId(agentSessionId) }}</strong>
-                  </div>
-                  <n-button class="ghost-button" secondary @click="agentConfigExpanded = true">
-                    打开配置管理
-                  </n-button>
-                  <n-button class="ghost-button" secondary @click="copyAgentSessionId">
-                    复制会话 ID
-                  </n-button>
-                </section>
-              </div>
-
-              <div
-                v-if="agentResponse || agentError"
-                :class="[
-                  'agent-output',
-                  'agent-report-card',
-                  { 'agent-report-fullscreen': agentReportFullscreen },
-                ]"
-                aria-live="polite"
+              <section
+                v-if="agentSessionResultTotal.leadsAdded > 0 || agentSessionResultTotal.draftsAdded > 0"
+                class="ag-card"
+                aria-label="本会话战绩"
               >
-                <div class="agent-report-head">
-                  <div>
-                    <strong>Agent 输出</strong>
-                    <n-tag
-                      :type="agentError ? 'error' : agentLoading ? 'info' : 'success'"
-                      size="small"
-                      round
-                      :bordered="false"
-                    >
-                      {{ agentError ? "失败" : agentLoading ? "生成中" : "已完成" }}
-                    </n-tag>
-                  </div>
-                  <span>
-                    <CheckCircle2 :size="15" aria-hidden="true" />
-                    完成于 2026-05-15
-                  </span>
-                  <div class="report-actions">
-                    <button
-                      type="button"
-                      aria-label="复制"
-                      :disabled="!agentOutputText"
-                      @click="copyAgentOutput"
-                    >
-                      <Check :size="15" aria-hidden="true" />
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="导出"
-                      :disabled="!agentOutputText"
-                      @click="downloadAgentOutput"
-                    >
-                      <ExternalLink :size="15" aria-hidden="true" />
-                    </button>
-                    <button
-                      type="button"
-                      :aria-label="agentReportFullscreen ? '退出全屏' : '全屏'"
-                      :disabled="!agentOutputText"
-                      @click="toggleAgentReportFullscreen"
-                    >
-                      <Maximize2 :size="15" aria-hidden="true" />
-                    </button>
-                  </div>
+                <div class="ag-card-head"><strong>本会话战绩</strong></div>
+                <div class="ag-stat-row">
+                  <div class="ag-stat"><strong>{{ agentSessionResultTotal.leadsAdded }}</strong><span>新增线索</span></div>
+                  <div class="ag-stat"><strong>{{ agentSessionResultTotal.draftsAdded }}</strong><span>生成草稿</span></div>
                 </div>
-                <p v-if="agentError" class="error">{{ agentError }}</p>
-                <MarkdownRenderer
-                  v-if="agentResponse"
-                  class="agent-message"
-                  :blocks="agentMarkdownBlocks"
-                />
-              </div>
-              <div v-else class="agent-empty-state agent-report-card" aria-live="polite">
-                <Bot :size="22" aria-hidden="true" />
-                <div>
-                  <strong>输入任务后，Agent 会在这里持续输出。</strong>
-                  <span>工具调用过程会固定显示在右侧执行轨道中，历史默认折叠。</span>
-                </div>
-              </div>
-            </section>
+              </section>
 
-            <aside class="agent-context-rail agent-side-panel" aria-label="Agent 上下文">
-              <section class="agent-config" aria-label="Agent 配置">
-                <div class="agent-config-header">
+              <section class="ag-card" aria-label="Agent 配置">
+                <div class="ag-card-head">
                   <strong>Agent 配置</strong>
-                  <span
-                    :class="[
-                      'status',
-                      agentConfig?.has_api_key ? 'status-qualified' : 'status-needs-review',
-                    ]"
-                  >
-                    <i></i>
-                    {{ agentConfig?.has_api_key ? "已连接" : "未连接" }}
+                  <span :class="['ag-status-dot', agentConfig?.has_api_key ? 'on' : 'off']">
+                    <i></i>{{ agentConfig?.has_api_key ? "已连接" : "未连接" }}
                   </span>
                 </div>
-
-                <dl class="agent-config-summary">
-                  <div>
-                    <dt>Provider</dt>
-                    <dd>{{ agentProviderName }}</dd>
-                  </div>
-                  <div>
-                    <dt>Model</dt>
-                    <dd>{{ agentModelName }}</dd>
-                  </div>
-                  <div>
-                    <dt>API 状态</dt>
-                    <dd>{{ agentConfig?.has_api_key ? "200 OK" : "未配置" }}</dd>
-                  </div>
-                  <div>
-                    <dt>API Key</dt>
-                    <dd>{{ agentConfig?.api_key_preview || "未配置" }}</dd>
-                  </div>
+                <dl class="ag-kv">
+                  <div><dt>Provider</dt><dd>{{ agentProviderName }}</dd></div>
+                  <div><dt>Model</dt><dd>{{ agentModelName }}</dd></div>
+                  <div><dt>API Key</dt><dd>{{ agentConfig?.api_key_preview || "未配置" }}</dd></div>
                 </dl>
-
-                <n-button
-                  class="ghost-button agent-config-manage-button"
-                  secondary
-                  :aria-expanded="agentConfigExpanded"
-                  @click="agentConfigExpanded = !agentConfigExpanded"
-                >
-                  <template #icon>
-                    <n-icon><SlidersHorizontal /></n-icon>
-                  </template>
-                  配置管理
-                </n-button>
-
-                <div v-if="agentConfigExpanded" class="agent-config-grid">
+                <button type="button" class="ag-link-button" @click="agentConfigExpanded = !agentConfigExpanded">
+                  {{ agentConfigExpanded ? "收起配置" : "编辑配置" }}
+                </button>
+                <div v-if="agentConfigExpanded" class="ag-config-form">
                   <label class="field">
                     <span>Provider</span>
                     <n-select v-model:value="agentProviderName" :options="providerOptions" />
@@ -2321,130 +2613,28 @@ onMounted(async () => {
                     :disabled="agentConfigLoading || agentConfigSaving"
                     @click="saveAgentConfig"
                   >
-                    <template #icon>
-                      <n-icon><Save /></n-icon>
-                    </template>
+                    <template #icon><n-icon><Save /></n-icon></template>
                     {{ agentConfigSaving ? "保存中..." : "保存配置" }}
                   </n-button>
-                </div>
-
-                <p v-if="agentConfigNotice" class="notice">{{ agentConfigNotice }}</p>
-                <p v-if="agentConfigError" class="error">{{ agentConfigError }}</p>
-              </section>
-
-              <section class="agent-capability-card" aria-label="当前技能">
-                <div>
-                  <p class="panel-label">当前技能</p>
-                  <n-tag type="success" round :bordered="false">
-                    overseas-distributor-prospecting
-                  </n-tag>
-                  <small>海外经销商线索挖掘与分析</small>
-                </div>
-                <a
-                  href="#agent-title"
-                  :aria-expanded="agentSkillDetailsOpen"
-                  @click.prevent="toggleAgentSkillDetails"
-                >
-                  详情
-                </a>
-              </section>
-
-              <section
-                v-if="agentSkillDetailsOpen"
-                class="agent-skill-detail-panel"
-                aria-label="技能详情"
-              >
-                <div>
-                  <span>适用产品</span>
-                  <strong>SkyWalker TKA / 骨科手术机器人 / 医疗器械渠道</strong>
-                </div>
-                <div>
-                  <span>默认流程</span>
-                  <strong>产品画像、国家市场搜索、线索评分、公开证据汇总</strong>
-                </div>
-                <div>
-                  <span>输出格式</span>
-                  <strong>Markdown 报告 + 可入库线索</strong>
+                  <p v-if="agentConfigNotice" class="notice">{{ agentConfigNotice }}</p>
+                  <p v-if="agentConfigError" class="error">{{ agentConfigError }}</p>
                 </div>
               </section>
 
-              <section class="agent-execution-rail" aria-label="Agent 实时过程">
-                <div class="execution-rail-head">
-                  <div>
-                    <p class="panel-label">执行过程</p>
-                    <strong>{{ currentAgentProcessItem ? "正在执行" : "等待任务" }}</strong>
-                  </div>
-                  <span>{{ agentHistoryCount }} 历史</span>
+              <section class="ag-card" aria-label="当前技能">
+                <div class="ag-card-head">
+                  <strong>当前技能</strong>
+                  <button type="button" class="ag-link-button" @click="toggleAgentSkillDetails">
+                    {{ agentSkillDetailsOpen ? "收起" : "详情" }}
+                  </button>
                 </div>
-
-                <div v-if="currentAgentProcessItem" class="agent-process">
-                  <div
-                    :class="[
-                      'agent-process-item',
-                      'agent-process-current',
-                      `process-${currentAgentProcessItem.kind}`,
-                    ]"
-                  >
-                    <span aria-hidden="true"></span>
-                    <div>
-                      <strong>{{ currentAgentProcessItem.label }}</strong>
-                      <small v-if="currentAgentProcessItem.detail">{{ currentAgentProcessItem.detail }}</small>
-                    </div>
-                  </div>
-                </div>
-                <div v-else class="agent-process-idle">
-                  <span aria-hidden="true"></span>
-                  <div>
-                    <strong>暂无运行中的工具</strong>
-                    <small>发送任务后，这里只展示最新一步。</small>
-                  </div>
-                </div>
-
-                <details v-if="agentHistoryCount > 0" class="agent-history">
-                  <summary>
-                    <span>历史记录</span>
-                    <small>{{ agentHistoryCount }} 条</small>
-                  </summary>
-                  <div v-if="historicalAgentStatusItems.length > 0" class="agent-history-process">
-                    <div
-                      v-for="item in historicalAgentStatusItems"
-                      :key="item.id"
-                      :class="['agent-process-item', `process-${item.kind}`]"
-                    >
-                      <span aria-hidden="true"></span>
-                      <div>
-                        <strong>{{ item.label }}</strong>
-                        <small v-if="item.detail">{{ item.detail }}</small>
-                      </div>
-                    </div>
-                  </div>
-                  <div v-if="agentEvents.length > 0" class="agent-events" aria-label="Agent 工具事件历史">
-                    <span v-for="(event, index) in agentEvents" :key="index">
-                      {{ formatAgentEvent(event) }}
-                    </span>
-                  </div>
-                </details>
-              </section>
-              <n-button
-                class="agent-log-button"
-                secondary
-                block
-                :aria-expanded="agentLogsOpen"
-                @click="toggleAgentLogs"
-              >
-                <template #icon>
-                  <n-icon><Clock3 /></n-icon>
-                </template>
-                查看完整执行日志
-              </n-button>
-              <section v-if="agentLogsOpen" class="agent-log-panel" aria-label="完整执行日志">
-                <article v-for="row in agentLogRows" :key="row.id" class="agent-log-row">
-                  <span>{{ row.title }}</span>
-                  <small>{{ row.detail }}</small>
-                </article>
-                <div v-if="agentLogRows.length === 0" class="agent-log-empty">
-                  暂无执行日志
-                </div>
+                <span class="ag-tag-success">overseas-distributor-prospecting</span>
+                <p class="ag-hint">海外经销商线索挖掘与分析</p>
+                <dl v-if="agentSkillDetailsOpen" class="ag-kv">
+                  <div><dt>适用产品</dt><dd>SkyWalker TKA / 骨科手术机器人 / 医疗器械渠道</dd></div>
+                  <div><dt>默认流程</dt><dd>产品画像、国家市场搜索、线索评分、公开证据汇总</dd></div>
+                  <div><dt>输出格式</dt><dd>Markdown 报告 + 可入库线索</dd></div>
+                </dl>
               </section>
             </aside>
           </section>
@@ -2524,6 +2714,47 @@ onMounted(async () => {
             class="toolbar-region-input"
             @keyup.enter="runAction('dashboard', loadDashboard)"
           />
+
+          <div class="toolbar-sort" aria-label="排序">
+            <button
+              type="button"
+              class="sort-chip sort-chip-trigger"
+              :class="{ active: sortField !== 'id', open: sortDropdownOpen }"
+              :aria-haspopup="'listbox'"
+              :aria-expanded="sortDropdownOpen"
+              @click.stop="toggleSortDropdown"
+            >
+              <SlidersHorizontal :size="13" class="sort-chip-icon" aria-hidden="true" />
+              <span class="sort-chip-label">{{ currentSortLabel }}</span>
+              <ChevronDown :size="13" class="sort-chip-caret" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              class="sort-chip sort-chip-dir"
+              :class="{ active: sortDir === 'asc' }"
+              :aria-label="sortDir === 'desc' ? '当前降序，点击切为升序' : '当前升序，点击切为降序'"
+              :title="sortDir === 'desc' ? '降序' : '升序'"
+              @click="toggleSortDir"
+            >
+              <ArrowDown v-if="sortDir === 'desc'" :size="13" />
+              <ArrowUp v-else :size="13" />
+            </button>
+            <div v-if="sortDropdownOpen" class="sort-dropdown" role="listbox">
+              <button
+                v-for="opt in sortFieldOptions"
+                :key="String(opt.value)"
+                type="button"
+                class="sort-dropdown-item"
+                :class="{ active: sortField === opt.value }"
+                role="option"
+                :aria-selected="sortField === opt.value"
+                @click="selectSortField(String(opt.value))"
+              >
+                <span class="sort-dropdown-label">{{ opt.label }}</span>
+                <Check v-if="sortField === opt.value" :size="14" class="sort-dropdown-check" />
+              </button>
+            </div>
+          </div>
         </div>
 
         <section
@@ -2763,7 +2994,10 @@ onMounted(async () => {
             <button v-if="can('settings.manage')" :class="['settings-tab', { active: settingsTab === 'email' }]" @click="settingsTab = 'email'">邮箱</button>
             <button v-if="can('settings.manage')" :class="['settings-tab', { active: settingsTab === 'sync' }]" @click="settingsTab = 'sync'">同步</button>
             <button v-if="can('agent.config')" :class="['settings-tab', { active: settingsTab === 'agent' }]" @click="settingsTab = 'agent'">Agent</button>
+            <button v-if="can('settings.manage')" :class="['settings-tab', { active: settingsTab === 'scoring' }]" @click="settingsTab = 'scoring'">评分规则</button>
           </div>
+
+          <ScoringRulesSettings v-if="settingsTab === 'scoring' && can('settings.manage')" :request="request" />
 
           <section v-if="settingsTab === 'email' && can('settings.manage')" class="settings-card">
             <div class="settings-card-head">

@@ -409,7 +409,7 @@ onMounted(loadAll);
           <KeyRound :size="15" /> 角色 <span class="seg-count">{{ roles.length }}</span>
         </button>
         <button :class="['seg-btn', { active: tab === 'suppressions' }]" @click="switchTab('suppressions')">
-          <MailX :size="15" /> 抑制名单
+          <MailX :size="15" /> 抑制名单 <span class="seg-count">{{ suppressions.length }}</span>
         </button>
         <button :class="['seg-btn', { active: tab === 'audit' }]" @click="switchTab('audit')">
           <ScrollText :size="15" /> 审计日志
@@ -493,25 +493,31 @@ onMounted(loadAll);
     <!-- ── SUPPRESSIONS (退订/抑制名单) ── -->
     <div v-else-if="tab === 'suppressions'" class="panel">
       <div class="compliance-note">
-        <MailX :size="16" />
+        <MailX :size="16" class="compliance-note-icon" />
         <span>名单内的邮箱<strong>不会再被发送任何邮件</strong>。退订链接点击、回复"不感兴趣"会自动加入；也可手动添加退信/投诉地址。</span>
       </div>
-      <div class="panel-bar suppress-add">
-        <input v-model="newSuppressEmail" type="email" placeholder="email@example.com" @keyup.enter="addSuppression" />
+
+      <div class="panel-bar">
+        <span class="panel-bar-label">共 {{ suppressions.length }} 条抑制记录</span>
+        <button class="btn-ghost" @click="loadSuppressions"><RotateCcw :size="14" /> 刷新</button>
+      </div>
+
+      <form class="suppress-add-card" @submit.prevent="addSuppression">
+        <input v-model="newSuppressEmail" type="email" placeholder="email@example.com" required />
         <select v-model="newSuppressReason">
           <option value="manual">手动</option>
           <option value="bounce">退信</option>
           <option value="complaint">投诉</option>
         </select>
-        <button class="btn-primary" @click="addSuppression"><Plus :size="16" /> 加入名单</button>
-      </div>
+        <button type="submit" class="btn-primary"><Plus :size="16" /> 加入名单</button>
+      </form>
 
       <div v-if="suppressions.length === 0" class="empty">暂无抑制记录</div>
       <div v-else class="ucard-list">
         <article v-for="s in suppressions" :key="s.id" class="ucard">
-          <span class="avatar" style="background:linear-gradient(135deg,#94a3b8,#64748b)"><MailX :size="18" /></span>
+          <span class="avatar suppress-avatar" :class="'reason-' + s.reason"><MailX :size="18" /></span>
           <div class="ucard-main">
-            <div class="ucard-name">{{ s.email }}<span class="tag tag-soft">{{ reasonLabel[s.reason] || s.reason }}</span></div>
+            <div class="ucard-name">{{ s.email }}<span class="tag" :class="'tag-reason-' + s.reason">{{ reasonLabel[s.reason] || s.reason }}</span></div>
             <div class="dim sm">{{ s.source || "—" }} · {{ fmtTime(s.created_at) }}</div>
           </div>
           <div class="row-actions">
@@ -922,16 +928,35 @@ onMounted(loadAll);
   font-size: 13px; line-height: 1.6;
 }
 .compliance-note strong { font-weight: 700; }
-.suppress-add { gap: 10px; }
-.suppress-add input {
-  flex: 1; padding: 9px 12px; border: 1px solid var(--border-strong);
-  border-radius: 9px; font-size: 14px; box-sizing: border-box;
+.compliance-note-icon { flex-shrink: 0; margin-top: 1px; }
+
+.suppress-add-card {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 16px;
 }
-.suppress-add input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
-.suppress-add select {
-  padding: 9px 10px; border: 1px solid var(--border-strong); border-radius: 9px;
-  font-size: 14px; background: var(--surface); cursor: pointer;
+.suppress-add-card input {
+  flex: 1 1 220px; min-width: 180px; padding: 9px 12px; border: 1px solid var(--border-strong);
+  border-radius: 9px; font-size: 14px; box-sizing: border-box; color: var(--text);
 }
+.suppress-add-card input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+.suppress-add-card select {
+  flex: 0 0 auto; padding: 9px 10px; border: 1px solid var(--border-strong); border-radius: 9px;
+  font-size: 14px; background: var(--surface); color: var(--text); cursor: pointer;
+}
+.suppress-add-card .btn-primary { flex: 0 0 auto; white-space: nowrap; }
+
+/* Suppression reason → color coding (keeps 4 reasons visually distinct) */
+.suppress-avatar.reason-bounce { background: linear-gradient(135deg, #f87171, #dc2626); }
+.suppress-avatar.reason-complaint { background: linear-gradient(135deg, #fb923c, #ea580c); }
+.suppress-avatar.reason-unsubscribe,
+.suppress-avatar.reason-reply-optout { background: linear-gradient(135deg, #60a5fa, #2563eb); }
+.suppress-avatar.reason-manual { background: linear-gradient(135deg, #94a3b8, #64748b); }
+.tag-reason-bounce { background: var(--danger-soft); color: var(--danger); }
+.tag-reason-complaint { background: var(--warning-soft); color: var(--warning); }
+.tag-reason-unsubscribe, .tag-reason-reply-optout { background: var(--primary-soft); color: var(--primary-strong); }
+.tag-reason-manual { background: var(--bg-subtle); color: var(--text-muted); }
+
 .empty { padding: 40px; text-align: center; color: var(--text-soft); font-size: 14px; }
 .audit-table { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
 .audit-table th { text-align: left; color: var(--text-muted); font-weight: 600; padding: 11px 14px; background: var(--surface-muted); border-bottom: 1px solid var(--border); }

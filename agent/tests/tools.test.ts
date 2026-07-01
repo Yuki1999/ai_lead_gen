@@ -15,6 +15,7 @@ import { createBusinessTools } from "../src/tools.js";
 type MockClient = Pick<
   BackendClient,
   | "getProductProfile"
+  | "getScoringRules"
   | "webSearch"
   | "fetchUrl"
   | "searchLeads"
@@ -31,7 +32,9 @@ describe("createBusinessTools", () => {
     assert.deepEqual(
       tools.map((tool) => tool.name),
       [
+        "add_leads",
         "get_product_profile",
+        "get_scoring_rules",
         "web_search",
         "fetch_url",
         "search_leads",
@@ -170,6 +173,30 @@ describe("createBusinessTools", () => {
     assertToolResult(result, { product_name: "SkyWalker" });
   });
 
+  it("executes get_scoring_rules through the backend client", async () => {
+    const signal = new AbortController().signal;
+    let calledWith: { signal?: AbortSignal } | undefined;
+    const rules = { weights: [{ key: "channel_fit", label: "渠道匹配度", percent: 40 }], positive_rules: [], negative_rules: [], thresholds: [] };
+    const client = mockClient({
+      getScoringRules: async (options) => {
+        calledWith = options;
+        return rules;
+      },
+    });
+    const tool = getTool("get_scoring_rules", client);
+
+    const result = await tool.execute(
+      "call-1",
+      {},
+      signal,
+      undefined,
+      undefined as never,
+    );
+
+    assert.deepEqual(calledWith, { signal });
+    assertToolResult(result, rules);
+  });
+
   it("executes list_leads through the backend client", async () => {
     const signal = new AbortController().signal;
     let calledWith:
@@ -267,6 +294,7 @@ describe("createBusinessTools", () => {
 function mockClient(overrides: Partial<MockClient> = {}): MockClient {
   return {
     getProductProfile: async () => ({ product_name: "SkyWalker" }),
+    getScoringRules: async () => ({ weights: [], positive_rules: [], negative_rules: [], thresholds: [] }),
     webSearch: async () => ({ query: "", results: [] }),
     fetchUrl: async () => ({ url: "", title: "", text: "" }),
     searchLeads: async () => ({ created_count: 0 }),

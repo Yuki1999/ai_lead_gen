@@ -51,6 +51,51 @@ def test_prospecting_persists_and_lists_leads(tmp_path, monkeypatch):
     assert listed.json()["leads"][0]["region"] == "Europe"
 
 
+def test_batch_create_leads_persists_agent_computed_score(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Agent Found Ortho",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@agent-found-ortho.example",
+                    "score": 87,
+                },
+                {
+                    "company_name": "Agent Found Ortho No Score",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@no-score.example",
+                },
+            ],
+        )
+
+    assert created.status_code == 201
+    leads = created.json()["leads"]
+    assert leads[0]["score"] == 87
+    assert leads[1]["score"] == 50
+
+
+def test_batch_create_leads_rejects_out_of_range_score(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        response = client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Bad Score Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@bad-score.example",
+                    "score": 150,
+                }
+            ],
+        )
+
+    assert response.status_code == 422
+
+
 def test_product_profile_endpoint_reads_root_assets(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         response = client.get("/product/profile")
@@ -369,13 +414,50 @@ def test_web_fetch_endpoint_returns_page_preview(tmp_path, monkeypatch):
     assert response.json()["email_found"] is True
 
 
+def test_agent_chat_delegates_the_calling_users_own_token(tmp_path, monkeypatch):
+    """The sidecar must receive THIS specific user's JWT (not the admin's, not
+    the service token), so its tool calls run under that user's real RBAC
+    permissions rather than a blanket-privileged identity."""
+    monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
+    from app import main as main_module
+    from app.auth import decode_token
+
+    captured = {}
+
+    def fake_forward_agent_chat(payload, user_token=None):
+        captured["user_token"] = user_token
+        return {"message": "ok", "session_id": "s", "events": []}
+
+    monkeypatch.setattr(main_module, "forward_agent_chat", fake_forward_agent_chat, raising=False)
+
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post(
+            "/admin/roles", json={"name": "chat-only", "permissions": ["agent.use"]}
+        ).json()
+        client.post(
+            "/admin/users",
+            json={"username": "chatter", "password": "chatter123", "role_ids": [role["id"]]},
+        )
+
+    with TestClient(main_module.create_app()) as c2:
+        _authenticate(c2, "chatter", "chatter123")
+        c2.post("/agent/chat", json={"message": "hi"})
+
+    payload = decode_token(captured["user_token"])
+    assert payload is not None
+    assert payload["username"] == "chatter"
+
+
 def test_agent_chat_proxy_forwards_to_sidecar(tmp_path, monkeypatch):
     monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
     from app import main as main_module
 
-    def fake_forward_agent_chat(payload):
+    def fake_forward_agent_chat(payload, user_token=None):
         assert payload["message"] == "Find India SkyWalker TKA distributors"
         assert payload["session_id"] is None
+        # The signed-in admin's own JWT must be delegated to the sidecar so its
+        # tool calls run under the real caller's RBAC permissions.
+        assert user_token
         return {
             "message": "Found 3 candidate distributors.",
             "session_id": "test-session",
@@ -401,8 +483,9 @@ def test_agent_chat_stream_proxy_forwards_sse(tmp_path, monkeypatch):
     monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
     from app import main as main_module
 
-    def fake_forward_agent_chat_stream(payload):
+    def fake_forward_agent_chat_stream(payload, user_token=None):
         assert payload["message"] == "Find India SkyWalker TKA distributors"
+        assert user_token
         yield b'event: start\ndata: {"session_id":"test-session"}\n\n'
         yield b'event: delta\ndata: {"text":"Found "}\n\n'
         yield b'event: done\ndata: {"message":"Found 3","session_id":"test-session","events":[]}\n\n'
@@ -435,7 +518,7 @@ def test_agent_chat_proxy_reports_sidecar_unavailable(tmp_path, monkeypatch):
     from app import main as main_module
     from app.agent_proxy import AgentProxyError
 
-    def fake_forward_agent_chat(payload):
+    def fake_forward_agent_chat(payload, user_token=None):
         raise AgentProxyError(status_code=503, detail="Agent sidecar unavailable at http://localhost:8011")
 
     monkeypatch.setattr(main_module, "forward_agent_chat", fake_forward_agent_chat, raising=False)
@@ -1010,3 +1093,133 @@ def test_bounce_message_suppresses_recipient(tmp_path, monkeypatch):
         result = client.post("/replies/sync").json()
         assert result["bounced_suppressed"] == 1
         assert any(s["email"] == "deadbox@bco.example" for s in client.get("/admin/suppressions").json()["suppressions"])
+
+
+# ── Configurable lead scoring rules ────────────────────────────────────────────
+
+def test_scoring_rules_defaults_match_skill_md(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        rules = client.get("/scoring/rules").json()
+
+    weight_total = sum(w["percent"] for w in rules["weights"])
+    assert weight_total == 100
+    assert rules["positive_rules"][0] == {"points": 25, "description": "官网确认从事医疗器械分销、进口或渠道销售"}
+    assert rules["thresholds"][0]["status"] == "qualified"
+    assert rules["updated_at"] == ""
+
+
+def test_scoring_rules_readable_via_service_token(tmp_path, monkeypatch):
+    """The Agent's tool call authenticates with the service token, not a user
+    JWT — it must still be able to read the current rules."""
+    import os as _os
+    monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
+    monkeypatch.setenv("MEDBOT_SERVICE_TOKEN", "svc-secret")
+    from app.main import create_app
+
+    with TestClient(create_app()) as client:
+        resp = client.get("/scoring/rules", headers={"X-Service-Token": "svc-secret"})
+        assert resp.status_code == 200
+        assert len(resp.json()["weights"]) > 0
+
+
+def test_update_scoring_rules_persists_and_requires_settings_manage(tmp_path, monkeypatch):
+    custom = {
+        "weights": [{"key": "channel_fit", "label": "渠道匹配度", "percent": 100}],
+        "positive_rules": [{"points": 50, "description": "自定义规则"}],
+        "negative_rules": [{"points": -50, "description": "自定义扣分"}],
+        "thresholds": [{"min": 0, "max": 100, "status": "new", "label": "全部待核验"}],
+    }
+    with _client(tmp_path, monkeypatch) as client:
+        updated = client.put("/scoring/rules", json=custom).json()
+        assert updated["weights"][0]["percent"] == 100
+        assert updated["updated_at"] != ""
+
+        # Persisted: a fresh GET reflects the change, not the defaults.
+        fetched = client.get("/scoring/rules").json()
+        assert fetched["positive_rules"][0]["description"] == "自定义规则"
+
+        # A limited role without settings.manage cannot edit, but can still read.
+        role = client.post("/admin/roles", json={"name": "score-reader", "permissions": ["leads.view"]}).json()
+        client.post("/admin/users", json={"username": "score_reader", "password": "reader123x", "role_ids": [role["id"]]})
+
+    from app.main import create_app as _create_app
+
+    with TestClient(_create_app()) as c2:
+        _authenticate(c2, "score_reader", "reader123x")
+        assert c2.get("/scoring/rules").status_code == 200
+        assert c2.put("/scoring/rules", json=custom).status_code == 403
+
+
+def test_leads_sort_multiple_fields(tmp_path, monkeypatch):
+    """
+    /leads should honour ?sort=&order= for every whitelisted column, fall back
+    to id on unknown fields, and apply created_at DESC as a stable tiebreaker
+    within score/status/… ties.
+    """
+    with _client(tmp_path, monkeypatch) as client:
+        # Insert leads in a known order. Batch keeps insertion sequential so
+        # created_at strictly increases along the array, letting us reason about
+        # tiebreakers by id order.
+        payload = [
+            {"company_name": "Alpha Ortho",  "region": "Europe", "country": "Germany",
+             "email": "a@alpha.example", "score": 60},
+            {"company_name": "Bravo Med",    "region": "Europe", "country": "France",
+             "email": "b@bravo.example",   "score": 90},
+            {"company_name": "Charlie Bio",  "region": "Asia",   "country": "Japan",
+             "email": "c@charlie.example", "score": 90},   # ties with Bravo on score
+            {"company_name": "Delta Robotics","region": "Asia",  "country": "India",
+             "email": "d@delta.example",   "score": 75},
+        ]
+        created = client.post("/leads/batch", json=payload)
+        assert created.status_code == 201
+        ids = [lead["id"] for lead in created.json()["leads"]]
+        assert len(ids) == 4
+
+        # 1) score DESC with tie: 90 (Charlie, newer) → 90 (Bravo) → 75 → 60
+        resp = client.get("/leads", params={"sort": "score", "order": "desc"})
+        assert resp.status_code == 200
+        names = [lead["company_name"] for lead in resp.json()["leads"]]
+        assert names == ["Charlie Bio", "Bravo Med", "Delta Robotics", "Alpha Ortho"]
+
+        # 2) created_at ASC: oldest first, matches insertion order
+        resp = client.get("/leads", params={"sort": "created_at", "order": "asc"})
+        assert resp.status_code == 200
+        names_asc = [lead["company_name"] for lead in resp.json()["leads"]]
+        assert names_asc == ["Alpha Ortho", "Bravo Med", "Charlie Bio", "Delta Robotics"]
+
+        # 3) company_name ASC — SQLite BINARY sort on the leading ASCII letter.
+        resp = client.get("/leads", params={"sort": "company_name", "order": "asc"})
+        names_alpha = [lead["company_name"] for lead in resp.json()["leads"]]
+        assert names_alpha == sorted(names_alpha)
+
+        # 4) Unknown sort key falls back to id DESC (default behaviour preserved).
+        resp = client.get("/leads", params={"sort": "email", "order": "desc"})
+        ids_returned = [lead["id"] for lead in resp.json()["leads"]]
+        assert ids_returned == sorted(ids, reverse=True)
+
+        # 5) Invalid order value falls back to DESC (case-insensitive comparison).
+        resp = client.get("/leads", params={"sort": "score", "order": "GIBBERISH"})
+        scores = [lead["score"] for lead in resp.json()["leads"]]
+        assert scores == sorted(scores, reverse=True)
+
+        # 6) reply_count DESC — insert two replies against Alpha Ortho, one
+        # against Delta, none for the rest. Alpha should sort first.
+        from app.db import insert_reply_analysis
+        from app.services import ReplyAnalysis
+        stub = ReplyAnalysis(
+            intent="interested", confidence=0.9, summary="", next_action="",
+            requires_human=False,
+        )
+        alpha_id = created.json()["leads"][0]["id"]
+        delta_id = created.json()["leads"][3]["id"]
+        insert_reply_analysis(lead_id=alpha_id, reply_text="reply 1", analysis=stub)
+        insert_reply_analysis(lead_id=alpha_id, reply_text="reply 2", analysis=stub)
+        insert_reply_analysis(lead_id=delta_id, reply_text="reply 3", analysis=stub)
+
+        resp = client.get("/leads", params={"sort": "reply_count", "order": "desc"})
+        rows = resp.json()["leads"]
+        assert rows[0]["company_name"] == "Alpha Ortho"
+        assert rows[0]["reply_count"] == 2
+        assert rows[1]["company_name"] == "Delta Robotics"
+        assert rows[1]["reply_count"] == 1
+        assert rows[2]["reply_count"] == 0 and rows[3]["reply_count"] == 0

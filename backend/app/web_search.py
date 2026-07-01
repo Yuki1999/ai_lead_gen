@@ -19,6 +19,9 @@ class HttpClient(Protocol):
     def get(self, url: str, **kwargs: object) -> requests.Response:
         ...
 
+    def post(self, url: str, **kwargs: object) -> requests.Response:
+        ...
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -42,6 +45,8 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 USER_AGENT = "Mozilla/5.0 (compatible; MedbotProspectingDemo/0.1)"
 SEARCH_TIMEOUT_SECONDS = 5
 PAGE_TIMEOUT_SECONDS = 3
+TAVILY_TIMEOUT_SECONDS = 8
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 SEED_PROSPECTS = [
     SeedProspect(
         name="ITS Implant",
@@ -172,6 +177,8 @@ def discover_real_prospects(
                 product_profile=product_profile,
                 region=_region_from_query(query, regions),
             )
+            if lead is None:
+                continue
             leads.append(lead)
             if len(leads) >= max_results:
                 return leads
@@ -205,20 +212,20 @@ def _append_seed_prospects(
             continue
 
         seen_domains.add(domain)
-        leads.append(
-            _candidate_from_result(
-                result=SearchResult(
-                    title=seed.name,
-                    url=seed.url,
-                    snippet=seed.hint,
-                    query="verified seed source",
-                ),
-                page=page,
-                email=_choose_email(emails, seed.url),
-                product_profile=product_profile,
-                region=seed.country,
-            )
+        seed_lead = _candidate_from_result(
+            result=SearchResult(
+                title=seed.name,
+                url=seed.url,
+                snippet=seed.hint,
+                query="verified seed source",
+            ),
+            page=page,
+            email=_choose_email(emails, seed.url),
+            product_profile=product_profile,
+            region=seed.country,
         )
+        if seed_lead is not None:
+            leads.append(seed_lead)
 
 
 def _seed_matches_targets(seed: SeedProspect, targets: list[str]) -> bool:
@@ -259,8 +266,67 @@ def build_search_queries(
 
 def search_web(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
     http = http or requests.Session()
+    # Tavily is the primary provider: DuckDuckGo/Bing scraping is unreliable
+    # from mainland China networks (blocked, rate-limited, or CAPTCHA-gated),
+    # which was producing sparse/low-quality real-search results in
+    # production. The scrapers below remain as a fallback if Tavily has no
+    # API key configured or its call fails.
+    results = search_tavily(query, http=http, limit=limit)
+    if results:
+        return results
     results = search_duckduckgo(query, http=http, limit=limit)
     return results or search_jina_reader(query, http=http, limit=limit) or search_bing(query, http=http, limit=limit)
+
+
+def _tavily_api_key() -> str:
+    return os.getenv("TAVILY_API_KEY", "").strip()
+
+
+def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
+    api_key = _tavily_api_key()
+    if not api_key:
+        return []
+    http = http or requests.Session()
+    try:
+        response = http.post(
+            TAVILY_SEARCH_URL,
+            json={
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": limit,
+                "include_answer": False,
+                "include_raw_content": False,
+            },
+            timeout=TAVILY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return []
+    if response.status_code >= 400:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+
+    results: list[SearchResult] = []
+    for item in data.get("results", []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        if not _is_http_url(url):
+            continue
+        results.append(
+            SearchResult(
+                title=str(item.get("title", "")).strip(),
+                url=url,
+                snippet=str(item.get("content", "")).strip(),
+                query=query,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
 
 
 def search_duckduckgo(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
@@ -460,15 +526,27 @@ def _candidate_from_result(
     email: str,
     product_profile: ProductProfile,
     region: str,
-) -> CandidateLead:
+) -> CandidateLead | None:
     evidence = f"{result.title} {result.snippet} {page.text[:3000]}".lower()
     category = _category_from_evidence(evidence)
     score = _score(evidence=evidence, email=email, product_profile=product_profile)
     company_name = _clean_company_name(page.title, fallback=result.title)
 
-    # Reject results that look like dictionary/encyclopedia/wiki entries
-    if _is_low_value_title(company_name):
-        company_name = ""  # will be rejected below
+    # Reject dictionary/encyclopedia/wiki/journal/error-page style titles.
+    if _is_low_value_title(company_name) or _is_low_value_title(result.title):
+        return None
+
+    # Reject soft-404 / error / "page not found" pages that returned HTTP 200
+    # but clearly aren't a company page (status-code checks alone miss these).
+    if _looks_like_error_page(title=page.title, text=page.text):
+        return None
+
+    # Require at least one topical signal (orthopedics / medical device /
+    # distribution). Without this, ANY page with a scraped email — a journal's
+    # editorial contact, a forum's support address — would still pass, since
+    # having an email is otherwise the only real filter.
+    if not _has_topical_relevance(evidence):
+        return None
 
     country = region
     match_reason = (
@@ -602,7 +680,7 @@ def _choose_email(emails: list[str], url: str) -> str:
 
 
 def _is_low_value_title(name: str) -> bool:
-    """Reject titles that look like dictionary/encyclopedia/wiki/definition/translation entries."""
+    """Reject titles that look like dictionary/wiki/journal/forum/error-page entries."""
     lowered = name.lower()
     patterns = [
         "是什么意思", "的翻译", "的读音", "的用法", "的例句",
@@ -611,8 +689,52 @@ def _is_low_value_title(name: str) -> bool:
         " - wikipedia", "wikipedia, the free",
         "dictionary", "encyclopedia", "thesaurus",
         "翻译", "词典", "字典", "词霸", "爱词霸",
+        # Academic journals / papers / literature
+        "杂志", "期刊", "学报", "论文", "文献",
+        "journal of", "proceedings of", "conference on",
+        # Q&A / forum / column content (not a company)
+        "专栏", "问答", "讨论区", "论坛",
+        # Soft-404 / error / unavailable pages that often return HTTP 200
+        "404", "page not found", "not found", "页面不存在", "页面未找到",
+        "无法访问", "访问出错", "出错了", "服务器错误", "维护中",
+        "under maintenance", "access denied", "forbidden",
     ]
     return any(p in lowered for p in patterns)
+
+
+# Domain-agnostic backstop for soft-404 pages: many sites render an "error" or
+# "not found" page with HTTP 200. Combine a phrase match with very short body
+# text — a real company page almost never has both.
+_ERROR_PAGE_PHRASES = (
+    "404", "page not found", "not found", "页面不存在", "页面未找到",
+    "无法访问", "访问出错", "出错了", "该页面", "链接已失效",
+    "under maintenance", "access denied", "内容不存在", "内容已删除",
+)
+
+
+def _looks_like_error_page(*, title: str, text: str) -> bool:
+    haystack = f"{title} {text[:400]}".lower()
+    has_error_phrase = any(phrase in haystack for phrase in _ERROR_PAGE_PHRASES)
+    is_very_short = len(re.sub(r"\s+", "", text)) < 120
+    return has_error_phrase and is_very_short
+
+
+_TOPICAL_TERMS = (
+    "orthopedic", "orthopaedic", "implant", "joint replacement", "arthroplasty",
+    "knee", "hip", "distributor", "distribution", "medical device",
+    "surgical", "surgery", "robotics", "navigation", "prosthesis", "prosthetic",
+    "骨科", "关节", "植入物", "经销", "代理", "分销", "手术机器人", "医疗器械",
+)
+
+
+def _has_topical_relevance(evidence: str) -> bool:
+    """Require at least one orthopedics/medical-device/distribution signal.
+
+    Without this, any page with a scraped email — an academic journal's
+    editorial contact, a forum's support address — would still pass, since
+    having an email was otherwise the only real acceptance criterion.
+    """
+    return any(term in evidence for term in _TOPICAL_TERMS)
 
 
 def _clean_company_name(title: str, *, fallback: str = "") -> str:
@@ -658,6 +780,9 @@ def _is_low_value_domain(domain: str) -> bool:
         "answers.com",
         "britannica.com",
         "encyclopedia.com",
+        "baidu.com",
+        "baike.baidu.com",
+        "zhidao.baidu.com",
         # Translation / language
         "translate.google",
         "deepl.com",
@@ -666,6 +791,40 @@ def _is_low_value_domain(domain: str) -> bool:
         "dict.cc",
         "bab.la",
         "glosbe.com",
+        # Chinese Q&A / content / social platforms
+        "zhihu.com",
+        "douban.com",
+        "weibo.com",
+        "xiaohongshu.com",
+        "bilibili.com",
+        "toutiao.com",
+        "sohu.com",
+        "163.com",
+        "qq.com",
+        "sina.com.cn",
+        "csdn.net",
+        "jianshu.com",
+        # Academic journals / literature databases / paper repositories
+        "cnki.net",
+        "wanfangdata.com.cn",
+        "cqvip.com",
+        "oversea.cnki.net",
+        "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "researchgate.net",
+        "sciencedirect.com",
+        "springer.com",
+        "springerlink.com",
+        "wiley.com",
+        "nature.com",
+        "jamanetwork.com",
+        "nejm.org",
+        "thelancet.com",
+        "tandfonline.com",
+        "academic.oup.com",
+        "semanticscholar.org",
+        "jstor.org",
+        "scholar.google.com",
         # News / media aggregators
         "reddit.com",
         "medium.com",

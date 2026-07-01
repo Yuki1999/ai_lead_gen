@@ -34,6 +34,7 @@ export interface AddLeadsInput {
     match_reason?: string;
     source?: string;
     lead_type?: string;
+    score?: number;
   }>;
 }
 
@@ -52,17 +53,38 @@ export interface BackendRequestOptions {
 
 type JsonObject = Record<string, unknown>;
 
+export interface BackendClientAuth {
+  /** Blanket-privileged fallback used when no specific human user is delegating. */
+  serviceToken?: string;
+  /** The delegating human user's own JWT — preferred whenever available so
+   * outbound tool calls run under that user's real RBAC permissions. */
+  userToken?: string;
+}
+
 export class BackendClient {
   readonly #baseUrl: string;
   readonly #serviceToken: string | undefined;
+  #userToken: string | undefined;
 
-  constructor(baseUrl: string, serviceToken?: string) {
+  constructor(baseUrl: string, auth: BackendClientAuth = {}) {
     this.#baseUrl = baseUrl.replace(/\/+$/, "");
-    this.#serviceToken = serviceToken;
+    this.#serviceToken = auth.serviceToken;
+    this.#userToken = auth.userToken;
+  }
+
+  /** Update which user this client's outbound calls are delegated as. Called
+   * per chat turn so a long-lived cached session always uses the current
+   * request's identity rather than a stale one from session creation time. */
+  setUserToken(userToken: string | undefined): void {
+    this.#userToken = userToken;
   }
 
   getProductProfile(options: BackendRequestOptions = {}): Promise<JsonObject> {
     return this.#request("GET", "/product/profile", undefined, options);
+  }
+
+  getScoringRules(options: BackendRequestOptions = {}): Promise<JsonObject> {
+    return this.#request("GET", "/scoring/rules", undefined, options);
   }
 
   searchLeads(
@@ -145,8 +167,13 @@ export class BackendClient {
     if (body) {
       headers["Content-Type"] = "application/json";
     }
-    if (this.#serviceToken) {
-      // Authenticate to the RBAC-protected backend as a trusted service principal.
+    if (this.#userToken) {
+      // Delegate as the human user who started this chat, so RBAC is enforced
+      // exactly as if they'd called the API directly (not a blanket service grant).
+      headers["Authorization"] = `Bearer ${this.#userToken}`;
+    } else if (this.#serviceToken) {
+      // Fallback: no delegating user available, authenticate as the trusted
+      // service principal (full permissions).
       headers["X-Service-Token"] = this.#serviceToken;
     }
 

@@ -31,6 +31,9 @@ class LeadCreateRequest(BaseModel):
     source: str = Field(default="manual", max_length=500)
     # "distributor" | "kol" | "" — selects which approved email template is used.
     lead_type: str = Field(default="", max_length=20)
+    # Agent-computed score per the admin-configured scoring rules (get_scoring_rules).
+    # Left unset for manual entries, which default to a neutral score.
+    score: int | None = Field(default=None, ge=0, le=100)
 
 
 class LeadUpdateRequest(BaseModel):
@@ -134,3 +137,38 @@ class SuppressionCreateRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     reason: str = Field(default="manual", max_length=40)
     notes: str = Field(default="", max_length=500)
+
+
+# ── Lead scoring rules (used by the overseas-distributor-prospecting skill) ──
+
+class ScoringWeight(BaseModel):
+    key: str = Field(min_length=1, max_length=60)
+    label: str = Field(min_length=1, max_length=100)
+    percent: int = Field(ge=0, le=100)
+
+
+class ScoringRule(BaseModel):
+    points: int = Field(ge=-100, le=100)
+    description: str = Field(min_length=1, max_length=300)
+
+
+class ScoringThreshold(BaseModel):
+    min: int = Field(ge=0, le=100)
+    max: int = Field(ge=0, le=100)
+    status: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=100)
+
+
+class ScoringRulesResponse(BaseModel):
+    weights: list[ScoringWeight]
+    positive_rules: list[ScoringRule]
+    negative_rules: list[ScoringRule]
+    thresholds: list[ScoringThreshold]
+    updated_at: str = ""
+
+
+class ScoringRulesUpdateRequest(BaseModel):
+    weights: list[ScoringWeight]
+    positive_rules: list[ScoringRule]
+    negative_rules: list[ScoringRule]
+    thresholds: list[ScoringThreshold]

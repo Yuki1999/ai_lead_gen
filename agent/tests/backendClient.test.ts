@@ -172,6 +172,60 @@ describe("BackendClient", () => {
     );
   });
 
+  it("delegates as the given user (Authorization header) in preference to the service token", async () => {
+    await withMockBackend(
+      (request) => {
+        assert.equal(request.headers.authorization, "Bearer user-jwt");
+        assert.equal(request.headers["x-service-token"], undefined);
+        return { product_name: "SkyWalker" };
+      },
+      async (baseUrl) => {
+        const client = new BackendClient(baseUrl, {
+          serviceToken: "service-secret",
+          userToken: "user-jwt",
+        });
+
+        await client.getProductProfile();
+      },
+    );
+  });
+
+  it("falls back to the service token when no user is delegating", async () => {
+    await withMockBackend(
+      (request) => {
+        assert.equal(request.headers["x-service-token"], "service-secret");
+        assert.equal(request.headers.authorization, undefined);
+        return { product_name: "SkyWalker" };
+      },
+      async (baseUrl) => {
+        const client = new BackendClient(baseUrl, { serviceToken: "service-secret" });
+
+        await client.getProductProfile();
+      },
+    );
+  });
+
+  it("setUserToken() switches a live client from service to user delegation", async () => {
+    let call = 0;
+    await withMockBackend(
+      (request) => {
+        call += 1;
+        if (call === 1) {
+          assert.equal(request.headers["x-service-token"], "service-secret");
+        } else {
+          assert.equal(request.headers.authorization, "Bearer user-jwt");
+        }
+        return { product_name: "SkyWalker" };
+      },
+      async (baseUrl) => {
+        const client = new BackendClient(baseUrl, { serviceToken: "service-secret" });
+        await client.getProductProfile();
+        client.setUserToken("user-jwt");
+        await client.getProductProfile();
+      },
+    );
+  });
+
   it("forwards AbortSignal to fetch", async () => {
     const controller = new AbortController();
     controller.abort();

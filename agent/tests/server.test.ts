@@ -112,6 +112,49 @@ describe("agent server", () => {
     });
   });
 
+  it("forwards the X-User-Token header to the chat runner for delegation", async () => {
+    let received: string | undefined;
+    const response = await request(
+      createServer({
+        env: testEnv({ OPENAI_API_KEY: "test-key" }),
+        runChat: async (message, sessionId, config, userToken) => {
+          received = userToken;
+          return { message: "ok", events: [] };
+        },
+      }),
+      "/agent/chat",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-User-Token": "user-jwt-abc" },
+        body: JSON.stringify({ message: "Find India distributors" }),
+      },
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(received, "user-jwt-abc");
+  });
+
+  it("passes undefined userToken to the runner when no X-User-Token header is sent", async () => {
+    let received: string | undefined = "not-called";
+    await request(
+      createServer({
+        env: testEnv({ OPENAI_API_KEY: "test-key" }),
+        runChat: async (message, sessionId, config, userToken) => {
+          received = userToken;
+          return { message: "ok", events: [] };
+        },
+      }),
+      "/agent/chat",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "Find India distributors" }),
+      },
+    );
+
+    assert.equal(received, undefined);
+  });
+
   it("streams chat runner progress as server-sent events", async () => {
     const response = await request(
       createServer({

@@ -15,7 +15,7 @@ description: Use when conducting overseas distributor or KOL prospecting for Med
    - 通过 `add_leads` / `search_leads` 保存线索时带上 `lead_type`，外联会据此选用对应的批准版邮件模板。
 2. **联系方式放宽**：公开邮箱、官网联系页、LinkedIn 均可接受，能建立有效触达即视为合格（优先级：官网邮箱 > LinkedIn > 官网联系表）。
 3. **竞品代理不再一刀切排除**：代理 Mako / ROSA / Cori 等竞品者改为个案评估，在评分中酌情降级，而非直接 reject。
-4. **评分权重**：渠道匹配度 40% · 目标市场战略优先级 25% · 学术/品牌公开资历 20% · 联系方式可用性 10% · 公开 KOL/医院合作记录 5%。
+4. **评分权重可配置**：默认为渠道匹配度 40% · 目标市场战略优先级 25% · 学术/品牌公开资历 20% · 联系方式可用性 10% · 公开 KOL/医院合作记录 5%，管理员可在「设置 → 评分规则」页调整权重、加减分项与分数区间。**打分前必须调用 `get_scoring_rules` 工具获取当前生效的规则**，不要凭本文档记忆的默认值打分（见第 5 步）。
 5. **外联与发送由后端按批准模板处理**：本 skill 仍**不撰写邮件正文**；调用 `create_outreach_records` 后，后端用批准版模板（代理商/KOL、中英文、统一署名、专人对接 CTA）生成邮件。是否自动发送由后端 `auto_send_enabled` 设置控制（默认存草稿，需人工审核）。
 6. **回复转人工触发词**（价格/报价、独家、注册证/认证/FDA/CE、招投标、合同、付款、临床声明/适应症/疗效、样机/试用/演示）由后端 `analyze_reply` 统一判断，命中即转人工。
 
@@ -312,9 +312,16 @@ For every retained lead, capture:
 
 ### Step 5: Score Each Lead
 
-Start from 0 and apply the rules below.
+**Call the `get_scoring_rules` tool before scoring any lead in this session.** The
+weights, point values, and thresholds are admin-configurable and may have been
+customized — always use the values the tool returns. The rules below are only
+the illustrative default shown to a human reader of this document; if the tool
+call fails or is unavailable, fall back to these defaults instead of guessing.
 
-Positive scoring:
+Start from 0 and apply the rules returned by `get_scoring_rules` (or the
+defaults below as a fallback).
+
+Default positive scoring:
 
 - +25 if the official site confirms medical device distribution, importation, or channel sales.
 - +20 if the company has clear orthopedic implants, joint replacement, knee arthroplasty, surgical equipment, robotics, navigation, or OR capital equipment relevance.
@@ -324,7 +331,7 @@ Positive scoring:
 - +10 if the company appears in a manufacturer partner page, official exhibitor list, regulatory/importer directory, or medical device association directory.
 - +5 if the company has multi-country coverage that is relevant to the target region.
 
-Negative scoring:
+Default negative scoring:
 
 - -20 if source evidence is weak or incomplete.
 - -20 if only LinkedIn/social/trade-directory evidence is available and no official site confirmation exists.
@@ -334,7 +341,7 @@ Negative scoring:
 
 Clamp score to 0–100.
 
-Recommended interpretation:
+Default interpretation (use the `thresholds` returned by `get_scoring_rules` instead when available):
 
 | Score | Meaning | Usual Status |
 | ---: | --- | --- |
@@ -345,6 +352,8 @@ Recommended interpretation:
 
 Do not force a high score.  
 A company with broad medical device distribution but no orthopedic evidence should normally be medium-fit or human-review.
+
+**When calling `add_leads` to persist a lead, always pass the `score` field with the number you just calculated.** If omitted, the lead is saved with a generic default score instead of your actual assessment, and the scoring work above is lost.
 
 ---
 

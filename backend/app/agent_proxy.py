@@ -20,9 +20,19 @@ def get_agent_base_url() -> str:
     return os.getenv("AGENT_BASE_URL", "http://localhost:8011").rstrip("/")
 
 
-def get_agent_headers() -> dict[str, str]:
+def get_agent_headers(*, user_token: str | None = None) -> dict[str, str]:
     token = os.getenv("AGENT_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if user_token:
+        # Identifies which authenticated human user this chat request is on
+        # behalf of. The sidecar forwards this as the user's own bearer token
+        # on its outbound tool calls, so those calls run under the user's real
+        # RBAC permissions instead of the sidecar's blanket-privileged service
+        # token (see BackendClient / X-Service-Token vs Authorization).
+        headers["X-User-Token"] = user_token
+    return headers
 
 
 def forward_agent_chat(
@@ -30,10 +40,11 @@ def forward_agent_chat(
     *,
     http: Any = requests,
     timeout: float = 90.0,
+    user_token: str | None = None,
 ) -> dict[str, Any]:
     url = f"{get_agent_base_url()}/agent/chat"
     post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout}
-    headers = get_agent_headers()
+    headers = get_agent_headers(user_token=user_token)
     if headers:
         post_kwargs["headers"] = headers
 
@@ -68,10 +79,11 @@ def forward_agent_chat_stream(
     *,
     http: Any = requests,
     timeout: float = 90.0,
+    user_token: str | None = None,
 ) -> Any:
     url = f"{get_agent_base_url()}/agent/chat/stream"
     post_kwargs: dict[str, Any] = {"json": payload, "timeout": timeout, "stream": True}
-    headers = get_agent_headers()
+    headers = get_agent_headers(user_token=user_token)
     if headers:
         post_kwargs["headers"] = headers
 

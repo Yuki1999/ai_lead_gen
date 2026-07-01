@@ -57,6 +57,11 @@ type CachedSessionEntry<TSession> =
 // finally; cached sessions are disposed when their runtime config changes.
 const sessionCache = new Map<string, CachedSessionEntry<AgentSession>>();
 const promptLocks = new Map<string, Promise<void>>();
+// Each cached session's BackendClient, keyed by the session object itself so
+// entries are freed automatically (WeakMap) whenever a session is evicted —
+// no manual cleanup needed. Looked up each turn to refresh the delegated
+// user's token even on a reused, long-lived cached session.
+const sessionBackends = new WeakMap<AgentSession, BackendClient>();
 
 export function buildSystemPrompt(base?: string): string {
   return base ? `${base}\n\n${DEFAULT_SYSTEM_PROMPT}` : DEFAULT_SYSTEM_PROMPT;
@@ -227,8 +232,9 @@ export async function runPiChat(
   message: string,
   sessionId: string,
   config: AgentConfig,
+  userToken?: string,
 ): Promise<{ message: string; events: object[] }> {
-  return runPiChatPrompt(message, sessionId, config);
+  return runPiChatPrompt(message, sessionId, config, undefined, userToken);
 }
 
 export async function runPiChatStream(
@@ -236,8 +242,9 @@ export async function runPiChatStream(
   sessionId: string,
   config: AgentConfig,
   emit: (event: ChatStreamEvent) => void,
+  userToken?: string,
 ): Promise<{ message: string; events: object[] }> {
-  return runPiChatPrompt(message, sessionId, config, emit);
+  return runPiChatPrompt(message, sessionId, config, emit, userToken);
 }
 
 async function runPiChatPrompt(
@@ -245,6 +252,7 @@ async function runPiChatPrompt(
   sessionId: string,
   config: AgentConfig,
   emit?: (event: ChatStreamEvent) => void,
+  userToken?: string,
 ): Promise<{ message: string; events: object[] }> {
   return runWithSessionLock(sessionId, async () => {
     evictCachedSessions(sessionCache, {
@@ -257,8 +265,12 @@ async function runPiChatPrompt(
 
     const managedSession = await getOrCreateCachedSession(
       sessionId,
-      piSessionConfigKey(config),
-      () => createManagedPiSession(config),
+      piSessionConfigKey(config, userToken),
+      async () => {
+        const { session, configKey, backend } = await createManagedPiSession(config, userToken);
+        sessionBackends.set(session, backend);
+        return { session, configKey };
+      },
       sessionCache,
       (session) => session.dispose(),
     );
@@ -271,6 +283,10 @@ async function runPiChatPrompt(
       disposeSession: (cachedSession) => cachedSession.dispose(),
       protectedSessionIds: new Set(promptLocks.keys()),
     });
+
+    // Refresh to THIS turn's delegated identity even on a reused, long-lived
+    // cached session, so RBAC always reflects who is asking right now.
+    sessionBackends.get(session)?.setUserToken(userToken);
 
     const chunks: string[] = [];
     const events: object[] = [];
@@ -343,7 +359,8 @@ function buildOpenAiCompatibleModel(
 
 async function createManagedPiSession(
   config: AgentConfig,
-): Promise<{ session: AgentSession; configKey: string }> {
+  userToken?: string,
+): Promise<{ session: AgentSession; configKey: string; backend: BackendClient }> {
   if (!existsSync(config.skillPath)) {
     throw new Error(`Default skill not found at ${config.skillPath}`);
   }
@@ -368,7 +385,10 @@ async function createManagedPiSession(
     );
   }
 
-  const backend = new BackendClient(config.backendBaseUrl, config.backendServiceToken);
+  const backend = new BackendClient(config.backendBaseUrl, {
+    serviceToken: config.backendServiceToken,
+    userToken,
+  });
   const businessTools = createBusinessTools(backend);
   const resourceLoader = new DefaultResourceLoader({
     cwd: projectRoot,
@@ -393,10 +413,10 @@ async function createManagedPiSession(
     tools: businessTools.map((tool) => tool.name),
   });
 
-  return { session, configKey: piSessionConfigKey(config) };
+  return { session, configKey: piSessionConfigKey(config, userToken), backend };
 }
 
-function piSessionConfigKey(config: AgentConfig): string {
+function piSessionConfigKey(config: AgentConfig, userToken?: string): string {
   return [
     config.projectRoot,
     config.backendBaseUrl,
@@ -405,7 +425,29 @@ function piSessionConfigKey(config: AgentConfig): string {
     config.skillName,
     config.skillPath,
     config.apiKey ? "model-key" : "no-model-key",
+    // Discriminate by delegated user identity (not the raw token, so a token
+    // refresh/relogin for the SAME user doesn't needlessly drop the cached Pi
+    // conversation). A different user reusing the same client session_id
+    // gets a fresh session instead of continuing someone else's conversation.
+    decodeJwtSubject(userToken),
   ].join("\0");
+}
+
+// Unverified decode — only used as a cache-key discriminator. The backend
+// independently and authoritatively verifies the token's signature on every
+// outbound call, so a forged/tampered value here can't grant any permission;
+// at worst it would just miss a cache hit.
+function decodeJwtSubject(token: string | undefined): string {
+  if (!token) return "";
+  try {
+    const payloadB64 = token.split(".")[1] ?? "";
+    const padded = payloadB64.replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(padded, "base64").toString("utf8");
+    const payload = JSON.parse(json) as { sub?: unknown; username?: unknown };
+    return String(payload.sub ?? payload.username ?? "");
+  } catch {
+    return "";
+  }
 }
 
 function isPendingSession<TSession>(

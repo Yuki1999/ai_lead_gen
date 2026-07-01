@@ -4,7 +4,7 @@ from dataclasses import asdict
 import asyncio
 import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -49,6 +49,8 @@ from app.schemas import (
     ResetPasswordRequest,
     RoleCreateRequest,
     RoleUpdateRequest,
+    ScoringRulesResponse,
+    ScoringRulesUpdateRequest,
     SearchRequest,
     SuppressionCreateRequest,
     UserCreateRequest,
@@ -377,17 +379,47 @@ def create_app() -> FastAPI:
     def product_profile() -> dict[str, object]:
         return extract_product_profile().to_dict()
 
+    @app.get(
+        "/scoring/rules",
+        response_model=ScoringRulesResponse,
+        dependencies=[Depends(get_current_principal)],
+    )
+    def scoring_rules() -> dict[str, object]:
+        """Current lead-scoring weights/rules. Readable by any authenticated
+        principal (including the Agent's delegated/service token) so the
+        prospecting skill can fetch live values instead of hardcoded ones."""
+        return db.get_scoring_rules()
+
+    @app.put(
+        "/scoring/rules",
+        response_model=ScoringRulesResponse,
+        dependencies=[Depends(require("settings.manage"))],
+    )
+    def update_scoring_rules(
+        request: ScoringRulesUpdateRequest,
+        principal: Principal = Depends(require("settings.manage")),
+    ) -> dict[str, object]:
+        updated = db.set_scoring_rules(request.model_dump())
+        db.add_audit(actor=principal.username, action="scoring_rules.update")
+        return updated
+
     @app.post("/agent/chat", response_model=AgentChatResponse, dependencies=[Depends(require("agent.use"))])
-    def agent_chat(request: AgentChatRequest) -> dict[str, object]:
+    def agent_chat(
+        request: AgentChatRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, object]:
         try:
-            return forward_agent_chat(request.model_dump())
+            return forward_agent_chat(request.model_dump(), user_token=_bearer_token(authorization))
         except AgentProxyError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
     @app.post("/agent/chat/stream", dependencies=[Depends(require("agent.use"))])
-    def agent_chat_stream(request: AgentChatRequest) -> StreamingResponse:
+    def agent_chat_stream(
+        request: AgentChatRequest,
+        authorization: str | None = Header(default=None),
+    ) -> StreamingResponse:
         try:
-            stream = forward_agent_chat_stream(request.model_dump())
+            stream = forward_agent_chat_stream(request.model_dump(), user_token=_bearer_token(authorization))
         except AgentProxyError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         return StreamingResponse(stream, media_type="text/event-stream")
@@ -444,7 +476,7 @@ def create_app() -> FastAPI:
                 category=item.category,
                 match_reason=item.match_reason,
                 source=item.source,
-                score=50,
+                score=item.score if item.score is not None else 50,
                 status="new",
                 notes="Agent discovered",
                 lead_type=item.lead_type,
@@ -465,7 +497,7 @@ def create_app() -> FastAPI:
             category=request.category,
             match_reason=request.match_reason,
             source=request.source,
-            score=50,
+            score=request.score if request.score is not None else 50,
             status="new",
             notes="",
             lead_type=request.lead_type,
@@ -504,8 +536,18 @@ def create_app() -> FastAPI:
         region: str | None = Query(default=None),
         status: str | None = Query(default=None),
         q: str | None = Query(default=None),
-        sort: str = Query(default="id"),
-        order: str = Query(default="desc"),
+        sort: str = Query(
+            default="id",
+            description=(
+                "\u6392\u5e8f\u5b57\u6bb5\uff1aid, score, company_name, country, region, "
+                "status, category, created_at, updated_at, reply_count\u3002"
+                "\u672a\u77e5\u503c\u56de\u9000\u5230 id\u3002"
+            ),
+        ),
+        order: str = Query(
+            default="desc",
+            description="\u6392\u5e8f\u65b9\u5411\uff1aasc \u6216 desc\uff0c\u9ed8\u8ba4 desc\u3002",
+        ),
     ) -> dict[str, object]:
         leads = db.list_leads(region=region, status=status, q=q, sort=sort, order=order)
         return {"total": len(leads), "leads": leads}
@@ -954,6 +996,19 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "****"
     return key[:4] + "****" + key[-4:]
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    """Extract the raw bearer token from an Authorization header, if present.
+
+    Used to delegate the calling human's own JWT to the Agent sidecar, so its
+    outbound tool calls run with that user's real RBAC permissions instead of
+    the sidecar's blanket-privileged service token.
+    """
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        return token or None
+    return None
 
 
 def _unsub_page(message: str, *, ok: bool) -> str:

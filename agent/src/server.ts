@@ -30,12 +30,14 @@ interface CreateServerOptions {
     message: string,
     sessionId: string,
     config: AgentConfig,
+    userToken?: string,
   ) => Promise<ChatResult> | ChatResult;
   runChatStream?: (
     message: string,
     sessionId: string,
     config: AgentConfig,
     emit: StreamEmit,
+    userToken?: string,
   ) => Promise<ChatResult> | ChatResult;
 }
 
@@ -84,6 +86,7 @@ export function createServer(options: CreateServerOptions = {}) {
           typeof body.session_id === "string" && body.session_id
             ? body.session_id
             : "default";
+        const userToken = extractUserToken(request);
 
         if (!message) {
           sendJson(response, 400, { detail: "message is required" }, config);
@@ -97,6 +100,7 @@ export function createServer(options: CreateServerOptions = {}) {
             message,
             sessionId,
             config,
+            userToken,
             runner: options.runChatStream,
           });
           return;
@@ -119,7 +123,7 @@ export function createServer(options: CreateServerOptions = {}) {
         }
 
         const runner = options.runChat ?? defaultMissingRunner;
-        const result = await runner(message, sessionId, config);
+        const result = await runner(message, sessionId, config, userToken);
         sendJson(
           response,
           200,
@@ -158,6 +162,7 @@ async function handleStreamChat(
     message: string;
     sessionId: string;
     config: AgentConfig;
+    userToken?: string;
     runner?: CreateServerOptions["runChatStream"];
   },
 ): Promise<void> {
@@ -189,6 +194,7 @@ async function handleStreamChat(
       (event) => {
         writeSse(response, event.type, event.type === "delta" ? { text: event.text } : { event: event.event });
       },
+      options.userToken,
     );
     writeSse(response, "done", {
       message: result.message,
@@ -331,4 +337,14 @@ function chatAuthorizationError(
 function isLocalHost(host: string): boolean {
   const normalized = host.toLowerCase();
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+// Identifies which authenticated human user the backend is chatting on behalf
+// of, so this turn's tool calls can be delegated as that user (see
+// BackendClient) instead of the sidecar's blanket-privileged service token.
+// Sent backend->sidecar only (never by a browser), so no CORS handling needed.
+function extractUserToken(request: IncomingMessage): string | undefined {
+  const header = request.headers["x-user-token"];
+  const value = Array.isArray(header) ? header[0] : header;
+  return value && value.trim() ? value.trim() : undefined;
 }

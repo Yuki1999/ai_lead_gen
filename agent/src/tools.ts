@@ -40,6 +40,16 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
                   "Recipient role: 'distributor' for medical-device distributors/channel partners, or 'kol' for surgeons/KOLs/hospital procurement. Selects which approved email template is used. Leave empty to auto-infer.",
               }),
             ),
+            score: Type.Optional(
+              Type.Integer({
+                minimum: 0,
+                maximum: 100,
+                description:
+                  "The lead's match score (0-100) you calculated using the weights and rules from get_scoring_rules. " +
+                  "Always call get_scoring_rules first and compute this yourself — if left unset, the lead is saved " +
+                  "with a generic default score instead of your actual assessment.",
+              }),
+            ),
           }),
           { description: "Array of leads to save" }
         ),
@@ -59,6 +69,17 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
       parameters: Type.Object({}),
       execute: async (_toolCallId, _params, signal) =>
         toolResult(await client.getProductProfile(signalOptions(signal))),
+    }),
+    defineTool({
+      name: "get_scoring_rules",
+      label: "Get Scoring Rules",
+      description:
+        "Fetch the CURRENT lead-scoring weights, positive/negative point rules, and score thresholds. " +
+        "These are admin-configurable and may differ from any values described elsewhere — always call " +
+        "this before scoring leads and use the returned values instead of guessing or assuming defaults.",
+      parameters: Type.Object({}),
+      execute: async (_toolCallId, _params, signal) =>
+        toolResult(await client.getScoringRules(signalOptions(signal))),
     }),
     defineTool({
       name: "web_search",
@@ -222,6 +243,7 @@ export function toolResult(payload: ToolPayload) {
 
 type BusinessMethod =
   | "getProductProfile"
+  | "getScoringRules"
   | "webSearch"
   | "fetchUrl"
   | "searchLeads"

@@ -193,9 +193,19 @@ def insert_lead(lead: CandidateLead) -> dict[str, Any]:
         return get_lead(cursor.lastrowid, connection=connection)
 
 
-_SORTABLE_COLUMNS = {
-    "company_name", "score", "category", "email", "source",
-    "country", "region", "status", "id",
+# Whitelist of external sort keys → SQL expressions. Values are hard-coded
+# server strings, so string-interpolating them into ORDER BY is safe.
+_SORT_EXPRS = {
+    "id": "l.id",
+    "score": "l.score",
+    "company_name": "l.company_name",
+    "country": "l.country",
+    "region": "l.region",
+    "status": "l.status",
+    "category": "l.category",
+    "created_at": "l.created_at",
+    "updated_at": "l.updated_at",
+    "reply_count": "reply_count",  # derived column, present in SELECT
 }
 
 def list_leads(
@@ -221,14 +231,25 @@ def list_leads(
         params["q"] = f"%{q}%"
 
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
-    sort_col = sort if sort in _SORTABLE_COLUMNS else "id"
-    sort_dir = "DESC" if order.lower() == "desc" else "ASC"
+    sort_key = sort if sort in _SORT_EXPRS else "id"
+    sort_expr = _SORT_EXPRS[sort_key]
+    sort_dir = "ASC" if str(order).lower() == "asc" else "DESC"
+    # Automatic secondary sort: keep results deterministic and surface newer
+    # entries within ties (unless the user is already sorting by created_at/id).
+    tiebreakers: list[str] = []
+    if sort_key != "created_at":
+        tiebreakers.append("l.created_at DESC")
+    if sort_key != "id":
+        tiebreakers.append("l.id DESC")
+    order_clause = f"{sort_expr} {sort_dir}"
+    if tiebreakers:
+        order_clause += ", " + ", ".join(tiebreakers)
     with connect() as connection:
         rows = connection.execute(
             f"""SELECT l.*,
                 (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) AS reply_count
             FROM leads l
-            {where} ORDER BY {sort_col} {sort_dir}, l.id DESC""",
+            {where} ORDER BY {order_clause}""",
             params,
         ).fetchall()
     return [_row_to_dict(row) for row in rows]
@@ -965,6 +986,64 @@ def get_all_settings() -> dict[str, str]:
         key, value = row["key"], row["value"]
         result[key] = decrypt_secret(value) if key in _SECRET_SETTING_KEYS else value
     return result
+
+
+# ── Lead scoring rules ───────────────────────────────────
+# Stored as a single JSON blob under the settings table. Defaults mirror the
+# overseas-distributor-prospecting SKILL.md Step 5 rules verbatim, so behavior
+# is unchanged until an admin actually customizes them.
+
+_SCORING_RULES_SETTING_KEY = "scoring_rules"
+
+DEFAULT_SCORING_RULES: dict[str, Any] = {
+    "weights": [
+        {"key": "channel_fit", "label": "渠道匹配度", "percent": 40},
+        {"key": "market_priority", "label": "目标市场战略优先级", "percent": 25},
+        {"key": "academic_brand", "label": "学术/品牌公开资历", "percent": 20},
+        {"key": "contact_availability", "label": "联系方式可用性", "percent": 10},
+        {"key": "kol_hospital_evidence", "label": "公开KOL/医院合作记录（加分项）", "percent": 5},
+    ],
+    "positive_rules": [
+        {"points": 25, "description": "官网确认从事医疗器械分销、进口或渠道销售"},
+        {"points": 20, "description": "明确的骨科植入物/关节置换/膝关节置换/手术设备/机器人/导航/OR资本设备相关性"},
+        {"points": 15, "description": "有可见的商务邮箱或官方联系表单"},
+        {"points": 15, "description": "公司所在国家/区域覆盖匹配目标市场"},
+        {"points": 10, "description": "有具名的商务拓展/销售/产品/经销联系人"},
+        {"points": 10, "description": "出现在厂商合作伙伴页、官方展商名录、监管/进口商目录，或医疗器械协会目录中"},
+        {"points": 5, "description": "具备与目标区域相关的多国覆盖"},
+    ],
+    "negative_rules": [
+        {"points": -20, "description": "来源证据薄弱或不完整"},
+        {"points": -20, "description": "仅有LinkedIn/社交媒体/贸易目录证据，无官网确认"},
+        {"points": -30, "description": "与医疗机器人、骨科器械、医疗分销、手术设备或医院设备无关"},
+        {"points": -30, "description": "疑似仅为医院、媒体、咨询公司、招聘网站、消费品，或无关的工业机器人公司"},
+        {"points": -40, "description": "确认为重复线索"},
+    ],
+    "thresholds": [
+        {"min": 80, "max": 100, "status": "qualified", "label": "强匹配"},
+        {"min": 60, "max": 79, "status": "new", "label": "中度匹配"},
+        {"min": 40, "max": 59, "status": "human_review", "label": "需人工核验"},
+        {"min": 0, "max": 39, "status": "rejected", "label": "弱匹配/建议拒绝"},
+    ],
+}
+
+
+def get_scoring_rules() -> dict[str, Any]:
+    raw = get_setting(_SCORING_RULES_SETTING_KEY, "")
+    if not raw:
+        return {**DEFAULT_SCORING_RULES, "updated_at": ""}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {**DEFAULT_SCORING_RULES, "updated_at": ""}
+    parsed.setdefault("updated_at", "")
+    return parsed
+
+
+def set_scoring_rules(rules: dict[str, Any]) -> dict[str, Any]:
+    payload = {**rules, "updated_at": _now()}
+    set_setting(_SCORING_RULES_SETTING_KEY, json.dumps(payload))
+    return payload
 
 
 # ── Helpers ────────────────────────────────────────────
