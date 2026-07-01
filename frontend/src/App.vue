@@ -531,6 +531,15 @@ const settingsEmailPasswordInput = ref("");
 const settingsLoading = ref(false);
 const settingsSaving = ref(false);
 const settingsTab = ref<"email" | "sync" | "agent" | "scoring">("email");
+const owaUrl = computed(() => {
+  const server = settings.value.email_server.trim();
+  if (!server) return "";
+  return server.startsWith("http://") || server.startsWith("https://") ? server : `https://${server}/owa`;
+});
+function openMailbox() {
+  if (!owaUrl.value) return;
+  window.open(owaUrl.value, "_blank", "noopener");
+}
 const drafts = ref<EmailEvent[]>([]);
 const draftCount = ref(0);
 const showOutreachPreview = ref(false);
@@ -3006,9 +3015,20 @@ onBeforeUnmount(() => {
                 <h3>Exchange 邮件服务</h3>
                 <p>配置 EWS 连接信息，用于发送外联和同步回复。</p>
               </div>
-              <n-tag :type="settings.email_user ? 'success' : 'default'" size="small" round :bordered="false">
-                {{ settings.email_user ? '已配置' : '未配置' }}
-              </n-tag>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <button
+                  type="button"
+                  class="queue-refresh"
+                  :disabled="!owaUrl"
+                  :title="owaUrl ? `打开 ${owaUrl}` : '请先填写 SMTP 服务器'"
+                  @click="openMailbox"
+                >
+                  打开邮箱网页
+                </button>
+                <n-tag :type="settings.email_user ? 'success' : 'default'" size="small" round :bordered="false">
+                  {{ settings.email_user ? '已配置' : '未配置' }}
+                </n-tag>
+              </div>
             </div>
             <div class="settings-agent-grid">
               <label class="field"><span>SMTP 服务器</span><n-input v-model:value="settings.email_server" placeholder="mail.microport.com.cn" /></label>
