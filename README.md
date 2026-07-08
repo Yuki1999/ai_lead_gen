@@ -86,7 +86,7 @@ uv run uvicorn app.main:app --reload --port 8000
 - `GET /agent/config`: 返回 Agent provider、模型和脱敏 key 预览
 - `PUT /agent/config`: 从 Web 写入 `agent/.env` 的 `PI_PROVIDER`、provider API key、`PI_MODEL`、`BACKEND_BASE_URL`
 - `POST /leads/search`: 默认执行真实网页搜索；传 `real_search: false` 才使用离线样例
-  - 搜索引擎优先使用 Tavily（需设置环境变量 `TAVILY_API_KEY`），DuckDuckGo/Bing 网页抓取仅作为无 key 或 Tavily 调用失败时的兜底——国内网络环境下直连 DuckDuckGo/Bing 抓取经常被限流或屏蔽，生产和开发环境都建议配置 `TAVILY_API_KEY`。
+  - 搜索引擎唯一使用 Tavily（需设置环境变量 `TAVILY_API_KEY`），不再有 DuckDuckGo/Bing 网页抓取兜底——国内网络环境下直连抓取经常被限流或屏蔽，与其静默降级返回不可靠结果，未配置 `TAVILY_API_KEY` 或调用失败时接口直接返回 502 报错。
 - `POST /campaigns/outreach-records`: 根据真实线索邮箱生成触达记录和邮件草稿
 - `POST /replies/analyze`: 理解邮件回复并更新线索状态
 

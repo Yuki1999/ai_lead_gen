@@ -173,3 +173,17 @@ class ScoringRulesUpdateRequest(BaseModel):
     positive_rules: list[ScoringRule]
     negative_rules: list[ScoringRule]
     thresholds: list[ScoringThreshold]
+
+
+# ── Token usage (AI cost monitoring) ──────────────────────────────────────────
+
+class TokenUsageEventRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=60)
+    model: str = Field(min_length=1, max_length=120)
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+    total_tokens: int = Field(ge=0)
+
+
+class TokenBudgetUpdateRequest(BaseModel):
+    budget_tokens: int = Field(ge=0, le=1_000_000_000)

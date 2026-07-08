@@ -12,6 +12,7 @@ import {
   ChevronDown,
   Clock3,
   Database,
+  Gauge,
   ExternalLink,
   FileText,
   Globe2,
@@ -19,6 +20,8 @@ import {
   Link2,
   Loader2,
   MailCheck,
+  MapPin,
+  Tag,
   Maximize2,
   MessageSquare,
   Pencil,
@@ -52,11 +55,16 @@ import {
   type SelectOption,
 } from "naive-ui";
 import AdminPanel from "./components/AdminPanel.vue";
+import FilterSelect from "./components/FilterSelect.vue";
 import ScoringRulesSettings from "./components/ScoringRulesSettings.vue";
+import UsageReport from "./components/UsageReport.vue";
+import { STANDARD_REGIONS, labelForCountry, labelForRegion } from "./geo";
 import {
   activateAgentSession,
   createNextAgentSession,
   deleteAgentSession,
+  deriveSessionTitle,
+  isDefaultSessionTitle,
   loadAgentSessionState,
   renameAgentSession,
   saveAgentSessionId,
@@ -82,6 +90,7 @@ interface Lead {
   notes: string;
   lead_type?: string;
   reply_count?: number;
+  last_outreach_at?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -213,6 +222,8 @@ interface SettingsResponse {
   send_daily_cap: number;
   send_min_interval_seconds: number;
   send_per_domain_daily_cap: number;
+  ai_content_generation: boolean;
+  ai_content_ready: boolean;
   agent_provider: string;
   agent_model: string;
   has_agent_key: boolean;
@@ -408,6 +419,42 @@ const leadTypeFilterOptions: SelectOption[] = [
   { label: "代理商", value: "distributor" },
   { label: "KOL", value: "kol" },
 ];
+// Filter-dropdown options exclude the "全部" entry — FilterSelect renders its own
+// reset row from the placeholder.
+const statusSelectOptions = computed(() =>
+  statusFilterOptions
+    .filter((o) => o.value !== "")
+    .map((o) => ({ value: String(o.value), label: String(o.label) })),
+);
+const leadTypeSelectOptions = computed(() =>
+  leadTypeFilterOptions
+    .filter((o) => o.value !== "")
+    .map((o) => ({ value: String(o.value), label: String(o.label) })),
+);
+
+// Region/country options come from the DB facets (so every option returns
+// results), ordered by the standard region taxonomy, then labeled 中文·English.
+const regionSelectOptions = computed(() => {
+  const counts = new Map(leadFacets.value.regions.map((r) => [r.value, r.count]));
+  const order = STANDARD_REGIONS.map((r) => r.value);
+  return leadFacets.value.regions
+    .map((r) => ({ value: r.value, label: labelForRegion(r.value), count: r.count }))
+    .sort((a, b) => {
+      const ia = order.indexOf(a.value);
+      const ib = order.indexOf(b.value);
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      return b.count - a.count;
+    })
+    .map((o) => ({ ...o, count: counts.get(o.value) }));
+});
+const countrySelectOptions = computed(() =>
+  leadFacets.value.countries.map((c) => ({
+    value: c.value,
+    label: labelForCountry(c.value),
+    count: c.count,
+  })),
+);
+
 const leadTypeLabels: Record<string, string> = {
   distributor: "代理商",
   kol: "KOL",
@@ -435,6 +482,7 @@ const providerOptions: SelectOption[] = [
 // Unknown/future tool names fall back to the raw name + a generic wrench icon.
 const AGENT_TOOL_META: Record<string, { label: string; icon: typeof FileText }> = {
   get_product_profile: { label: "读取产品画像", icon: FileText },
+  get_scoring_rules: { label: "读取评分规则", icon: SlidersHorizontal },
   web_search: { label: "网页搜索", icon: Globe2 },
   fetch_url: { label: "抓取网页", icon: Link2 },
   search_leads: { label: "搜索线索", icon: Search },
@@ -450,29 +498,62 @@ function toolMeta(name: string): { label: string; icon: typeof FileText } {
 function toggleToolTimeline(turn: AgentTurn): void {
   turn.toolTimelineExpanded = !turn.toolTimelineExpanded;
 }
+function toolsHaveRunning(turn: AgentTurn): boolean {
+  return turn.toolCalls.some((c) => c.status === "running");
+}
+function toolsHaveError(turn: AgentTurn): boolean {
+  return Boolean(turn.error) || turn.toolCalls.some((c) => c.status === "error");
+}
+// The tool currently executing — shown as a single live line ("正在搜索线索…")
+// so the collapsed summary reads calmly instead of a growing list of rows.
+function runningToolLabel(turn: AgentTurn): string {
+  const running = [...turn.toolCalls].reverse().find((c) => c.status === "running");
+  return running ? toolMeta(running.toolName).label : "调用工具";
+}
 function collapseToolTimelineIfClean(turn: AgentTurn): void {
-  // Keep it expanded if something failed — that's exactly when the detail
-  // is worth seeing without an extra click.
-  const hasFailure = Boolean(turn.error) || turn.toolCalls.some((c) => c.status === "error");
-  if (!hasFailure) turn.toolTimelineExpanded = false;
+  // Auto-expand only to surface a failure; otherwise stay collapsed as a
+  // quiet one-line summary the user can open on demand.
+  turn.toolTimelineExpanded = toolsHaveError(turn);
 }
 function renderTurnBlocks(text: string) {
   return parseMarkdown(text);
 }
 function applySuggestion(text: string): void {
   agentPrompt.value = text;
+  nextTick(() => {
+    autoGrowComposer();
+    agentComposerRef.value?.focus();
+  });
+}
+function focusComposer(): void {
   nextTick(() => agentComposerRef.value?.focus());
 }
 function autoGrowComposer(): void {
   const el = agentComposerRef.value;
   if (!el) return;
   el.style.height = "auto";
-  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  el.style.height = Math.min(el.scrollHeight, 180) + "px";
 }
-function scrollAgentChatToBottom(): void {
+// Track how close the user is to the bottom so streaming only auto-follows when
+// they haven't scrolled up, and the "back to bottom" affordance appears when they have.
+function onAgentChatScroll(): void {
+  const el = agentChatScrollRef.value;
+  if (!el) return;
+  const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  agentPinnedToBottom.value = distanceFromBottom < 80;
+  agentShowScrollDown.value = distanceFromBottom > 220;
+}
+function scrollAgentChatToBottom(opts: { force?: boolean; smooth?: boolean } = {}): void {
+  const { force = false, smooth = false } = opts;
+  // While streaming, respect a user who scrolled up to read earlier content.
+  if (!force && !agentPinnedToBottom.value) return;
   nextTick(() => {
     const el = agentChatScrollRef.value;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    if (smooth) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    else el.scrollTop = el.scrollHeight;
+    agentPinnedToBottom.value = true;
+    agentShowScrollDown.value = false;
   });
 }
 
@@ -486,17 +567,19 @@ const metrics = ref<Metrics>({
 });
 const selectedLeadIds = ref<number[]>([]);
 const filterRegion = ref("");
+const filterCountry = ref("");
 const filterStatus = ref("");
 const filterLeadType = ref("");
+// Distinct region/country values present in the DB (with counts), used to build
+// the filter dropdowns so users only filter by values that actually exist.
+const leadFacets = ref<{
+  regions: { value: string; count: number }[];
+  countries: { value: string; count: number }[];
+}>({ regions: [], countries: [] });
 const query = ref("");
 const sortField = ref("id");
 const sortDir = ref<"asc" | "desc">("desc");
 const sortDropdownOpen = ref(false);
-const replyLeadId = ref<number | "">("");
-const replyText = ref(
-  "We are interested. Please send product details, certificates, and partner requirements."
-);
-const analysis = ref<ReplyAnalysis | null>(null);
 const sourcePreview = ref<SourcePreview | null>(null);
 const sourcePreviewLead = ref<Lead | null>(null);
 const sourcePreviewLoading = ref(false);
@@ -513,12 +596,20 @@ const detailNotes = ref("");
 const detailOutreach = ref<EmailEvent[]>([]);
 const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
+// Manual "paste a reply and analyze it" for the open lead (detail modal).
+const detailReplyText = ref("");
+const detailReplyBusy = ref(false);
 const agentPrompt = ref("");
 const agentSessionId = ref("default");
 const agentSessions = ref<AgentSessionRecord[]>([]);
 const agentTurnsBySession = reactive<Record<string, AgentTurn[]>>({});
 const agentChatScrollRef = ref<HTMLElement | null>(null);
 const agentComposerRef = ref<HTMLTextAreaElement | null>(null);
+// Stick-to-bottom: only auto-follow the stream while the user is already near
+// the bottom. If they scroll up to read, stop yanking them and offer a
+// floating "back to bottom" button instead.
+const agentPinnedToBottom = ref(true);
+const agentShowScrollDown = ref(false);
 let agentTurnSeq = 0;
 let agentToolCallSeq = 0;
 // One abort controller per session id, so different sessions can stream concurrently
@@ -551,6 +642,8 @@ const settings = ref<SettingsResponse>({
   send_daily_cap: 200,
   send_min_interval_seconds: 20,
   send_per_domain_daily_cap: 25,
+  ai_content_generation: true,
+  ai_content_ready: false,
   agent_provider: "deepseek",
   agent_model: "deepseek-v4-pro",
   has_agent_key: false,
@@ -582,7 +675,8 @@ const outreachPreviews = ref<Array<{ lead_id: number; company_name: string; emai
 const showCreateLead = ref(false);
 const createError = ref("");
 const newLead = ref({ company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" });
-const activePage = ref<"workspace" | "agent" | "settings" | "admin">("workspace");
+const activePage = ref<"workspace" | "agent" | "settings" | "admin" | "usage">("workspace");
+const usageReportRef = ref<InstanceType<typeof UsageReport> | null>(null);
 const editingSessionId = ref("");
 const editingSessionTitle = ref("");
 const agentConfigExpanded = ref(false);
@@ -599,20 +693,29 @@ const selectedCount = computed(() => selectedLeadIds.value.length);
 const topbarContent = computed(() => {
   if (activePage.value === "agent") {
     return {
-      eyebrow: "Pi / pi-mono Agent",
       title: "渠道拓展 Agent",
       copy: "默认使用 overseas-distributor-prospecting skill，支持实时输出、联网搜索和线索入库。",
     };
   }
   if (activePage.value === "settings") {
     return {
-      eyebrow: "系统配置",
       title: "设置",
       copy: "邮件回复自动同步、Agent 模型与 API 配置。",
     };
   }
+  if (activePage.value === "usage") {
+    return {
+      title: "AI 用量看板",
+      copy: "实时统计 Agent 对话、回复分析、邮件生成消耗的 token，掌握月度额度与走势。",
+    };
+  }
+  if (activePage.value === "admin") {
+    return {
+      title: "用户与权限",
+      copy: "自定义角色与操作级权限，并管理退订抑制名单与操作审计日志。",
+    };
+  }
   return {
-    eyebrow: "微创畅行机器人 · 海外业务",
     title: "海外渠道拓展系统",
     copy: "面向 SkyWalker TKA 的代理商发现、邮箱证据审阅、触达记录和回复处理。",
   };
@@ -692,13 +795,6 @@ const agentNotificationItems = computed(() => [
     detail: `${agentSessions.value.length} 个本地会话已保存`,
   },
 ]);
-const selectedLead = computed(() =>
-  leads.value.find((lead) => lead.id === Number(replyLeadId.value))
-);
-const replyLeadOptions = computed<SelectOption[]>(() => [
-  { label: "不关联", value: "" },
-  ...leads.value.map((lead) => ({ label: lead.company_name, value: lead.id })),
-]);
 const highlightedSourceText = computed(() => {
   if (!sourcePreview.value) return [] as HighlightChunk[];
   return buildHighlightedChunks(sourcePreview.value.text, sourcePreview.value.email);
@@ -755,6 +851,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 async function loadDashboard(): Promise<void> {
   const params = new URLSearchParams();
   if (filterRegion.value) params.set("region", filterRegion.value);
+  if (filterCountry.value) params.set("country", filterCountry.value);
   if (filterStatus.value) params.set("status", filterStatus.value);
   if (filterLeadType.value) params.set("lead_type", filterLeadType.value);
   if (query.value) params.set("q", query.value);
@@ -764,14 +861,23 @@ async function loadDashboard(): Promise<void> {
   const [leadPayload, metricPayload] = await Promise.all([
     request<LeadListResponse>(`/leads?${params.toString()}`),
     request<Metrics>("/metrics"),
+    loadLeadFacets(),
   ]);
 
   leads.value = leadPayload.leads;
   metrics.value = metricPayload;
-  if (replyLeadId.value === "" && leads.value.length > 0) {
-    replyLeadId.value = leads.value[0].id;
-  }
   await loadDrafts();
+}
+
+async function loadLeadFacets(): Promise<void> {
+  try {
+    leadFacets.value = await request<{
+      regions: { value: string; count: number }[];
+      countries: { value: string; count: number }[];
+    }>("/leads/facets");
+  } catch {
+    // Non-fatal: filters just fall back to whatever was already loaded.
+  }
 }
 
 async function loadDrafts(): Promise<void> {
@@ -917,30 +1023,55 @@ async function syncReplies(): Promise<void> {
       total_inbox: number;
       synced: number;
       skipped: number;
+      analysis_failed?: number;
+      ai_ready?: boolean;
+      opted_out?: number;
       items: Array<{ lead_id: number; company: string; intent: string; auto_reply: boolean }>;
     }>("/replies/sync", { method: "POST" });
+
+    // Replies that arrived but couldn't be classified because no LLM is
+    // configured — surface this loudly so "0 synced" isn't misread as "no replies".
+    if (payload.analysis_failed && payload.analysis_failed > 0) {
+      message.warning(
+        payload.ai_ready
+          ? `有 ${payload.analysis_failed} 条回复分析失败，请稍后重试。`
+          : `有 ${payload.analysis_failed} 条回复因未配置 AI 无法分析——请到「设置 → Agent」配置后重新同步。`,
+      );
+    }
     if (payload.synced > 0) {
       const companies = [...new Set(payload.items.map((i) => i.company))].join("、");
-      message.success(`同步了 ${payload.synced} 条回复（${companies}），跳过 ${payload.skipped} 条`);
-    } else {
+      const optOut = payload.opted_out ? `，${payload.opted_out} 个地址已按退订抑制` : "";
+      message.success(`同步了 ${payload.synced} 条回复（${companies}）${optOut}`);
+    } else if (!payload.analysis_failed) {
       message.success(`未发现新回复（扫描 ${payload.total_inbox} 封邮件）`);
     }
     await loadDashboard();
   });
 }
 
-async function analyzeCurrentReply(): Promise<void> {
-  await runAction("reply", async () => {
-    analysis.value = await request<ReplyAnalysis>("/replies/analyze", {
+// Analyze a reply the operator pasted into the open lead's detail panel.
+async function analyzeDetailReply(): Promise<void> {
+  const leadId = detailLeadId.value;
+  const text = detailReplyText.value.trim();
+  if (leadId === null || !text || detailReplyBusy.value) return;
+  detailReplyBusy.value = true;
+  try {
+    const result = await request<ReplyAnalysis>("/replies/analyze", {
       method: "POST",
-      body: JSON.stringify({
-        lead_id: replyLeadId.value === "" ? null : Number(replyLeadId.value),
-        reply_text: replyText.value,
-      }),
+      body: JSON.stringify({ lead_id: leadId, reply_text: text }),
     });
-    message.success("回复已完成理解");
-    await loadDashboard();
-  });
+    detailReplyText.value = "";
+    message.success(
+      `已分析：${result.requires_human ? "转人工" : formatStatus(result.intent)}`,
+    );
+    await loadDashboard(); // refresh the lead list first so the panel reads new status
+    await openLeadDetail(leadId); // then reload reply/outreach history + status
+
+  } catch (caught) {
+    message.error(errorDetail(caught));
+  } finally {
+    detailReplyBusy.value = false;
+  }
 }
 
 async function sendAgentPrompt(): Promise<void> {
@@ -949,6 +1080,16 @@ async function sendAgentPrompt(): Promise<void> {
   if (!message || isSessionBusy(sessionKey)) return;
 
   const turns = agentTurnsBySession[sessionKey] ?? (agentTurnsBySession[sessionKey] = []);
+  // Auto-name the session from its first message (unless the user already
+  // gave it a custom name), the way ChatGPT/Claude title a new chat.
+  if (turns.length === 0) {
+    const session = agentSessions.value.find((item) => item.id === sessionKey);
+    if (session && isDefaultSessionTitle(session.title)) {
+      applyAgentSessionState(
+        renameAgentSession(getAgentStorage(), currentAgentSessionState(), sessionKey, deriveSessionTitle(message)),
+      );
+    }
+  }
   turns.push({
     id: ++agentTurnSeq,
     role: "user",
@@ -961,7 +1102,8 @@ async function sendAgentPrompt(): Promise<void> {
   });
   agentPrompt.value = "";
   nextTick(() => autoGrowComposer());
-  scrollAgentChatToBottom();
+  scrollAgentChatToBottom({ force: true });
+  focusComposer();
 
   await dispatchAssistantResponse(sessionKey, message);
 }
@@ -978,7 +1120,7 @@ function regenerateLastResponse(): void {
   const lastUser = turns[turns.length - 1];
   if (!lastUser || lastUser.role !== "user") return;
 
-  scrollAgentChatToBottom();
+  scrollAgentChatToBottom({ force: true });
   void dispatchAssistantResponse(sessionKey, lastUser.text);
 }
 
@@ -1019,7 +1161,7 @@ function submitEditedMessage(): void {
     stopped: false,
     startedAt: Date.now(),
   });
-  scrollAgentChatToBottom();
+  scrollAgentChatToBottom({ force: true });
   void dispatchAssistantResponse(sessionKey, newText);
 }
 
@@ -1034,13 +1176,15 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
     error: "",
     stopped: false,
     startedAt: Date.now(),
-    toolTimelineExpanded: true,
+    toolTimelineExpanded: false,
   };
   turns.push(assistantTurn);
 
   agentError.value = "";
-  if (sessionKey === agentSessionId.value) agentLiveStatus.value = "已发送，等待 Agent 响应";
-  scrollAgentChatToBottom();
+  if (sessionKey === agentSessionId.value) {
+    agentLiveStatus.value = "已发送，等待 Agent 响应";
+    scrollAgentChatToBottom({ force: true });
+  }
   startAgentElapsedTicker();
 
   const leadsBefore = metrics.value.total_leads;
@@ -1076,11 +1220,18 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      // The user pressed stop: exit even if aborting the fetch didn't reject
+      // this read (some upstreams keep flushing). Cancel to release the stream.
+      if (assistantTurn.stopped) {
+        void reader.cancel().catch(() => undefined);
+        return;
+      }
       buffer = consumeAgentStreamBuffer(
         buffer + decoder.decode(value, { stream: true }),
         assistantTurn,
       );
     }
+    if (assistantTurn.stopped) return;
     buffer = consumeAgentStreamBuffer(buffer + decoder.decode(), assistantTurn);
     if (buffer.trim()) {
       handleAgentSseFrame(buffer, assistantTurn);
@@ -1117,7 +1268,7 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
       agentAbortControllers.delete(sessionKey);
     }
     stopAgentElapsedTickerIfIdle();
-    scrollAgentChatToBottom();
+    if (sessionKey === agentSessionId.value) scrollAgentChatToBottom();
   }
 }
 
@@ -1138,6 +1289,23 @@ function stopAgentElapsedTickerIfIdle(): void {
 
 function stopAgentPrompt(sessionId: string = agentSessionId.value): void {
   agentAbortControllers.get(sessionId)?.abort();
+  agentAbortControllers.delete(sessionId);
+  // Optimistic UI: flip out of the "generating" state immediately. Some
+  // providers (reasoning models) keep the upstream stream open well past the
+  // visible answer, so aborting the fetch may not reject the in-flight read
+  // right away — don't make the user wait for that to update the composer.
+  const turns = agentTurnsBySession[sessionId];
+  const last = turns?.[turns.length - 1];
+  if (last && last.role === "assistant" && last.pending) {
+    last.pending = false;
+    last.stopped = true;
+    for (const call of last.toolCalls) {
+      if (call.status === "running") call.status = "error";
+    }
+    collapseToolTimelineIfClean(last);
+  }
+  if (sessionId === agentSessionId.value) agentLiveStatus.value = "已停止生成";
+  stopAgentElapsedTickerIfIdle();
 }
 
 async function saveAgentConfig(): Promise<void> {
@@ -1269,10 +1437,15 @@ function closeLeadDetail(): void {
   detailLeadId.value = null;
   detailOutreach.value = [];
   detailReplies.value = [];
+  detailReplyText.value = "";
 }
 
-function goToReply(): void {
-  message.success("回复已自动同步和分析，点击行查看详情");
+// Outreach from the detail panel: close it first so the preview modal isn't
+// layered on top of the detail modal.
+function outreachFromDetail(): void {
+  const id = detailLeadId.value;
+  closeLeadDetail();
+  if (id !== null) void sendOutreachSingle(id);
 }
 
 async function saveLeadDetail(): Promise<void> {
@@ -1386,6 +1559,21 @@ function buildHighlightedChunks(text: string, email: string): HighlightChunk[] {
     }));
 }
 
+// Backend HTTP errors arrive as a JSON body like {"detail": "..."}; surface the
+// human-readable detail instead of the raw JSON string.
+function errorDetail(caught: unknown): string {
+  if (caught instanceof Error) {
+    try {
+      const parsed = JSON.parse(caught.message) as { detail?: string };
+      if (parsed && typeof parsed.detail === "string" && parsed.detail) return parsed.detail;
+    } catch {
+      // message wasn't JSON — fall through to the raw message
+    }
+    return caught.message;
+  }
+  return "请求失败";
+}
+
 async function runAction(
   actionName: NonNullable<typeof currentAction.value>,
   action: () => Promise<void>,
@@ -1395,7 +1583,7 @@ async function runAction(
   try {
     await action();
   } catch (caught) {
-    message.error(caught instanceof Error ? caught.message : "请求失败");
+    message.error(errorDetail(caught));
   } finally {
     loading.value = false;
     currentAction.value = null;
@@ -1419,6 +1607,26 @@ function statusClass(status: string): string {
   return `status status-${status.replace("_", "-")}`;
 }
 
+// A lead that's been emailed but hasn't replied yet is "awaiting reply"; past a
+// week with no reply it's worth a follow-up nudge. Gives the operator a way to
+// find who to chase without a whole new status.
+function isAwaitingReply(lead: Lead): boolean {
+  return lead.status === "emailed" && (lead.reply_count || 0) === 0;
+}
+function outreachAgeDays(lead: Lead): number | null {
+  if (!lead.last_outreach_at) return null;
+  const t = new Date(lead.last_outreach_at).getTime();
+  if (Number.isNaN(t)) return null;
+  return Math.max(0, Math.floor((Date.now() - t) / 86_400_000));
+}
+
+// Leads ready for (first) outreach: found or confirmed but not yet emailed /
+// rejected. Agent-confirmed (`qualified`) leads belong here too — they're the
+// prime targets to send to, so they get the same per-row 外联 button.
+function canOutreach(status: string): boolean {
+  return status === "new" || status === "qualified";
+}
+
 function statusTagType(status: string): "default" | "info" | "success" | "warning" | "error" {
   if (["interested", "qualified"].includes(status)) return "success";
   if (["human_review", "needs_review"].includes(status)) return "warning";
@@ -1434,12 +1642,12 @@ function applyAgentConfig(config: AgentConfigResponse): void {
   agentBackendBaseUrl.value = config.backend_base_url;
 }
 
-function showPage(page: "workspace" | "agent" | "settings" | "admin", sectionId?: string): void {
+function showPage(page: "workspace" | "agent" | "settings" | "admin" | "usage", sectionId?: string): void {
   activePage.value = page;
   agentGuideOpen.value = false;
   agentNotificationsOpen.value = false;
   sidebarUserMenuOpen.value = false;
-  const hash = page === "agent" ? "agent" : page === "settings" ? "settings" : sectionId || "overview";
+  const hash = page === "agent" ? "agent" : page === "settings" ? "settings" : page === "usage" ? "usage" : sectionId || "overview";
   globalThis.history?.replaceState(null, "", `#${hash}`);
 
   if (page === "settings") {
@@ -1451,6 +1659,10 @@ function showPage(page: "workspace" | "agent" | "settings" | "admin", sectionId?
     }
     if (can("settings.manage")) loadSettings();
     return;
+  }
+  if (page === "agent") {
+    scrollAgentChatToBottom({ force: true });
+    focusComposer();
   }
   const targetId = sectionId || (page === "agent" ? "overview" : "");
   if (!targetId) return;
@@ -1499,6 +1711,7 @@ async function saveSettings(): Promise<void> {
       send_daily_cap: settings.value.send_daily_cap,
       send_min_interval_seconds: settings.value.send_min_interval_seconds,
       send_per_domain_daily_cap: settings.value.send_per_domain_daily_cap,
+      ai_content_generation: settings.value.ai_content_generation,
       agent_provider: agentProviderName.value,
       agent_model: agentModelName.value,
       backend_base_url: agentBackendBaseUrl.value,
@@ -1646,7 +1859,8 @@ function startNewAgentSession(): void {
     createNextAgentSession(getAgentStorage(), currentAgentSessionState()),
   );
   agentError.value = "";
-  message.success("已创建新的 Agent 会话");
+  scrollAgentChatToBottom({ force: true });
+  focusComposer();
 }
 
 function switchAgentSession(sessionId: string): void {
@@ -1655,8 +1869,8 @@ function switchAgentSession(sessionId: string): void {
     activateAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
   );
   agentError.value = "";
-  message.success("已切换 Agent 会话");
-  scrollAgentChatToBottom();
+  scrollAgentChatToBottom({ force: true });
+  focusComposer();
 }
 
 function beginEditAgentSession(session: AgentSessionRecord): void {
@@ -1857,6 +2071,10 @@ function handleAgentStreamEvent(
   payload: Record<string, unknown>,
   turn: AgentTurn,
 ): void {
+  // Once the user has stopped a turn, ignore any late frames the upstream
+  // stream is still flushing so a "stopped" reply doesn't keep growing.
+  if (turn.stopped) return;
+
   // Concurrency guard: a background session's events must never yank the
   // globally-viewed session or pop a toast about a conversation the user
   // isn't currently looking at.
@@ -1871,7 +2089,7 @@ function handleAgentStreamEvent(
 
   if (eventName === "delta") {
     turn.text += typeof payload.text === "string" ? payload.text : "";
-    scrollAgentChatToBottom();
+    if (viewing) scrollAgentChatToBottom();
     return;
   }
 
@@ -1879,7 +2097,7 @@ function handleAgentStreamEvent(
     const event = asAgentEvent(payload.event);
     if (!event) return;
     applyAgentEventToTurn(turn, event);
-    scrollAgentChatToBottom();
+    if (viewing) scrollAgentChatToBottom();
     return;
   }
 
@@ -1981,6 +2199,8 @@ onMounted(async () => {
   loadAgentHistoryFromStorage();
   if (globalThis.location?.hash === "#agent") {
     activePage.value = "agent";
+  } else if (globalThis.location?.hash === "#usage" && can("settings.manage")) {
+    activePage.value = "usage";
   }
   if (authToken.value) {
     const ok = await fetchMe();
@@ -1990,7 +2210,17 @@ onMounted(async () => {
     }
   }
   document.addEventListener("mousedown", handleSortOutsideClick);
+  document.addEventListener("keydown", handleAgentEscToStop);
 });
+
+// Esc stops the running Agent generation (the composer is disabled mid-stream,
+// so this lives on the document rather than the textarea).
+function handleAgentEscToStop(event: KeyboardEvent): void {
+  if (event.key === "Escape" && activePage.value === "agent" && agentLoading.value) {
+    event.preventDefault();
+    stopAgentPrompt();
+  }
+}
 
 watch(agentTurnsBySession, scheduleAgentHistoryPersist, { deep: true });
 
@@ -1998,6 +2228,7 @@ onBeforeUnmount(() => {
   if (agentHistoryPersistTimer) clearTimeout(agentHistoryPersistTimer);
   if (agentElapsedTimer) clearInterval(agentElapsedTimer);
   document.removeEventListener("mousedown", handleSortOutsideClick);
+  document.removeEventListener("keydown", handleAgentEscToStop);
 });
 </script>
 
@@ -2027,7 +2258,6 @@ onBeforeUnmount(() => {
       <button class="login-submit" type="submit" :disabled="loginLoading">
         {{ loginLoading ? "登录中..." : "登 录" }}
       </button>
-      <p class="login-hint">默认管理员：admin / admin123（首次登录后请尽快修改密码）</p>
     </form>
   </div>
 
@@ -2059,6 +2289,15 @@ onBeforeUnmount(() => {
           <span class="nav-icon"><Home :size="18" aria-hidden="true" /></span>
           线索管理
           <span v-if="draftCount > 0" class="nav-badge">{{ draftCount }}</span>
+        </button>
+        <button
+          v-if="can('settings.manage')"
+          type="button"
+          :class="{ active: activePage === 'usage' }"
+          @click="showPage('usage')"
+        >
+          <span class="nav-icon"><Gauge :size="18" aria-hidden="true" /></span>
+          AI 用量
         </button>
         <button
           v-if="can('users.manage')"
@@ -2111,10 +2350,6 @@ onBeforeUnmount(() => {
     <section class="main-workspace workspace-shell">
       <header id="overview" class="topbar workspace-command">
         <div>
-          <p :class="['eyebrow', { 'agent-crumb': activePage === 'agent' }]">
-            <ChevronDown v-if="activePage === 'agent'" :size="14" aria-hidden="true" />
-            <span>{{ topbarContent.eyebrow }}</span>
-          </p>
           <h1>{{ topbarContent.title }}</h1>
           <p class="topbar-copy">{{ topbarContent.copy }}</p>
         </div>
@@ -2147,6 +2382,18 @@ onBeforeUnmount(() => {
                 <n-icon><MailCheck /></n-icon>
               </template>
               同步回复
+            </n-button>
+          </template>
+          <template v-else-if="activePage === 'usage'">
+            <span class="live-badge">
+              <Gauge :size="16" aria-hidden="true" />
+              实时用量
+            </span>
+            <n-button class="ghost-button" secondary @click="usageReportRef?.reload()">
+              <template #icon>
+                <n-icon><RefreshCw /></n-icon>
+              </template>
+              刷新
             </n-button>
           </template>
           <template v-else>
@@ -2224,6 +2471,8 @@ onBeforeUnmount(() => {
               >
                 <Plus :size="16" aria-hidden="true" /> 新建会话
               </button>
+
+              <p class="ag-sidebar-label">历史会话</p>
 
               <label class="ag-sidebar-search">
                 <Search :size="14" aria-hidden="true" />
@@ -2307,29 +2556,44 @@ onBeforeUnmount(() => {
 
               <div class="sr-only" aria-live="polite" aria-atomic="true">{{ agentLiveStatus }}</div>
 
-              <div ref="agentChatScrollRef" class="ag-chat-scroll">
+              <div ref="agentChatScrollRef" class="ag-chat-scroll" @scroll.passive="onAgentChatScroll">
                 <div v-if="agentTurns.length === 0" class="ag-chat-empty">
-                  <span class="ag-chat-empty-icon"><Bot :size="26" aria-hidden="true" /></span>
+                  <span class="ag-chat-empty-icon"><Bot :size="30" aria-hidden="true" /></span>
                   <strong>向 Agent 发起一个渠道拓展任务</strong>
                   <p>Agent 会调用网页搜索、抓取、线索评分等工具，并把执行过程实时显示在下面。</p>
-                  <div class="ag-suggestions">
+                  <div class="ag-suggest-grid">
                     <button
                       type="button"
+                      class="ag-suggest-card"
                       @click="applySuggestion('帮我找 SkyWalker TKA 在印度的渠道商，优先找骨科植入物、关节置换、TKA 分销商，要求公开邮箱和来源证据。')"
                     >
-                      找印度的 TKA 渠道商
+                      <span class="ag-suggest-icon" style="--c: #6366f1"><Globe2 :size="17" aria-hidden="true" /></span>
+                      <span class="ag-suggest-text">
+                        <strong>找印度的 TKA 渠道商</strong>
+                        <small>骨科植入物 / 关节置换分销商，附公开邮箱与证据</small>
+                      </span>
                     </button>
                     <button
                       type="button"
+                      class="ag-suggest-card"
                       @click="applySuggestion('搜索德国的骨科机器人代理商，并给出匹配理由和证据来源。')"
                     >
-                      搜索德国骨科机器人代理商
+                      <span class="ag-suggest-icon" style="--c: #0ea5e9"><Search :size="17" aria-hidden="true" /></span>
+                      <span class="ag-suggest-text">
+                        <strong>搜德国骨科机器人代理商</strong>
+                        <small>给出匹配理由和公开证据来源</small>
+                      </span>
                     </button>
                     <button
                       type="button"
+                      class="ag-suggest-card"
                       @click="applySuggestion('帮我分析这条客户回复的意向：暂不确定预算，需要先了解产品资质。')"
                     >
-                      分析一条客户回复
+                      <span class="ag-suggest-icon" style="--c: #10b981"><MessageSquare :size="17" aria-hidden="true" /></span>
+                      <span class="ag-suggest-text">
+                        <strong>分析一条客户回复</strong>
+                        <small>判断意向、下一步动作与是否转人工</small>
+                      </span>
                     </button>
                   </div>
                 </div>
@@ -2363,47 +2627,60 @@ onBeforeUnmount(() => {
                   <div v-else class="ag-turn ag-turn-assistant">
                     <span class="ag-avatar"><Bot :size="16" aria-hidden="true" /></span>
                     <div class="ag-turn-body">
-                      <div v-if="turn.toolCalls.length > 0" class="ag-tool-timeline">
+                      <div
+                        v-if="turn.toolCalls.length > 0"
+                        class="ag-tools"
+                        :class="{ 'is-running': toolsHaveRunning(turn) }"
+                      >
                         <button
                           type="button"
-                          class="ag-tool-summary"
+                          class="ag-tools-summary"
                           :aria-expanded="turn.toolTimelineExpanded ? 'true' : 'false'"
                           @click="toggleToolTimeline(turn)"
                         >
-                          <Wrench :size="13" aria-hidden="true" />
-                          <span class="ag-tool-summary-label">
-                            {{
-                              turn.toolCalls.some((c) => c.status === 'running')
-                                ? "工具执行中…"
-                                : `已使用 ${turn.toolCalls.length} 个工具`
-                            }}
-                            <template v-if="turn.toolCalls.some((c) => c.status === 'error')"> · 有失败</template>
+                          <Loader2
+                            v-if="toolsHaveRunning(turn)"
+                            :size="13"
+                            class="ag-spin ag-tools-lead"
+                            aria-hidden="true"
+                          />
+                          <span
+                            v-else
+                            class="ag-tools-lead-badge"
+                            :class="{ 'has-error': toolsHaveError(turn) }"
+                          >
+                            <X v-if="toolsHaveError(turn)" :size="11" aria-hidden="true" />
+                            <Check v-else :size="11" aria-hidden="true" />
+                          </span>
+                          <span class="ag-tools-summary-text">
+                            <template v-if="toolsHaveRunning(turn)">正在{{ runningToolLabel(turn) }}…</template>
+                            <template v-else>使用了 {{ turn.toolCalls.length }} 个工具<template v-if="toolsHaveError(turn)"> · 有失败</template></template>
                           </span>
                           <ChevronDown
-                            :size="14"
-                            class="ag-tool-summary-chevron"
-                            :class="{ 'ag-tool-summary-chevron-open': turn.toolTimelineExpanded }"
+                            :size="13"
+                            class="ag-tools-caret"
+                            :class="{ open: turn.toolTimelineExpanded }"
                             aria-hidden="true"
                           />
                         </button>
-                        <div v-if="turn.toolTimelineExpanded" class="ag-tool-list">
-                          <div
-                            v-for="call in turn.toolCalls"
-                            :key="call.id"
-                            :class="['ag-tool-row', `ag-tool-${call.status}`]"
-                          >
-                            <span class="ag-tool-dot">
-                              <Loader2 v-if="call.status === 'running'" :size="12" class="ag-spin" aria-hidden="true" />
-                              <X v-else-if="call.status === 'error'" :size="12" aria-hidden="true" />
-                              <Check v-else :size="12" aria-hidden="true" />
-                            </span>
-                            <component :is="toolMeta(call.toolName).icon" :size="14" class="ag-tool-icon" aria-hidden="true" />
-                            <span class="ag-tool-label">{{ call.detail || toolMeta(call.toolName).label }}</span>
-                            <span class="ag-tool-status">
-                              {{ call.status === 'running' ? '执行中' : call.status === 'error' ? '失败' : '已完成' }}
-                            </span>
-                          </div>
-                        </div>
+
+                        <transition name="ag-tools-expand">
+                          <ol v-if="turn.toolTimelineExpanded" class="ag-tools-steps">
+                            <li
+                              v-for="call in turn.toolCalls"
+                              :key="call.id"
+                              :class="['ag-tools-step', `is-${call.status}`]"
+                            >
+                              <span class="ag-tools-node">
+                                <Loader2 v-if="call.status === 'running'" :size="10" class="ag-spin" aria-hidden="true" />
+                                <X v-else-if="call.status === 'error'" :size="10" aria-hidden="true" />
+                                <Check v-else :size="10" aria-hidden="true" />
+                              </span>
+                              <component :is="toolMeta(call.toolName).icon" :size="13" class="ag-tools-icon" aria-hidden="true" />
+                              <span class="ag-tools-name">{{ call.detail || toolMeta(call.toolName).label }}</span>
+                            </li>
+                          </ol>
+                        </transition>
                       </div>
 
                       <div v-if="turn.text" class="ag-bubble ag-bubble-assistant">
@@ -2443,36 +2720,56 @@ onBeforeUnmount(() => {
                 </template>
               </div>
 
-              <form class="ag-composer" @submit.prevent="sendAgentPrompt">
-                <textarea
-                  ref="agentComposerRef"
-                  v-model="agentPrompt"
-                  class="ag-composer-input"
-                  placeholder="向 Agent 发起渠道拓展任务，Enter 发送，Shift+Enter 换行"
-                  rows="1"
-                  :disabled="agentLoading"
-                  @input="autoGrowComposer"
-                  @keydown.enter.exact.prevent="sendAgentPrompt"
-                ></textarea>
+              <transition name="ag-fade">
                 <button
-                  v-if="agentLoading"
+                  v-if="agentShowScrollDown"
                   type="button"
-                  class="ag-send-button ag-stop-button"
-                  aria-label="停止生成"
-                  title="停止生成"
-                  @click="stopAgentPrompt()"
+                  class="ag-scroll-down"
+                  aria-label="回到最新消息"
+                  title="回到最新消息"
+                  @click="scrollAgentChatToBottom({ force: true, smooth: true })"
                 >
-                  <Square :size="14" fill="currentColor" aria-hidden="true" />
+                  <ChevronDown :size="18" aria-hidden="true" />
                 </button>
-                <button
-                  v-else
-                  type="submit"
-                  class="ag-send-button"
-                  :disabled="!agentPrompt.trim()"
-                  aria-label="发送"
-                >
-                  <Send :size="17" aria-hidden="true" />
-                </button>
+              </transition>
+
+              <form class="ag-composer" @submit.prevent="sendAgentPrompt">
+                <div class="ag-composer-field" :class="{ 'is-busy': agentLoading }">
+                  <textarea
+                    ref="agentComposerRef"
+                    v-model="agentPrompt"
+                    class="ag-composer-input"
+                    placeholder="向 Agent 发起渠道拓展任务…"
+                    rows="1"
+                    :disabled="agentLoading"
+                    @input="autoGrowComposer"
+                    @keydown.enter.exact.prevent="sendAgentPrompt"
+                  ></textarea>
+                  <button
+                    v-if="agentLoading"
+                    type="button"
+                    class="ag-send-button ag-stop-button"
+                    aria-label="停止生成"
+                    title="停止生成"
+                    @click="stopAgentPrompt()"
+                  >
+                    <Square :size="14" fill="currentColor" aria-hidden="true" />
+                  </button>
+                  <button
+                    v-else
+                    type="submit"
+                    class="ag-send-button"
+                    :disabled="!agentPrompt.trim()"
+                    aria-label="发送"
+                  >
+                    <Send :size="17" aria-hidden="true" />
+                  </button>
+                </div>
+                <div class="ag-composer-hint">
+                  <span v-if="agentLoading" class="ag-hint-busy"><kbd>Esc</kbd> 停止生成</span>
+                  <span v-else><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+                  <span class="ag-composer-skill"><Bot :size="12" aria-hidden="true" /> overseas-distributor-prospecting</span>
+                </div>
               </form>
             </section>
 
@@ -2613,18 +2910,6 @@ onBeforeUnmount(() => {
           </article>
         </section>
 
-        <div v-if="activePage === 'workspace'" class="lead-type-metrics" aria-label="线索分类统计">
-          <div class="lead-type-metric-card">
-            <span class="lead-type-metric-label">代理商</span>
-            <strong class="lead-type-metric-value">{{ metrics.distributor_leads ?? 0 }}</strong>
-            <span class="lead-type-metric-sub">已确认 {{ metrics.distributor_qualified ?? 0 }}</span>
-          </div>
-          <div class="lead-type-metric-card">
-            <span class="lead-type-metric-label">KOL</span>
-            <strong class="lead-type-metric-value">{{ metrics.kol_leads ?? 0 }}</strong>
-            <span class="lead-type-metric-sub">已确认 {{ metrics.kol_qualified ?? 0 }}</span>
-          </div>
-        </div>
 
         <div v-if="activePage === 'workspace'" class="toolbar" aria-label="筛选线索">
           <div class="toolbar-search">
@@ -2646,34 +2931,37 @@ onBeforeUnmount(() => {
             </button>
           </div>
 
-          <div class="status-chips">
-            <button
-              v-for="opt in statusFilterOptions"
-              :key="String(opt.value)"
-              :class="['status-chip', { active: filterStatus === opt.value }]"
-              @click="filterStatus = filterStatus === opt.value ? '' : String(opt.value); runAction('dashboard', loadDashboard)"
-            >
-              {{ opt.label }}
-            </button>
+          <div class="toolbar-filters">
+            <FilterSelect
+              v-model="filterStatus"
+              :options="statusSelectOptions"
+              placeholder="全部状态"
+              @change="runAction('dashboard', loadDashboard)"
+            />
+            <FilterSelect
+              v-model="filterLeadType"
+              :options="leadTypeSelectOptions"
+              placeholder="全部类型"
+              :icon="Tag"
+              @change="runAction('dashboard', loadDashboard)"
+            />
+            <FilterSelect
+              v-model="filterRegion"
+              :options="regionSelectOptions"
+              placeholder="全部地区"
+              :icon="Globe2"
+              @change="runAction('dashboard', loadDashboard)"
+            />
+            <FilterSelect
+              v-model="filterCountry"
+              :options="countrySelectOptions"
+              placeholder="全部国家"
+              :icon="MapPin"
+              searchable
+              search-placeholder="搜索国家…"
+              @change="runAction('dashboard', loadDashboard)"
+            />
           </div>
-
-          <div class="status-chips">
-            <button
-              v-for="opt in leadTypeFilterOptions"
-              :key="String(opt.value)"
-              :class="['status-chip', 'lead-type-chip', { active: filterLeadType === opt.value }]"
-              @click="filterLeadType = filterLeadType === opt.value ? '' : String(opt.value); runAction('dashboard', loadDashboard)"
-            >
-              {{ opt.label }}
-            </button>
-          </div>
-
-          <input
-            v-model="filterRegion"
-            placeholder="地区..."
-            class="toolbar-region-input"
-            @keyup.enter="runAction('dashboard', loadDashboard)"
-          />
 
           <div class="toolbar-sort" aria-label="排序">
             <button
@@ -2734,6 +3022,18 @@ onBeforeUnmount(() => {
               <div>
                 <h2 id="lead-list-title">线索数据库</h2>
                 <p>公司、邮箱、公开来源证据、评分和管线状态</p>
+              </div>
+              <div class="lh-type-stats" aria-label="线索分类统计">
+                <span class="lh-stat lh-stat-distributor">
+                  <i class="lh-dot"></i>代理商
+                  <b>{{ metrics.distributor_leads ?? 0 }}</b>
+                  <em>已确认 {{ metrics.distributor_qualified ?? 0 }}</em>
+                </span>
+                <span class="lh-stat lh-stat-kol">
+                  <i class="lh-dot"></i>KOL
+                  <b>{{ metrics.kol_leads ?? 0 }}</b>
+                  <em>已确认 {{ metrics.kol_qualified ?? 0 }}</em>
+                </span>
               </div>
             </div>
             <div class="list-head-right">
@@ -2801,6 +3101,14 @@ onBeforeUnmount(() => {
                 <n-tag :type="lead.lead_type === 'kol' ? 'warning' : 'info'" size="small" round :bordered="false">
                   {{ leadTypeLabel(lead.lead_type) }}
                 </n-tag>
+                <span
+                  v-if="isAwaitingReply(lead)"
+                  class="lead-await-chip"
+                  :class="{ stale: (outreachAgeDays(lead) ?? 0) >= 7 }"
+                >
+                  <Clock3 :size="11" aria-hidden="true" />
+                  {{ (outreachAgeDays(lead) ?? 0) >= 7 ? "待跟进" : "待回复" }}<template v-if="outreachAgeDays(lead) !== null"> · {{ outreachAgeDays(lead) }}天</template>
+                </span>
                 <span class="lead-region">{{ lead.country === lead.region ? lead.country : `${lead.country} · ${lead.region}` }}</span>
                 <span class="lead-category">{{ lead.category }}</span>
               </div>
@@ -2814,7 +3122,7 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="lead-tools" @click.stop>
-              <button v-if="lead.status === 'new'" class="lead-action-btn primary" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
+              <button v-if="canOutreach(lead.status)" class="lead-action-btn primary" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
               <button v-if="lead.status === 'emailed' && (lead.reply_count || 0) > 0" class="lead-action-btn" @click="goToReplyForLead(lead.id)"><MailCheck :size="13" />回复</button>
               <button v-if="['new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
               <button v-if="lead.status === 'rejected'" class="lead-action-btn" @click="reactivateLead(lead.id)"><RefreshCw :size="13" />激活</button>
@@ -2886,13 +3194,41 @@ onBeforeUnmount(() => {
                   />
                 </label>
                 <div class="detail-actions">
+                  <n-button
+                    v-if="detailLead && canOutreach(detailLead.status)"
+                    class="primary-button"
+                    type="primary"
+                    @click="outreachFromDetail"
+                  >
+                    <template #icon><n-icon><Send /></n-icon></template>
+                    发送外联
+                  </n-button>
                   <n-button class="ghost-button danger-action" secondary @click="deleteLead(detailLeadId!)">
                     <template #icon><n-icon><Trash2 /></n-icon></template>
                     删除
                   </n-button>
-                  <n-button class="ghost-button" secondary @click="goToReply">
-                    <template #icon><n-icon><MailCheck /></n-icon></template>
-                    回复处理
+                </div>
+
+                <div class="detail-reply-analyze">
+                  <div class="detail-reply-head">
+                    <p class="panel-label">分析收到的回复</p>
+                    <span>把对方的邮件回复粘贴进来，由 AI 判断意向并更新线索状态。</span>
+                  </div>
+                  <n-input
+                    v-model:value="detailReplyText"
+                    type="textarea"
+                    :autosize="{ minRows: 3, maxRows: 8 }"
+                    placeholder="粘贴对方的回复原文…"
+                  />
+                  <n-button
+                    class="primary-button"
+                    type="primary"
+                    :loading="detailReplyBusy"
+                    :disabled="!detailReplyText.trim() || detailReplyBusy"
+                    @click="analyzeDetailReply"
+                  >
+                    <template #icon><n-icon><MessageSquare /></n-icon></template>
+                    {{ detailReplyBusy ? "分析中…" : "AI 分析回复" }}
                   </n-button>
                 </div>
               </div>
@@ -2937,6 +3273,12 @@ onBeforeUnmount(() => {
           </section>
         </div>
       </section>
+
+        <UsageReport
+          v-if="activePage === 'usage' && can('settings.manage')"
+          ref="usageReportRef"
+          :request="request"
+        />
 
         <AdminPanel
           v-if="activePage === 'admin' && can('users.manage')"
@@ -3039,9 +3381,22 @@ onBeforeUnmount(() => {
               <div>
                 <p class="panel-label">AI Agent</p>
                 <h3>模型与 API 配置</h3>
-                <p>配置 Agent 使用的 AI 模型、API Key 和后端地址。</p>
+                <p>此处的 AI 模型 / API Key 同时用于三处：<strong>Agent 对话</strong>、<strong>外联邮件生成</strong>、<strong>回复意图分析</strong>。</p>
               </div>
             </div>
+
+            <label class="toggle-field">
+              <n-checkbox v-model:checked="settings.ai_content_generation">用 AI 生成外联邮件正文</n-checkbox>
+            </label>
+            <p class="setting-hint">
+              开启后，外联邮件正文优先由上面配置的 LLM 生成，调用失败或未配置时回退到固定模板；关闭则始终用模板。
+              <br />
+              <strong>回复意图分析</strong>始终由 LLM 完成（无关键词兜底）——未配置 API Key 时会<strong>直接报错</strong>，不做规则猜测。
+            </p>
+            <p v-if="!settings.ai_content_ready" class="setting-hint" style="color: var(--warning-color, #d97706);">
+              ⚠️ 后端设置与 Agent 配置里都没有可用的 API Key：外联邮件将回退到模板，且<strong>回复分析会直接报错</strong>。请在下方填写 API Key。
+            </p>
+
             <div class="settings-agent-grid">
               <label class="field"><span>Provider</span><n-select v-model:value="agentProviderName" :options="providerOptions" /></label>
               <label class="field"><span>API Key</span><n-input v-model:value="settingsAgentKeyInput" autocomplete="off" :placeholder="settings.has_agent_key ? settings.agent_key_preview : 'sk-...'" type="password" show-password-on="click" /></label>

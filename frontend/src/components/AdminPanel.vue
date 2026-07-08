@@ -8,7 +8,6 @@ import {
   Plus,
   RotateCcw,
   ScrollText,
-  ShieldCheck,
   Trash2,
   UserPlus,
   Users,
@@ -392,15 +391,8 @@ onMounted(loadAll);
 
 <template>
   <section class="admin">
-    <!-- Header -->
+    <!-- Header: tabs only; the page title lives in the shared topbar. -->
     <header class="admin-head">
-      <div class="admin-title">
-        <span class="admin-title-icon"><ShieldCheck :size="22" /></span>
-        <div>
-          <h2>用户、权限与合规</h2>
-          <p>自定义角色与权限，并管理退订抑制名单和操作审计日志。</p>
-        </div>
-      </div>
       <div class="seg">
         <button :class="['seg-btn', { active: tab === 'users' }]" @click="switchTab('users')">
           <Users :size="15" /> 用户 <span class="seg-count">{{ users.length }}</span>
@@ -682,19 +674,11 @@ onMounted(loadAll);
 /* Header */
 .admin-head {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
   gap: 16px;
   flex-wrap: wrap;
 }
-.admin-title { display: flex; align-items: center; gap: 14px; }
-.admin-title-icon {
-  width: 44px; height: 44px; border-radius: 12px;
-  display: grid; place-items: center;
-  background: var(--primary-soft); color: var(--primary-strong);
-}
-.admin-title h2 { margin: 0; font-size: 20px; color: var(--text); }
-.admin-title p { margin: 3px 0 0; font-size: 13px; color: var(--text-muted); }
 
 /* Segmented control */
 .seg {

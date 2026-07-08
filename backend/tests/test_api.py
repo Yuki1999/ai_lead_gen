@@ -11,9 +11,37 @@ def _authenticate(client: TestClient, username: str = "admin", password: str = "
     client.headers["Authorization"] = f"Bearer {resp.json()['token']}"
 
 
+def _mock_reply_llm(monkeypatch, *, intent: str, requires_human: bool) -> None:
+    """Configure a backend LLM key and stub the chat call so reply analysis (now
+    LLM-only, no keyword fallback) returns a deterministic intent in tests."""
+    import requests
+
+    from app import db
+
+    db.set_setting("agent_provider", "deepseek")
+    db.set_setting("agent_key", "test-key")
+    content = (
+        '{"intent": "%s", "confidence": 0.9, "summary": "s", '
+        '"next_action": "n", "requires_human": %s}'
+        % (intent, "true" if requires_human else "false")
+    )
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": content}}], "usage": {"total_tokens": 12}}
+
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+
+
 @contextmanager
 def _client(tmp_path, monkeypatch, *, authenticate: bool = True):
     monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
+    # Isolate the Pi sidecar env so the AI-content fallback can't resolve a real
+    # key from the project's agent/.env during tests (keeps email/reply on the
+    # deterministic template/keyword path unless a test sets a DB key itself).
+    monkeypatch.setenv("AGENT_ENV_PATH", str(tmp_path / "agent.env"))
     from app.main import create_app
 
     with TestClient(create_app()) as client:
@@ -328,6 +356,7 @@ def test_demo_email_send_requires_discovered_email(tmp_path, monkeypatch):
 
 def test_reply_analysis_updates_lead_status(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
         created = client.post(
             "/leads/search",
             json={
@@ -355,6 +384,7 @@ def test_reply_analysis_updates_lead_status(tmp_path, monkeypatch):
 
 def test_complex_reply_sets_human_review_status(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="complex", requires_human=True)
         created = client.post(
             "/leads/search",
             json={
@@ -377,6 +407,24 @@ def test_complex_reply_sets_human_review_status(tmp_path, monkeypatch):
     assert analysis.status_code == 201
     assert analysis.json()["requires_human"] is True
     assert lead["status"] == "human_review"
+
+
+def test_reply_analysis_errors_without_llm(tmp_path, monkeypatch):
+    # No LLM configured (AGENT_ENV_PATH isolated by fixture): the endpoint must
+    # error rather than fall back to keyword rules.
+    with _client(tmp_path, monkeypatch) as client:
+        created = client.post(
+            "/leads/search",
+            json={"target_regions": ["Europe"], "max_results": 1, "real_search": False},
+        )
+        lead_id = created.json()["leads"][0]["id"]
+        resp = client.post(
+            "/replies/analyze",
+            json={"lead_id": lead_id, "reply_text": "We are interested, tell us more."},
+        )
+
+    assert resp.status_code == 502
+    assert "AI" in resp.json()["detail"]
 
 
 def test_update_lead_status_and_notes(tmp_path, monkeypatch):
@@ -1476,3 +1524,138 @@ def test_leads_sort_multiple_fields(tmp_path, monkeypatch):
         assert rows[1]["company_name"] == "Delta Robotics"
         assert rows[1]["reply_count"] == 1
         assert rows[2]["reply_count"] == 0 and rows[3]["reply_count"] == 0
+
+
+def test_leads_filter_by_country(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post(
+            "/leads/batch",
+            json=[
+                {
+                    "company_name": "Germany Country Filter Co",
+                    "region": "Europe",
+                    "country": "Germany",
+                    "email": "sales@germany-country-filter.example",
+                    "score": 80,
+                },
+                {
+                    "company_name": "Singapore Country Filter Co",
+                    "region": "Southeast Asia",
+                    "country": "Singapore",
+                    "email": "sales@singapore-country-filter.example",
+                    "score": 80,
+                },
+            ],
+        )
+
+        germany_only = client.get("/leads", params={"country": "Germany"}).json()
+        singapore_only = client.get("/leads", params={"country": "Singapore"}).json()
+        no_filter = client.get("/leads").json()
+
+    assert germany_only["total"] == 1
+    assert germany_only["leads"][0]["company_name"] == "Germany Country Filter Co"
+    assert singapore_only["total"] == 1
+    assert singapore_only["leads"][0]["company_name"] == "Singapore Country Filter Co"
+    assert no_filter["total"] == 2
+
+
+# ── AI token usage monitoring ─────────────────────────────────────────────────
+
+def test_token_usage_report_defaults_to_no_budget(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        resp = client.get("/usage/token-report")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["used_tokens"] == 0
+    assert body["budget_tokens"] == 0
+    assert body["remaining_tokens"] is None
+    assert body["percent_used"] is None
+    assert body["by_source"] == {}
+    assert body["daily_series"] == []
+
+
+def test_agent_reports_token_usage_and_report_aggregates_it(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        recorded = client.post(
+            "/usage/token-events",
+            json={
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "total_tokens": 150,
+            },
+        )
+        assert recorded.status_code == 200
+
+        report = client.get("/usage/token-report").json()
+
+    assert report["used_tokens"] == 150
+    assert report["by_source"] == {"agent_chat": 150}
+
+
+def test_token_budget_update_computes_remaining_and_percent(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post(
+            "/usage/token-events",
+            json={
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "prompt_tokens": 8000,
+                "completion_tokens": 2000,
+                "total_tokens": 10000,
+            },
+        )
+
+        updated = client.put("/usage/token-budget", json={"budget_tokens": 100000}).json()
+
+    assert updated["budget_tokens"] == 100000
+    assert updated["used_tokens"] == 10000
+    assert updated["remaining_tokens"] == 90000
+    assert updated["percent_used"] == 10.0
+
+
+def test_token_usage_requires_settings_manage_for_report_and_budget(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post(
+            "/admin/roles", json={"name": "usage-blind", "permissions": ["leads.view"]}
+        ).json()
+        client.post(
+            "/admin/users",
+            json={"username": "usage_blind", "password": "blind1234", "role_ids": [role["id"]]},
+        )
+
+    from app.main import create_app as _create_app
+
+    with TestClient(_create_app()) as c2:
+        _authenticate(c2, "usage_blind", "blind1234")
+        assert c2.get("/usage/token-report").status_code == 403
+        assert c2.put("/usage/token-budget", json={"budget_tokens": 1000}).status_code == 403
+
+
+def test_token_usage_event_requires_agent_use_permission(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        role = client.post(
+            "/admin/roles", json={"name": "no-agent-use", "permissions": ["leads.view"]}
+        ).json()
+        client.post(
+            "/admin/users",
+            json={"username": "no_agent_use", "password": "noagent123", "role_ids": [role["id"]]},
+        )
+
+    from app.main import create_app as _create_app
+
+    with TestClient(_create_app()) as c2:
+        _authenticate(c2, "no_agent_use", "noagent123")
+        resp = c2.post(
+            "/usage/token-events",
+            json={
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+        assert resp.status_code == 403

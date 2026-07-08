@@ -36,6 +36,10 @@ class ReplyAnalysis:
     summary: str
     next_action: str
     requires_human: bool
+    # True ONLY when the reply explicitly asks to stop / unsubscribe / be removed.
+    # Auto-suppression keys off this — not off a general "rejected" intent — so a
+    # merely-uninterested reply can't permanently block the address.
+    opt_out: bool = False
 
 
 def generate_candidate_leads(
@@ -254,17 +258,79 @@ def _render_template_email(lead: CandidateLead) -> RenderedEmail:
     return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
 
 
+def resolve_content_ai(*, respect_toggle: bool = True) -> tuple[str, str, str] | None:
+    """Resolve the LLM used to generate outreach emails and analyze replies.
+
+    Priority:
+    1. Master switch `ai_content_generation` (default on) — only when
+       `respect_toggle` is set. Email generation respects it (falls back to a
+       template when off); reply analysis passes `respect_toggle=False` because
+       it is LLM-only and simply needs a key.
+    2. Explicit backend AI settings (`agent_provider` / `agent_key` / `agent_model`).
+    3. Fall back to the Pi sidecar's config (agent/.env) so a single agent setup
+       also powers email/reply generation without re-entering the key.
+
+    Returns `(provider, api_key, model)`, or None when no LLM is available.
+    """
+    try:
+        from app.db import get_all_settings, get_setting
+
+        if respect_toggle and get_setting("ai_content_generation", "true") != "true":
+            return None
+        settings = get_all_settings()
+        provider = settings.get("agent_provider", "").strip().lower()
+        api_key = settings.get("agent_key", "").strip()
+        model = settings.get("agent_model", "").strip()
+        if api_key and provider:
+            return provider, api_key, model or "deepseek-v4-pro"
+
+        from app.agent_config import resolve_sidecar_ai
+
+        sidecar = resolve_sidecar_ai()
+        if sidecar and sidecar[1]:
+            provider, api_key, model = sidecar
+            return provider.lower(), api_key, model or "deepseek-v4-pro"
+    except Exception:
+        pass
+    return None
+
+
+def _record_llm_usage(*, source: str, provider: str, model: str, data: object) -> None:
+    """Persist token usage from an OpenAI-compatible chat-completions response.
+
+    Best-effort and self-contained: a bug here must never take down email
+    generation or reply analysis, so all failures are swallowed.
+    """
+    try:
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            return
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        if total_tokens <= 0:
+            return
+        from app.db import insert_token_usage_event
+        insert_token_usage_event(
+            source=source,
+            provider=provider,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            actor="backend",
+        )
+    except Exception:
+        pass
+
+
 def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
     """Generate email using the configured AI agent. Returns None on failure."""
     try:
-        from app.db import get_all_settings
-        settings = get_all_settings()
-        provider = settings.get("agent_provider", "").lower()
-        api_key = settings.get("agent_key", "")
-        model = settings.get("agent_model", "deepseek-v4-pro")
-
-        if not api_key or not provider:
+        resolved = resolve_content_ai()
+        if resolved is None:
             return None
+        provider, api_key, model = resolved
 
         if provider == "deepseek":
             api_url = "https://api.deepseek.com/v1/chat/completions"
@@ -307,6 +373,7 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
             return None
 
         data = resp.json()
+        _record_llm_usage(source="email_generation", provider=provider, model=model, data=data)
         content = data["choices"][0]["message"]["content"].strip()
 
         # Parse JSON from response
@@ -410,38 +477,68 @@ Hard requirements:
 Return JSON: {{"subject": "{subject}", "body": "..."}}"""
 
 
+class ReplyAnalysisError(RuntimeError):
+    """Raised when a reply can't be analyzed by the LLM.
+
+    Reply intent classification is LLM-only — there is NO keyword fallback, so
+    callers get a clear error (no LLM configured, or the LLM call failed)
+    instead of an unreliable rule-based guess.
+    """
+
+
+def bounce_reply_analysis() -> ReplyAnalysis:
+    """Deterministic analysis for a bounce / non-delivery report (no LLM needed)."""
+    return ReplyAnalysis(
+        intent="rejected",
+        confidence=1.0,
+        summary="退信 / 无法送达；已将该地址加入抑制名单。",
+        next_action="停止向该地址发送外联。",
+        requires_human=False,
+    )
+
+
+def auto_reply_analysis() -> ReplyAnalysis:
+    """Deterministic analysis for an auto-reply (out-of-office etc.; no LLM needed)."""
+    return ReplyAnalysis(
+        intent="needs_review",
+        confidence=0.5,
+        summary="自动回复（如离开办公室），非真实意向。",
+        next_action="等待对方的真实回复后再处理。",
+        requires_human=False,
+    )
+
+
 def analyze_reply(reply_text: str) -> ReplyAnalysis:
-    ai_result = _try_ai_reply_analysis(reply_text)
-    if ai_result:
-        return ai_result
-    return _keyword_analyze_reply(reply_text)
+    """Classify a prospect reply's intent using the LLM.
+
+    LLM-only by design: raises ``ReplyAnalysisError`` when no LLM is configured
+    or the call fails, rather than falling back to unreliable keyword rules.
+    """
+    resolved = resolve_content_ai(respect_toggle=False)
+    if resolved is None:
+        raise ReplyAnalysisError(
+            "未配置 AI 模型（Provider / API Key），无法分析回复。请在「设置 → Agent」中配置 LLM。"
+        )
+    return _ai_reply_analysis(reply_text, resolved)
 
 
-def _try_ai_reply_analysis(reply_text: str) -> ReplyAnalysis | None:
-    """Use the configured LLM to analyze reply intent. Returns None on failure."""
-    try:
-        from app.db import get_all_settings
-        settings = get_all_settings()
-        provider = settings.get("agent_provider", "").lower()
-        api_key = settings.get("agent_key", "")
-        model = settings.get("agent_model", "deepseek-v4-pro")
+def _ai_reply_analysis(reply_text: str, resolved: tuple[str, str, str]) -> ReplyAnalysis:
+    """Call the LLM to classify a reply. Raises ReplyAnalysisError on any failure."""
+    provider, api_key, model = resolved
 
-        if not api_key or not provider:
-            return None
+    if provider == "deepseek":
+        api_url = "https://api.deepseek.com/v1/chat/completions"
+    elif provider == "openai":
+        api_url = "https://api.openai.com/v1/chat/completions"
+    elif provider in ("bailian", "dashscope", "qwen"):
+        # 阿里云百炼 / 通义千问 — OpenAI 兼容端点
+        api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    else:
+        raise ReplyAnalysisError(f"不支持的 AI provider：{provider}")
 
-        if provider == "deepseek":
-            api_url = "https://api.deepseek.com/v1/chat/completions"
-        elif provider == "openai":
-            api_url = "https://api.openai.com/v1/chat/completions"
-        elif provider in ("bailian", "dashscope", "qwen"):
-            # 阿里云百炼 / 通义千问 — OpenAI 兼容端点
-            api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-        else:
-            return None
+    import requests, json, re
 
-        import requests, json, re
-
-        prompt = f"""Analyze this prospect reply email and classify the intent. Reply text:
+    prompt = f"""Analyze this prospect reply email and classify the intent. Reply text:
 
 \"\"\"
 {reply_text[:2000]}
@@ -453,6 +550,7 @@ Return ONLY a JSON object with these fields:
 - summary: one short sentence in Chinese summarizing what the reply means
 - next_action: one short sentence in Chinese about what to do next
 - requires_human: boolean, true if the reply involves legal/contract/exclusivity/tender matters that need human review
+- opt_out: boolean, true ONLY if the reply EXPLICITLY asks to stop contact / unsubscribe / be removed from the list (e.g. "unsubscribe", "remove me", "do not contact us", "stop emailing", "退订", "别再发了"). A merely uninterested or "no fit" reply is NOT an opt_out.
 
 Rules:
 - "interested": general interest, asks for the brochure/product brief, asks who to talk to, or wants to keep the conversation going — WITHOUT yet raising any of the human-review topics below
@@ -462,6 +560,7 @@ Rules:
 
 Important: The reply may be in Chinese, English, or any language. Judge by meaning, not by keyword matching. Whenever a human-review topic appears, prefer "complex" with requires_human=true even if the prospect also sounds interested."""
 
+    try:
         resp = requests.post(
             api_url,
             headers={
@@ -480,72 +579,33 @@ Important: The reply may be in Chinese, English, or any language. Judge by meani
             # Reasoning/"thinking" models (e.g. Bailian qwen3.7-max) can be slow.
             timeout=90,
         )
+    except requests.RequestException as exc:
+        raise ReplyAnalysisError(f"AI 回复分析请求失败：{exc}") from exc
 
-        if resp.status_code != 200:
-            return None
+    if resp.status_code != 200:
+        raise ReplyAnalysisError(f"AI 回复分析返回 HTTP {resp.status_code}")
 
-        data = resp.json()
+    data = resp.json()
+    _record_llm_usage(source="reply_analysis", provider=provider, model=model, data=data)
+    try:
         content = data["choices"][0]["message"]["content"].strip()
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
         parsed = json.loads(content)
+    except (KeyError, IndexError, ValueError, TypeError) as exc:
+        raise ReplyAnalysisError("AI 回复分析返回了无法解析的内容") from exc
 
-        intent = str(parsed.get("intent", "")).lower()
-        if intent not in ("interested", "rejected", "complex", "needs_review"):
-            return None
-
-        return ReplyAnalysis(
-            intent=intent,
-            confidence=float(parsed.get("confidence", 0.7)),
-            summary=str(parsed.get("summary", ""))[:500],
-            next_action=str(parsed.get("next_action", ""))[:500],
-            requires_human=bool(parsed.get("requires_human", False)),
-        )
-
-    except Exception:
-        return None
-
-
-def _keyword_analyze_reply(reply_text: str) -> ReplyAnalysis:
-    text = reply_text.strip()
-    lowered = text.lower()
-
-    if _contains_any(lowered, ["not interested", "remove us", "unsubscribe", "do not contact"]):
-        return ReplyAnalysis(
-            intent="rejected",
-            confidence=0.9,
-            summary="The recipient declined further outreach.",
-            next_action="Mark as do not contact and stop outreach.",
-            requires_human=False,
-        )
-
-    if _contains_any(lowered, _HUMAN_REVIEW_TRIGGERS):
-        return ReplyAnalysis(
-            intent="complex",
-            confidence=0.84,
-            summary="回复涉及价格/独家/注册证/招投标/合同/付款/临床声明/样机试用等需人工处理的事项。",
-            next_action="转人工：由海外业务负责人审核后再回复，AI 不自动答复。",
-            requires_human=True,
-        )
-
-    if _contains_any(
-        lowered,
-        ["interested", "send", "share", "details", "pricing", "certificate", "catalog", "product"],
-    ):
-        return ReplyAnalysis(
-            intent="interested",
-            confidence=0.78,
-            summary="The recipient asked for more information or showed interest.",
-            next_action="Send the introductory product brief and ask to schedule a qualification call.",
-            requires_human=False,
-        )
+    intent = str(parsed.get("intent", "")).lower()
+    if intent not in ("interested", "rejected", "complex", "needs_review"):
+        raise ReplyAnalysisError(f"AI 回复分析返回了无效的 intent：{intent!r}")
 
     return ReplyAnalysis(
-        intent="needs_review",
-        confidence=0.58,
-        summary="The reply is ambiguous and does not clearly accept or reject the outreach.",
-        next_action="Route to a human for quick review or request clarification.",
-        requires_human=True,
+        intent=intent,
+        confidence=float(parsed.get("confidence", 0.7)),
+        summary=str(parsed.get("summary", ""))[:500],
+        next_action=str(parsed.get("next_action", ""))[:500],
+        requires_human=bool(parsed.get("requires_human", False)),
+        opt_out=bool(parsed.get("opt_out", False)),
     )
 
 
@@ -606,33 +666,3 @@ def _category_for_keyword(keyword: str) -> str:
     if "laparoscopic" in lowered or "minimally invasive" in lowered:
         return "minimally invasive surgery channel"
     return "medical device distributor"
-
-
-# Human-review trigger phrases (approved list, EN + CN). If a prospect reply
-# mentions any of these, the reply must be escalated to a human and AI must not
-# auto-respond. Source: 邮件模板文档 4.3 / 业务信息表「人工审核项」.
-_HUMAN_REVIEW_TRIGGERS = [
-    # price / quote / budget
-    "price", "pricing", "quote", "quotation", "budget", "cost", "discount",
-    "价格", "报价", "预算", "费用", "折扣",
-    # exclusivity
-    "exclusive", "exclusivity", "sole distributor", "独家", "排他",
-    # registration / certification
-    "registration", "certificate", "certification", "fda", "ce mark", "ce 认证",
-    "注册证", "认证", "资质", "许可证",
-    # tender / bidding
-    "tender", "bidding", "bid", "rfp", "rfq", "招投标", "招标", "投标",
-    # contract / agreement / terms
-    "contract", "agreement", "terms and conditions", "合同", "协议", "条款",
-    # payment / deposit
-    "payment terms", "deposit", "down payment", "付款", "保证金", "定金",
-    # clinical claims / indications / efficacy
-    "clinical claim", "indication", "efficacy", "临床声明", "适应症", "疗效",
-    # demo / trial / sample machine
-    "demo unit", "demonstration", "trial unit", "sample machine", "loaner",
-    "样机", "试用", "演示", "demo",
-]
-
-
-def _contains_any(text: str, phrases: list[str]) -> bool:
-    return any(phrase in text for phrase in phrases)

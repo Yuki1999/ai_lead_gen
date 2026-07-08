@@ -70,6 +70,22 @@ def update_agent_config(
     return agent_config_status(restart_required=True)
 
 
+def resolve_sidecar_ai() -> tuple[str, str, str] | None:
+    """Return `(provider, api_key, model)` from the Pi sidecar's agent/.env.
+
+    Lets the backend email/reply AI reuse the same LLM the conversational Agent
+    is already configured with, so a single setup powers everything. Returns
+    None when no API key is configured there.
+    """
+    values = _read_env_values(_agent_env_path())
+    provider = _provider_name(values)
+    api_key = values.get(_api_key_env_name(provider), "").strip()
+    if not api_key:
+        return None
+    model = values.get("PI_MODEL") or DEFAULT_MODEL_BY_PROVIDER.get(provider, "")
+    return provider, api_key, model
+
+
 def _provider_name(values: dict[str, str]) -> str:
     configured = _normalize_provider(values.get("PI_PROVIDER"))
     if configured:

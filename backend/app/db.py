@@ -130,6 +130,18 @@ def init_db() -> None:
                 detail TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS token_usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                actor TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
             """
         )
         # Migration: add message_id column if upgrading from older schema
@@ -176,6 +188,15 @@ def init_db() -> None:
 def insert_lead(lead: CandidateLead) -> dict[str, Any]:
     now = _now()
     payload = asdict(lead) | {"created_at": now, "updated_at": now}
+    # Canonicalize region/country to the public standard (UN M49 regions,
+    # ISO 3166-1 country names) so every write path — Agent add_leads, real web
+    # search, seeds, manual — stores values that match the filter taxonomy and
+    # infers the region from the country when the caller didn't set one cleanly.
+    from app.geo import normalize_geo
+
+    payload["region"], payload["country"] = normalize_geo(
+        str(payload.get("region") or ""), str(payload.get("country") or "")
+    )
     # Resolve and persist lead_type at insert time instead of leaving it blank
     # and re-inferring on every email render — the classification needs to be
     # a stable, queryable column for filtering/dashboards/scoring-rule choice.
@@ -221,6 +242,7 @@ _SORT_EXPRS = {
 def list_leads(
     *,
     region: str | None = None,
+    country: str | None = None,
     status: str | None = None,
     lead_type: str | None = None,
     q: str | None = None,
@@ -232,6 +254,9 @@ def list_leads(
     if region:
         filters.append("region = :region")
         params["region"] = region
+    if country:
+        filters.append("country = :country")
+        params["country"] = country
     if status:
         filters.append("status = :status")
         params["status"] = status
@@ -261,7 +286,10 @@ def list_leads(
     with connect() as connection:
         rows = connection.execute(
             f"""SELECT l.*,
-                (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) AS reply_count
+                (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) AS reply_count,
+                (SELECT MAX(COALESCE(NULLIF(sent_at, ''), created_at))
+                   FROM outreach_events
+                   WHERE lead_id = l.id AND status IN ('sent', 'queued')) AS last_outreach_at
             FROM leads l
             {where} ORDER BY {order_clause}""",
             params,
@@ -481,25 +509,19 @@ def list_draft_events() -> list[dict[str, Any]]:
 
 
 def approve_outreach_event(event_id: int) -> dict[str, Any] | None:
+    """Validate that ``event_id`` is a pending draft and return it.
+
+    Approving does NOT mark the lead as emailed — the caller enqueues the event
+    and the lead flips to ``emailed`` only when it is actually sent
+    (``mark_outreach_sent``). This keeps ``emailed`` meaning "delivered", not
+    "approved / queued".
+    """
     with connect() as connection:
         row = connection.execute(
             "SELECT * FROM outreach_events WHERE id = ? AND status = 'draft'",
             (event_id,),
         ).fetchone()
-        if row is None:
-            return None
-        connection.execute(
-            "UPDATE outreach_events SET status = ?, message_id = ? WHERE id = ?",
-            ("sent", "", event_id),
-        )
-        connection.execute(
-            "UPDATE leads SET status = ?, updated_at = ? WHERE id = ?",
-            ("emailed", _now(), row["lead_id"]),
-        )
-        updated = connection.execute(
-            "SELECT * FROM outreach_events WHERE id = ?", (event_id,)
-        ).fetchone()
-        return _row_to_dict(updated)
+        return _row_to_dict(row) if row else None
 
 
 def reject_outreach_event(event_id: int) -> dict[str, Any] | None:
@@ -562,6 +584,102 @@ def metrics() -> dict[str, int]:
         "distributor_qualified": distributor_qualified,
         "kol_qualified": kol_qualified,
     }
+
+
+def lead_facets() -> dict[str, list[dict[str, Any]]]:
+    """Distinct region/country values (with counts) across all leads.
+
+    Powers the lead-management filter dropdowns so users can only filter by
+    values that actually exist. Computed over every lead (ignores the active
+    filter) so switching filters always shows the full option set.
+    """
+    with connect() as connection:
+        region_rows = connection.execute(
+            """
+            SELECT region AS value, COUNT(*) AS count FROM leads
+            WHERE TRIM(region) <> '' GROUP BY region ORDER BY count DESC, region ASC
+            """
+        ).fetchall()
+        country_rows = connection.execute(
+            """
+            SELECT country AS value, COUNT(*) AS count FROM leads
+            WHERE TRIM(country) <> '' GROUP BY country ORDER BY count DESC, country ASC
+            """
+        ).fetchall()
+    return {
+        "regions": [{"value": row["value"], "count": int(row["count"])} for row in region_rows],
+        "countries": [{"value": row["value"], "count": int(row["count"])} for row in country_rows],
+    }
+
+
+# ── Token usage (AI cost monitoring) ───────────────────
+
+def insert_token_usage_event(
+    *,
+    source: str,
+    provider: str,
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    actor: str = "",
+) -> None:
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO token_usage_events (
+                source, provider, model, prompt_tokens, completion_tokens, total_tokens, actor, created_at
+            )
+            VALUES (:source, :provider, :model, :prompt_tokens, :completion_tokens, :total_tokens, :actor, :created_at)
+            """,
+            {
+                "source": source,
+                "provider": provider,
+                "model": model,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "actor": actor,
+                "created_at": _now(),
+            },
+        )
+
+
+def token_usage_total_since(iso_since: str) -> int:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT COALESCE(SUM(total_tokens), 0) FROM token_usage_events WHERE created_at >= ?",
+            (iso_since,),
+        ).fetchone()
+    return int(row[0])
+
+
+def token_usage_breakdown_since(iso_since: str) -> dict[str, int]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT source, COALESCE(SUM(total_tokens), 0) AS total
+            FROM token_usage_events WHERE created_at >= ?
+            GROUP BY source
+            """,
+            (iso_since,),
+        ).fetchall()
+    return {row["source"]: int(row["total"]) for row in rows}
+
+
+def token_usage_daily_series(*, since_iso: str) -> list[dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT substr(created_at, 1, 10) AS day, COALESCE(SUM(total_tokens), 0) AS total
+            FROM token_usage_events
+            WHERE created_at >= ?
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            (since_iso,),
+        ).fetchall()
+    return [{"date": row["day"], "total_tokens": int(row["total"])} for row in rows]
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

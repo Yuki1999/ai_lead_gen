@@ -53,6 +53,8 @@ from app.schemas import (
     ScoringRulesUpdateRequest,
     SearchRequest,
     SuppressionCreateRequest,
+    TokenBudgetUpdateRequest,
+    TokenUsageEventRequest,
     UserCreateRequest,
     UserUpdateRequest,
     WebFetchRequest,
@@ -61,11 +63,14 @@ from app.schemas import (
 from app.services import (
     CandidateLead,
     RenderedEmail,
+    ReplyAnalysisError,
     analyze_reply,
+    auto_reply_analysis,
+    bounce_reply_analysis,
     generate_candidate_leads,
     render_email,
 )
-from app.web_search import discover_real_prospects, fetch_source_preview, search_web
+from app.web_search import SearchProviderError, discover_real_prospects, fetch_source_preview, search_web
 
 
 def create_app() -> FastAPI:
@@ -463,13 +468,16 @@ def create_app() -> FastAPI:
     @app.post("/leads/search", status_code=201, dependencies=[Depends(require("leads.search"))])
     def search_leads(request: SearchRequest) -> dict[str, object]:
         if request.real_search:
-            candidates = discover_real_prospects(
-                target_regions=request.target_regions,
-                product_profile=extract_product_profile(),
-                extra_keywords=request.product_keywords,
-                max_results=request.max_results,
-                require_email=request.require_email,
-            )
+            try:
+                candidates = discover_real_prospects(
+                    target_regions=request.target_regions,
+                    product_profile=extract_product_profile(),
+                    extra_keywords=request.product_keywords,
+                    max_results=request.max_results,
+                    require_email=request.require_email,
+                )
+            except SearchProviderError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
         else:
             candidates = generate_candidate_leads(
                 target_regions=request.target_regions,
@@ -560,6 +568,7 @@ def create_app() -> FastAPI:
     @app.get("/leads", dependencies=[Depends(require("leads.view"))])
     def list_leads(
         region: str | None = Query(default=None),
+        country: str | None = Query(default=None),
         status: str | None = Query(default=None),
         lead_type: str | None = Query(default=None, description="distributor 或 kol，留空为全部。"),
         q: str | None = Query(default=None),
@@ -576,8 +585,15 @@ def create_app() -> FastAPI:
             description="\u6392\u5e8f\u65b9\u5411\uff1aasc \u6216 desc\uff0c\u9ed8\u8ba4 desc\u3002",
         ),
     ) -> dict[str, object]:
-        leads = db.list_leads(region=region, status=status, lead_type=lead_type, q=q, sort=sort, order=order)
+        leads = db.list_leads(
+            region=region, country=country, status=status, lead_type=lead_type, q=q, sort=sort, order=order
+        )
         return {"total": len(leads), "leads": leads}
+
+    @app.get("/leads/facets", dependencies=[Depends(require("leads.view"))])
+    def lead_facets() -> dict[str, object]:
+        """Distinct region/country values (with counts) for the filter dropdowns."""
+        return db.lead_facets()
 
     @app.get("/sources/preview", dependencies=[Depends(require("leads.search"))])
     def source_preview(
@@ -591,7 +607,10 @@ def create_app() -> FastAPI:
 
     @app.post("/web/search", dependencies=[Depends(require("leads.search"))])
     def web_search(request: WebSearchRequest) -> dict[str, object]:
-        results = search_web(request.query, limit=request.max_results)
+        try:
+            results = search_web(request.query, limit=request.max_results)
+        except SearchProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {
             "query": request.query,
             "results": [asdict(result) for result in results],
@@ -866,6 +885,8 @@ def create_app() -> FastAPI:
         synced: list[dict[str, object]] = []
         skipped: list[dict[str, object]] = []
         bounced: list[str] = []
+        analysis_failed = 0  # replies we couldn't analyze (LLM unavailable/failed)
+        opted_out: list[str] = []  # addresses suppressed due to explicit opt-out
 
         for reply in inbox_replies:
             sender = reply.sender_email.lower()
@@ -879,7 +900,7 @@ def create_app() -> FastAPI:
                     bounced.extend(hit)
                     db.insert_reply_analysis(
                         lead_id=None, reply_text=reply.body[:2000],
-                        analysis=analyze_reply("bounce"), message_id=reply.message_id,
+                        analysis=bounce_reply_analysis(), message_id=reply.message_id,
                     )
                     continue
 
@@ -919,18 +940,31 @@ def create_app() -> FastAPI:
             is_auto = _is_auto_reply(reply.subject, reply.body)
 
             if is_auto:
-                analysis = analyze_reply("Auto-reply received")
+                analysis = auto_reply_analysis()
                 # Don't change lead status for auto-replies
             else:
-                analysis = analyze_reply(reply.body)
+                try:
+                    analysis = analyze_reply(reply.body)
+                except ReplyAnalysisError as exc:
+                    # LLM-only reply analysis: don't guess with rules — skip this
+                    # reply (leave it unanalyzed) and surface why in the result.
+                    analysis_failed += 1
+                    skipped.append({
+                        "sender": sender,
+                        "subject": reply.subject,
+                        "reason": f"AI 分析失败：{exc}",
+                    })
+                    continue
                 db.update_lead(
                     lead_id,
                     status=_status_for_intent(analysis.intent, analysis.requires_human),
                 )
-                # A clear "not interested / remove me" reply is an opt-out → suppress.
-                if analysis.intent == "rejected" and sender:
+                # Only an EXPLICIT opt-out (unsubscribe / remove me) suppresses the
+                # address — a merely "not interested" reply must stay recoverable.
+                if analysis.opt_out and sender:
                     db.add_suppression(sender, reason="reply-optout", source="inbox")
                     db.add_audit(actor="system", action="suppression.add", target_type="email", target_id=sender, detail="reply-optout")
+                    opted_out.append(sender)
             record = db.insert_reply_analysis(
                 lead_id=lead_id,
                 reply_text=reply.body,
@@ -954,6 +988,9 @@ def create_app() -> FastAPI:
             "synced": len(synced),
             "skipped": len(skipped),
             "bounced_suppressed": len(bounced),
+            "analysis_failed": analysis_failed,
+            "ai_ready": _content_ai_ready(),
+            "opted_out": len(opted_out),
             "items": synced,
             "skipped_items": skipped[:10],
         }
@@ -963,7 +1000,10 @@ def create_app() -> FastAPI:
         if request.lead_id is not None and db.get_lead(request.lead_id) is None:
             raise HTTPException(status_code=404, detail="Lead not found")
 
-        analysis = analyze_reply(request.reply_text)
+        try:
+            analysis = analyze_reply(request.reply_text)
+        except ReplyAnalysisError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         if request.lead_id is not None:
             db.update_lead(
                 request.lead_id,
@@ -986,6 +1026,10 @@ def create_app() -> FastAPI:
             "send_daily_cap": int(settings.get("send_daily_cap", "200") or "200"),
             "send_min_interval_seconds": int(settings.get("send_min_interval_seconds", "20") or "20"),
             "send_per_domain_daily_cap": int(settings.get("send_per_domain_daily_cap", "25") or "25"),
+            # AI content generation (outreach emails + reply analysis). Default on:
+            # LLM-generated with the template/keyword rules only as a fallback.
+            "ai_content_generation": settings.get("ai_content_generation", "true") == "true",
+            "ai_content_ready": _content_ai_ready(),
             "agent_provider": settings.get("agent_provider", ""),
             "agent_model": settings.get("agent_model", ""),
             "has_agent_key": bool(settings.get("agent_key", "")),
@@ -1005,6 +1049,7 @@ def create_app() -> FastAPI:
         changed: list[str] = []
         for key in (
             "sync_enabled", "sync_interval_minutes", "auto_send_enabled",
+            "ai_content_generation",
             "send_daily_cap", "send_min_interval_seconds", "send_per_domain_daily_cap",
             "agent_provider", "agent_model", "agent_key", "backend_base_url",
             "email_server", "email_user", "email_password",
@@ -1023,6 +1068,39 @@ def create_app() -> FastAPI:
             db.add_audit(actor=principal.username, action="settings.update", detail=", ".join(changed))
         return get_settings()
 
+    @app.get("/usage/token-report", dependencies=[Depends(require("settings.manage"))])
+    def token_usage_report() -> dict[str, object]:
+        """Monthly AI token usage vs. the configured budget, plus a daily trend series."""
+        return _build_token_usage_report()
+
+    @app.put("/usage/token-budget", dependencies=[Depends(require("settings.manage"))])
+    def update_token_budget(
+        request: TokenBudgetUpdateRequest,
+        principal: Principal = Depends(require("settings.manage")),
+    ) -> dict[str, object]:
+        """Set the monthly token budget used to compute used/remaining in the report."""
+        db.set_setting("monthly_token_budget", str(request.budget_tokens))
+        db.add_audit(
+            actor=principal.username,
+            action="settings.update",
+            detail=f"monthly_token_budget={request.budget_tokens}",
+        )
+        return _build_token_usage_report()
+
+    @app.post("/usage/token-events", dependencies=[Depends(require("agent.use"))])
+    def record_token_usage_event(request: TokenUsageEventRequest) -> dict[str, object]:
+        """Agent sidecar reports token usage for a completed chat turn."""
+        db.insert_token_usage_event(
+            source="agent_chat",
+            provider=request.provider,
+            model=request.model,
+            prompt_tokens=request.prompt_tokens,
+            completion_tokens=request.completion_tokens,
+            total_tokens=request.total_tokens,
+            actor="agent",
+        )
+        return {"ok": True}
+
     return app
 
 
@@ -1030,6 +1108,20 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "****"
     return key[:4] + "****" + key[-4:]
+
+
+def _content_ai_ready() -> bool:
+    """Whether an LLM is actually resolvable for email/reply generation.
+
+    Ignores the on/off master switch — reflects only that a usable key exists
+    (in backend settings or the Pi sidecar's agent/.env), so the UI can warn
+    when AI generation is enabled but no key is configured anywhere.
+    """
+    from app.agent_config import resolve_sidecar_ai
+
+    if db.get_setting("agent_key", "").strip() and db.get_setting("agent_provider", "").strip():
+        return True
+    return resolve_sidecar_ai() is not None
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -1062,6 +1154,33 @@ box-shadow:0 12px 28px rgba(15,23,42,.06);text-align:center;">
 def _today_start_iso() -> str:
     from datetime import UTC, datetime
     return datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _month_start_iso() -> str:
+    from datetime import UTC, datetime
+    return datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _days_ago_iso(days: int) -> str:
+    from datetime import UTC, datetime, timedelta
+    start = datetime.now(UTC) - timedelta(days=days)
+    return start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def _build_token_usage_report() -> dict[str, object]:
+    """Monthly-to-date token usage vs. the configured budget, plus a 30-day daily trend."""
+    month_start = _month_start_iso()
+    used = db.token_usage_total_since(month_start)
+    budget = int(db.get_setting("monthly_token_budget", "0") or "0")
+    return {
+        "month_start": month_start,
+        "used_tokens": used,
+        "budget_tokens": budget,
+        "remaining_tokens": max(budget - used, 0) if budget > 0 else None,
+        "percent_used": round(used / budget * 100, 1) if budget > 0 else None,
+        "by_source": db.token_usage_breakdown_since(month_start),
+        "daily_series": db.token_usage_daily_series(since_iso=_days_ago_iso(29)),
+    }
 
 
 def _send_throttle() -> dict[str, int]:
@@ -1143,18 +1262,26 @@ async def _auto_sync_loop() -> None:
                         matched = _match_reply_to_lead(reply.sender_email)
                         if matched:
                             is_auto = _is_auto_reply(reply.subject, reply.body)
-                            analysis = analyze_reply(reply.body)
+                            if is_auto:
+                                analysis = auto_reply_analysis()
+                            else:
+                                try:
+                                    analysis = analyze_reply(reply.body)
+                                except ReplyAnalysisError as exc:
+                                    # LLM-only: skip unanalyzable replies rather
+                                    # than fall back to unreliable keyword rules.
+                                    _logger.warning("Auto-sync: skipped reply (AI analysis failed): %s", exc)
+                                    continue
+                                db.update_lead(
+                                    int(matched["id"]),
+                                    status=_status_for_intent(analysis.intent, analysis.requires_human),
+                                )
                             db.insert_reply_analysis(
                                 lead_id=int(matched["id"]),
                                 reply_text=reply.body,
                                 analysis=analysis,
                                 message_id=reply.message_id,
                             )
-                            if not is_auto:
-                                db.update_lead(
-                                    int(matched["id"]),
-                                    status=_status_for_intent(analysis.intent, analysis.requires_human),
-                                )
                             synced += 1
                 if synced:
                     _logger.info("Auto-sync: synced %d new replies", synced)

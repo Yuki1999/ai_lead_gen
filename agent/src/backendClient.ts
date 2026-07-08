@@ -52,6 +52,14 @@ export interface AnalyzeReplyInput {
   lead_id?: number;
 }
 
+export interface RecordTokenUsageInput {
+  provider: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
 export interface BackendRequestOptions {
   signal?: AbortSignal;
 }
@@ -165,6 +173,13 @@ export class BackendClient {
     options: BackendRequestOptions = {},
   ): Promise<JsonObject> {
     return this.#request("POST", "/replies/analyze", input, options);
+  }
+
+  recordTokenUsage(
+    input: RecordTokenUsageInput,
+    options: BackendRequestOptions = {},
+  ): Promise<JsonObject> {
+    return this.#request("POST", "/usage/token-events", { ...input }, options);
   }
 
   async #request(

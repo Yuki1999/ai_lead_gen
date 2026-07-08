@@ -1,12 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from app.product import extract_product_profile
 from app.web_search import (
+    SearchProviderError,
     SeedProspect,
     discover_real_prospects,
     extract_emails,
     fetch_page_summary,
-    search_duckduckgo,
     search_tavily,
     search_web,
 )
@@ -32,20 +34,22 @@ class FakeResponse:
 
 
 class FakeHttp:
+    def post(self, url: str, **kwargs):
+        assert "api.tavily.com" in url
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Demo Ortho Distribution - Orthopedic Implants",
+                        "url": "https://demo-ortho.example/",
+                        "content": "Orthopedic implant distributor for joint replacement and knee arthroplasty.",
+                    }
+                ]
+            },
+        )
+
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse(
-                """
-                <div class="result">
-                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdemo-ortho.example%2F">
-                    Demo Ortho Distribution - Orthopedic Implants
-                  </a>
-                  <a class="result__snippet">
-                    Orthopedic implant distributor for joint replacement and knee arthroplasty.
-                  </a>
-                </div>
-                """
-            )
         return FakeResponse(
             """
             <html>
@@ -61,8 +65,6 @@ class FakeHttp:
 
 class SeedOnlyFakeHttp:
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse("")
         return FakeResponse(
             """
             <html>
@@ -97,48 +99,6 @@ class ContactPageFakeHttp:
         )
 
 
-class BingFallbackFakeHttp:
-    def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse("<html><title>DuckDuckGo challenge</title></html>")
-        if "bing.com" in url:
-            return FakeResponse(
-                """
-                <ol id="b_results">
-                  <li class="b_algo">
-                    <h2><a href="https://bing-ortho.example/contact">
-                      Bing Ortho India
-                    </a></h2>
-                    <div class="b_caption">
-                      <p>Orthopedic implant distributor serving India.</p>
-                    </div>
-                  </li>
-                </ol>
-                """
-            )
-        return FakeResponse("")
-
-
-class JinaFallbackFakeHttp:
-    def get(self, url: str, **kwargs):
-        if "duckduckgo.com/html" in url and "r.jina.ai" not in url:
-            return FakeResponse("<html><title>DuckDuckGo challenge</title></html>")
-        if "r.jina.ai" in url:
-            return FakeResponse(
-                """
-                Title: orthopedic implant distributor India at DuckDuckGo
-
-                URL Source: https://duckduckgo.com/html/?q=orthopedic%20implant%20distributor%20India
-
-                Markdown Content:
-                ## [Smit MediMed Pvt Ltd - Certified Orthopedic Implants Producer](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.smitmedimed.com%2F)
-
-                [Established in the year 1990, Smit Medimed Pvt Ltd specializes as CDSCO certified Orthopedic Implants Producer.](https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.smitmedimed.com%2F)
-                """
-            )
-        return FakeResponse("")
-
-
 def test_product_profile_extracts_skywalker_tka_positioning():
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -156,32 +116,6 @@ def test_extract_emails_filters_image_like_matches():
     assert emails == ["bd@example.net", "info@example.com", "sales@example.org"]
 
 
-def test_search_duckduckgo_unwraps_real_result_urls():
-    results = search_duckduckgo("orthopedic distributor", http=FakeHttp(), limit=1)
-
-    assert results[0].url == "https://demo-ortho.example/"
-    assert "Orthopedic Implants" in results[0].title
-
-
-def test_search_web_falls_back_to_bing_results_when_duckduckgo_is_blocked():
-    results = search_web("orthopedic distributor India", http=BingFallbackFakeHttp(), limit=1)
-
-    assert len(results) == 1
-    assert results[0].url == "https://bing-ortho.example/contact"
-    assert results[0].title == "Bing Ortho India"
-    assert results[0].snippet == "Orthopedic implant distributor serving India."
-    assert results[0].query == "orthopedic distributor India"
-
-
-def test_search_web_uses_jina_reader_when_duckduckgo_is_blocked():
-    results = search_web("orthopedic implant distributor India", http=JinaFallbackFakeHttp(), limit=1)
-
-    assert len(results) == 1
-    assert results[0].url == "https://www.smitmedimed.com/"
-    assert results[0].title == "Smit MediMed Pvt Ltd - Certified Orthopedic Implants Producer"
-    assert "CDSCO certified Orthopedic Implants Producer" in results[0].snippet
-
-
 def test_fetch_page_summary_records_where_email_was_found():
     page = fetch_page_summary("https://contact-page.example/", http=ContactPageFakeHttp())
 
@@ -192,6 +126,7 @@ def test_fetch_page_summary_records_where_email_was_found():
 def test_discover_real_prospects_uses_search_result_and_page_email(monkeypatch):
     import app.web_search as web_search
 
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -255,26 +190,28 @@ class ZhihuColumnFakeHttp:
     """A Zhihu column ranks in search results; the domain itself must be
     rejected before any page is even fetched."""
 
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "骨科机器人行业观察 - 知乎专栏",
+                        "url": "https://www.zhihu.com/column/c_123",
+                        "content": "分享骨科手术机器人、关节置换行业动态。联系邮箱 columnist@zhihu.com",
+                    }
+                ]
+            },
+        )
+
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse(
-                """
-                <div class="result">
-                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.zhihu.com%2Fcolumn%2Fc_123">
-                    骨科机器人行业观察 - 知乎专栏
-                  </a>
-                  <a class="result__snippet">
-                    分享骨科手术机器人、关节置换行业动态。联系邮箱 columnist@zhihu.com
-                  </a>
-                </div>
-                """
-            )
         raise AssertionError("Zhihu domain should be filtered before any page fetch")
 
 
 def test_discover_real_prospects_rejects_zhihu_column(monkeypatch):
     import app.web_search as web_search
 
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -294,20 +231,21 @@ class AcademicJournalFakeHttp:
     real editorial-office email and even topical (orthopedic) keywords. Must
     still be rejected by the title pattern, not just the domain blocklist."""
 
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "中国协和医学杂志 - 骨科机器人关节置换研究论文",
+                        "url": "https://www.example-pumc-journal.cn/",
+                        "content": "本文报道了机器人辅助全膝关节置换手术的临床研究。",
+                    }
+                ]
+            },
+        )
+
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse(
-                """
-                <div class="result">
-                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.example-pumc-journal.cn%2F">
-                    中国协和医学杂志 - 骨科机器人关节置换研究论文
-                  </a>
-                  <a class="result__snippet">
-                    本文报道了机器人辅助全膝关节置换手术的临床研究。
-                  </a>
-                </div>
-                """
-            )
         return FakeResponse(
             """
             <html>
@@ -324,6 +262,7 @@ class AcademicJournalFakeHttp:
 def test_discover_real_prospects_rejects_academic_journal_title(monkeypatch):
     import app.web_search as web_search
 
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -343,20 +282,21 @@ class SoftErrorPageFakeHttp:
     for sites that don't set a real 404 status). A stray contact-form email
     template fragment happens to be present in the boilerplate."""
 
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Ortho Distributors Directory",
+                        "url": "https://broken-ortho.example/old-page",
+                        "content": "Orthopedic implant distributor directory listing.",
+                    }
+                ]
+            },
+        )
+
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse(
-                """
-                <div class="result">
-                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbroken-ortho.example%2Fold-page">
-                    Ortho Distributors Directory
-                  </a>
-                  <a class="result__snippet">
-                    Orthopedic implant distributor directory listing.
-                  </a>
-                </div>
-                """
-            )
         return FakeResponse(
             """
             <html>
@@ -371,6 +311,7 @@ class SoftErrorPageFakeHttp:
 def test_discover_real_prospects_rejects_soft_404_page(monkeypatch):
     import app.web_search as web_search
 
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -390,20 +331,21 @@ class UnrelatedBusinessFakeHttp:
     with orthopedics/medical devices/distribution. Must be rejected by the
     topical-relevance gate, not saved just because it has *an* email."""
 
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Coffee Roasters Co",
+                        "url": "https://coffee-roasters.example/",
+                        "content": "Specialty coffee roaster and wholesale supplier.",
+                    }
+                ]
+            },
+        )
+
     def get(self, url: str, **kwargs):
-        if "duckduckgo" in url:
-            return FakeResponse(
-                """
-                <div class="result">
-                  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fcoffee-roasters.example%2F">
-                    Coffee Roasters Co
-                  </a>
-                  <a class="result__snippet">
-                    Specialty coffee roaster and wholesale supplier.
-                  </a>
-                </div>
-                """
-            )
         return FakeResponse(
             """
             <html>
@@ -417,6 +359,7 @@ class UnrelatedBusinessFakeHttp:
 def test_discover_real_prospects_rejects_topically_unrelated_business(monkeypatch):
     import app.web_search as web_search
 
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
     profile = extract_product_profile(Path(__file__).resolve().parents[2])
 
@@ -431,8 +374,8 @@ def test_discover_real_prospects_rejects_topically_unrelated_business(monkeypatc
     assert leads == []
 
 
-# ── Tavily as the primary search provider (DuckDuckGo/Bing are unreliable ───
-# from mainland China networks) ──────────────────────────────────────────────
+# ── Tavily is the only search provider. There is no scraping fallback: a ────
+# missing key or a failed call must raise, not silently degrade. ────────────
 
 class TavilyFakeHttp:
     def post(self, url: str, **kwargs):
@@ -475,29 +418,50 @@ def test_search_tavily_used_when_api_key_configured(monkeypatch):
     assert results[0].url == "https://demo-ortho.example/"
 
 
-def test_search_tavily_returns_empty_without_api_key(monkeypatch):
+def test_search_tavily_raises_without_api_key(monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     class UnusedHttp:
         def post(self, url: str, **kwargs):
             raise AssertionError("should not call Tavily when no API key is configured")
 
-    assert search_tavily("orthopedic distributor Europe", http=UnusedHttp()) == []
+    with pytest.raises(SearchProviderError):
+        search_tavily("orthopedic distributor Europe", http=UnusedHttp())
 
 
-def test_search_web_prefers_tavily_over_duckduckgo(monkeypatch):
+def test_search_web_raises_when_tavily_call_fails(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
 
-    class DuckDuckGoShouldNotBeCalled(TavilyFakeHttp):
+    class FailingHttp:
+        def post(self, url: str, **kwargs):
+            return FakeResponse("server error", status_code=500)
+
+    with pytest.raises(SearchProviderError):
+        search_web("orthopedic distributor Europe", http=FailingHttp())
+
+
+def test_discover_real_prospects_raises_when_tavily_not_configured(monkeypatch):
+    import app.web_search as web_search
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
+    profile = extract_product_profile(Path(__file__).resolve().parents[2])
+
+    class UnusedHttp:
+        def post(self, url: str, **kwargs):
+            raise AssertionError("should not call Tavily when no API key is configured")
+
         def get(self, url: str, **kwargs):
-            if "duckduckgo" in url:
-                raise AssertionError("should not fall back to DuckDuckGo when Tavily succeeds")
-            return super().get(url, **kwargs)
+            raise AssertionError("should not fetch pages before search succeeds")
 
-    results = search_web("orthopedic distributor Europe", http=DuckDuckGoShouldNotBeCalled())
-
-    assert len(results) == 1
-    assert results[0].url == "https://demo-ortho.example/"
+    with pytest.raises(SearchProviderError):
+        discover_real_prospects(
+            target_regions=["Europe"],
+            product_profile=profile,
+            max_results=1,
+            require_email=True,
+            http=UnusedHttp(),
+        )
 
 
 def test_discover_real_prospects_uses_tavily_when_configured(monkeypatch):

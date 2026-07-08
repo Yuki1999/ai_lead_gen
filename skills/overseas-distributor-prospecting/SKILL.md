@@ -327,8 +327,8 @@ For every retained lead, capture:
 | --- | --- |
 | `company_name` | Legal or trading name. |
 | `local_name` | Local-language name if available. |
-| `region` | Region, such as Europe, Middle East, Southeast Asia. |
-| `country` | Country or primary market. |
+| `region` | Standard region (UN M49). Use exactly one of: `North America`, `Latin America`, `Europe`, `Middle East`, `Africa`, `Central Asia`, `South Asia`, `Southeast Asia`, `East Asia`, `Oceania`. |
+| `country` | Country as its ISO 3166-1 English short name (e.g. `United States`, `Germany`, `United Arab Emirates`, `South Korea`), not abbreviations like USA/UK/UAE. |
 | `city` | City or headquarters location if available. |
 | `website` | Official website URL. |
 | `contact_name` | Named BD / sales / product / distributor contact if public; otherwise department. |

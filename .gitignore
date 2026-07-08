@@ -18,3 +18,5 @@ dist/
 # Local IDE / assistant configuration
 .claude/
 .zcode/
+# Vite build cache
+frontend/.vite/

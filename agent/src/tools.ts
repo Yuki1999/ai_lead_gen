@@ -27,8 +27,16 @@ export function createBusinessTools(client: Pick<BackendClient, BusinessMethod>)
         leads: Type.Array(
           Type.Object({
             company_name: Type.String({ description: "Company name" }),
-            region: Type.String({ description: "Region like Europe, North America" }),
-            country: Type.String({ description: "Country" }),
+            region: Type.String({
+              description:
+                "Standard region (UN M49). Use exactly one of: North America, Latin America, " +
+                "Europe, Middle East, Africa, Central Asia, South Asia, Southeast Asia, East Asia, Oceania.",
+            }),
+            country: Type.String({
+              description:
+                "Country as its ISO 3166-1 English short name, e.g. 'United States', 'Germany', " +
+                "'United Arab Emirates', 'South Korea' (not abbreviations like USA/UK/UAE).",
+            }),
             website: Type.Optional(Type.String({ description: "Website URL" })),
             contact_name: Type.Optional(Type.String({ description: "Contact person or department" })),
             email: Type.Optional(Type.String({ description: "Email address" })),

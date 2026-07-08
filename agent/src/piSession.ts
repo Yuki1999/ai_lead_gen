@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 
-import { getModel, type Model } from "@earendil-works/pi-ai";
+import { getModel, type Model, type Usage } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
   createAgentSession,
@@ -93,6 +93,31 @@ export function extractTextDelta(event: AgentSessionEvent): string {
   }
 
   return "";
+}
+
+export function extractUsage(event: AgentSessionEvent): Usage | null {
+  if (event.type === "message_end" && event.message.role === "assistant") {
+    return event.message.usage;
+  }
+
+  return null;
+}
+
+export interface TurnUsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export function sumUsage(usages: Usage[]): TurnUsageTotals {
+  return usages.reduce<TurnUsageTotals>(
+    (totals, usage) => ({
+      promptTokens: totals.promptTokens + usage.input,
+      completionTokens: totals.completionTokens + usage.output,
+      totalTokens: totals.totalTokens + usage.totalTokens,
+    }),
+    { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+  );
 }
 
 export function summarizeEvent(event: AgentSessionEvent): JsonSafeObject | null {
@@ -290,6 +315,7 @@ async function runPiChatPrompt(
 
     const chunks: string[] = [];
     const events: object[] = [];
+    const usages: Usage[] = [];
     const unsubscribe = session.subscribe((event) => {
       const summary = summarizeEvent(event);
       if (summary) {
@@ -301,10 +327,15 @@ async function runPiChatPrompt(
         chunks.push(delta);
         emit?.({ type: "delta", text: delta });
       }
+      const usage = extractUsage(event);
+      if (usage) {
+        usages.push(usage);
+      }
     });
 
     try {
       await session.prompt(`/skill:${config.skillName}\n\n${message}`);
+      reportTokenUsage(sessionBackends.get(session), config, sumUsage(usages));
       return {
         message:
           chunks.join("").trim() || "Agent completed without a text response.",
@@ -315,6 +346,29 @@ async function runPiChatPrompt(
       unsubscribe();
     }
   });
+}
+
+// Best-effort usage telemetry: a reporting failure must never surface to the
+// user or affect the chat turn that already completed successfully.
+function reportTokenUsage(
+  backend: BackendClient | undefined,
+  config: AgentConfig,
+  totals: TurnUsageTotals,
+): void {
+  if (!backend || totals.totalTokens <= 0) {
+    return;
+  }
+  backend
+    .recordTokenUsage({
+      provider: config.modelProvider,
+      model: config.modelName,
+      prompt_tokens: totals.promptTokens,
+      completion_tokens: totals.completionTokens,
+      total_tokens: totals.totalTokens,
+    })
+    .catch((error) => {
+      console.error("Failed to record agent chat token usage", error);
+    });
 }
 
 // OpenAI-compatible providers that pi-ai doesn't ship a model registry for, but

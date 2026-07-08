@@ -8,7 +8,9 @@ import {
   createAgentSessionId,
   createNextAgentSession,
   deleteAgentSession,
+  deriveSessionTitle,
   isAgentSessionId,
+  isDefaultSessionTitle,
   loadAgentSessionState,
   loadAgentSessionId,
   renameAgentSession,
@@ -153,5 +155,28 @@ describe("agent session persistence", () => {
     state = deleteAgentSession(storage, state, "agent-session-2", create);
     assert.equal(state.activeId, "agent-session-3");
     assert.deepEqual(state.sessions.map((session) => session.id), ["agent-session-3"]);
+  });
+});
+
+describe("auto session titling", () => {
+  it("recognizes only the auto-generated placeholder titles", () => {
+    assert.equal(isDefaultSessionTitle("新会话"), true);
+    assert.equal(isDefaultSessionTitle("会话 2"), true);
+    assert.equal(isDefaultSessionTitle("会话12"), true);
+    assert.equal(isDefaultSessionTitle("当前会话"), true);
+    assert.equal(isDefaultSessionTitle("未命名会话"), true);
+    // A real / user-given title must not be treated as a placeholder.
+    assert.equal(isDefaultSessionTitle("找印度 TKA 渠道商"), false);
+    assert.equal(isDefaultSessionTitle("会话记录整理"), false);
+  });
+
+  it("derives a concise title from the first message", () => {
+    assert.equal(deriveSessionTitle("帮我找印度的 TKA 渠道商"), "帮我找印度的 TKA 渠道商");
+    assert.equal(deriveSessionTitle("  多个   空格   合并  "), "多个 空格 合并");
+    assert.equal(deriveSessionTitle("   "), "新会话");
+    // Long messages are truncated to maxLength + an ellipsis.
+    const long = deriveSessionTitle("请详细列举拓展印度 TKA 渠道商的十个步骤并逐一展开说明每一步");
+    assert.ok(long.endsWith("…"));
+    assert.equal(long.length, 25);
   });
 });

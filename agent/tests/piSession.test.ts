@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 
 import { loadConfig } from "../src/config.js";
 import {
@@ -9,10 +10,23 @@ import {
   createDefaultSkill,
   evictCachedSessions,
   extractTextDelta,
+  extractUsage,
   getOrCreateCachedSession,
   runWithSessionLock,
   summarizeEvent,
+  sumUsage,
 } from "../src/piSession.js";
+
+function fakeUsage(input: number, output: number): Usage {
+  return {
+    input,
+    output,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
 
 describe("piSession helpers", () => {
   it("builds the Medbot system prompt and preserves an existing base prompt", () => {
@@ -69,6 +83,39 @@ describe("piSession helpers", () => {
     } as AgentSessionEvent);
 
     assert.equal(summary, null);
+  });
+
+  it("extracts usage from assistant message_end events, ignoring other events", () => {
+    const usage = fakeUsage(120, 40);
+    const event = {
+      type: "message_end",
+      message: { role: "assistant", usage },
+    } as AgentSessionEvent;
+
+    assert.equal(extractUsage(event), usage);
+    assert.equal(
+      extractUsage({ type: "message_end", message: { role: "user" } } as AgentSessionEvent),
+      null,
+    );
+    assert.equal(extractUsage({ type: "turn_start" } as AgentSessionEvent), null);
+  });
+
+  it("sums usage across multiple assistant turns (e.g. tool-calling round trips)", () => {
+    const totals = sumUsage([fakeUsage(100, 20), fakeUsage(50, 10)]);
+
+    assert.deepEqual(totals, {
+      promptTokens: 150,
+      completionTokens: 30,
+      totalTokens: 180,
+    });
+  });
+
+  it("sums to zero for an empty usage list", () => {
+    assert.deepEqual(sumUsage([]), {
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    });
   });
 
   it("reuses cached sessions by session ID and config key", async () => {

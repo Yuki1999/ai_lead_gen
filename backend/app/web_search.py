@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from html import unescape
 from typing import Protocol
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,9 +41,17 @@ class SeedProspect:
     hint: str
 
 
+class SearchProviderError(RuntimeError):
+    """Raised when the configured search provider is missing or fails.
+
+    The system has no scraping fallback: if Tavily is not configured or its
+    call fails, callers must surface the error rather than silently
+    degrading to an unreliable substitute.
+    """
+
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 USER_AGENT = "Mozilla/5.0 (compatible; MedbotProspectingDemo/0.1)"
-SEARCH_TIMEOUT_SECONDS = 5
 PAGE_TIMEOUT_SECONDS = 3
 TAVILY_TIMEOUT_SECONDS = 8
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -265,17 +273,10 @@ def build_search_queries(
 
 
 def search_web(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
-    http = http or requests.Session()
-    # Tavily is the primary provider: DuckDuckGo/Bing scraping is unreliable
-    # from mainland China networks (blocked, rate-limited, or CAPTCHA-gated),
-    # which was producing sparse/low-quality real-search results in
-    # production. The scrapers below remain as a fallback if Tavily has no
-    # API key configured or its call fails.
-    results = search_tavily(query, http=http, limit=limit)
-    if results:
-        return results
-    results = search_duckduckgo(query, http=http, limit=limit)
-    return results or search_jina_reader(query, http=http, limit=limit) or search_bing(query, http=http, limit=limit)
+    # Tavily is the only search provider. There is no scraping fallback: if
+    # it isn't configured or the call fails, callers get a SearchProviderError
+    # instead of a silently degraded (and often unreliable) substitute.
+    return search_tavily(query, http=http, limit=limit)
 
 
 def _tavily_api_key() -> str:
@@ -285,7 +286,7 @@ def _tavily_api_key() -> str:
 def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
     api_key = _tavily_api_key()
     if not api_key:
-        return []
+        raise SearchProviderError("TAVILY_API_KEY is not configured")
     http = http or requests.Session()
     try:
         response = http.post(
@@ -300,14 +301,14 @@ def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8)
             },
             timeout=TAVILY_TIMEOUT_SECONDS,
         )
-    except requests.RequestException:
-        return []
+    except requests.RequestException as exc:
+        raise SearchProviderError(f"Tavily request failed: {exc}") from exc
     if response.status_code >= 400:
-        return []
+        raise SearchProviderError(f"Tavily returned HTTP {response.status_code}")
     try:
         data = response.json()
-    except ValueError:
-        return []
+    except ValueError as exc:
+        raise SearchProviderError("Tavily returned a non-JSON response") from exc
 
     results: list[SearchResult] = []
     for item in data.get("results", []) if isinstance(data, dict) else []:
@@ -321,123 +322,6 @@ def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8)
                 title=str(item.get("title", "")).strip(),
                 url=url,
                 snippet=str(item.get("content", "")).strip(),
-                query=query,
-            )
-        )
-        if len(results) >= limit:
-            break
-    return results
-
-
-def search_duckduckgo(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
-    http = http or requests.Session()
-    try:
-        response = http.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            timeout=SEARCH_TIMEOUT_SECONDS,
-            headers={"User-Agent": USER_AGENT},
-        )
-    except requests.RequestException:
-        return []
-    if response.status_code >= 400:
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results: list[SearchResult] = []
-    for row in soup.select(".result"):
-        link = row.select_one("a.result__a")
-        if not link:
-            continue
-        raw_url = link.get("href") or ""
-        url = _unwrap_duckduckgo_url(raw_url)
-        title = link.get_text(" ", strip=True)
-        snippet = row.select_one(".result__snippet")
-        results.append(
-            SearchResult(
-                title=unescape(title),
-                url=url,
-                snippet=snippet.get_text(" ", strip=True) if snippet else "",
-                query=query,
-            )
-        )
-        if len(results) >= limit:
-            break
-    return results
-
-
-def search_bing(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
-    http = http or requests.Session()
-    try:
-        response = http.get(
-            "https://www.bing.com/search",
-            params={"q": query, "setlang": "en-US"},
-            timeout=SEARCH_TIMEOUT_SECONDS,
-            headers={"User-Agent": USER_AGENT},
-        )
-    except requests.RequestException:
-        return []
-    if response.status_code >= 400:
-        return []
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results: list[SearchResult] = []
-    for row in soup.select("li.b_algo"):
-        link = row.select_one("h2 a[href]")
-        if not link:
-            continue
-        url = _unwrap_bing_url(link.get("href") or "")
-        if not _is_http_url(url):
-            continue
-        title = link.get_text(" ", strip=True)
-        snippet = row.select_one(".b_caption p") or row.select_one("p")
-        results.append(
-            SearchResult(
-                title=unescape(title),
-                url=url,
-                snippet=snippet.get_text(" ", strip=True) if snippet else "",
-                query=query,
-            )
-        )
-        if len(results) >= limit:
-            break
-    return results
-
-
-def search_jina_reader(query: str, *, http: HttpClient | None = None, limit: int = 8) -> list[SearchResult]:
-    http = http or requests.Session()
-    target_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    try:
-        response = http.get(
-            f"https://r.jina.ai/http://r.jina.ai/http://{target_url}",
-            timeout=SEARCH_TIMEOUT_SECONDS,
-            headers={"User-Agent": USER_AGENT},
-        )
-    except requests.RequestException:
-        return []
-    if response.status_code >= 400:
-        return []
-
-    results: list[SearchResult] = []
-    matches = list(
-        re.finditer(
-            r"^\s*(?:\d+\.\s+)?## \[(?P<title>.+?)\]\((?P<url>https?://[^\s)]+)\)",
-            response.text,
-            re.MULTILINE,
-        )
-    )
-    for index, match in enumerate(matches):
-        raw_url = unescape(match.group("url"))
-        url = _unwrap_duckduckgo_url(raw_url)
-        if not _is_http_url(url) or _is_low_value_domain(_domain(url)):
-            continue
-        block_end = matches[index + 1].start() if index + 1 < len(matches) else len(response.text)
-        snippet = _markdown_snippet(response.text[match.end():block_end])
-        results.append(
-            SearchResult(
-                title=_clean_markdown(match.group("title")),
-                url=url,
-                snippet=snippet,
                 query=query,
             )
         )
@@ -612,58 +496,6 @@ def _candidate_contact_urls(url: str) -> list[str]:
     for path in ["contact", "contact-us", "contacts", "en/contact", "about/contact"]:
         candidates.append(urljoin(root, path))
     return list(dict.fromkeys(candidates))
-
-
-def _unwrap_duckduckgo_url(raw_url: str) -> str:
-    if raw_url.startswith("//"):
-        raw_url = "https:" + raw_url
-    parsed = urlparse(raw_url)
-    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
-        target = parse_qs(parsed.query).get("uddg", [""])[0]
-        return target or raw_url
-    if raw_url.startswith("/"):
-        return f"https://duckduckgo.com{raw_url}"
-    return raw_url
-
-
-def _unwrap_bing_url(raw_url: str) -> str:
-    parsed = urlparse(raw_url)
-    if "bing.com" in parsed.netloc and parsed.path.startswith("/ck/"):
-        target = parse_qs(parsed.query).get("u", [""])[0]
-        if target.startswith("a1"):
-            target = target[2:]
-        try:
-            import base64
-
-            padded = target + "=" * (-len(target) % 4)
-            decoded = base64.urlsafe_b64decode(padded).decode("utf8")
-            if _is_http_url(decoded):
-                return decoded
-        except (ValueError, UnicodeDecodeError):
-            return raw_url
-    return raw_url
-
-
-def _markdown_snippet(block: str) -> str:
-    for raw_line in block.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("[![") or line.startswith("!["):
-            continue
-        link_match = re.fullmatch(r"\[([^\]]+)\]\([^)]+\)", line)
-        if link_match:
-            label = link_match.group(1)
-            if "." in label and " " not in label:
-                continue
-            return _clean_markdown(label)[:500]
-        return _clean_markdown(line)[:500]
-    return ""
-
-
-def _clean_markdown(value: str) -> str:
-    value = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", value)
-    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
-    value = value.replace("**", " ").replace("__", " ")
-    return unescape(re.sub(r"\s+", " ", value)).strip()
 
 
 def _choose_email(emails: list[str], url: str) -> str:

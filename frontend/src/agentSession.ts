@@ -42,6 +42,20 @@ export function createAgentSessionRecord(
   };
 }
 
+// Auto-generated placeholder titles that a real first message should replace.
+const DEFAULT_SESSION_TITLE_RE = /^(新会话|当前会话|未命名会话|会话\s*\d+)$/;
+
+export function isDefaultSessionTitle(title: string): boolean {
+  return DEFAULT_SESSION_TITLE_RE.test(title.trim());
+}
+
+/** Derive a concise session title from the first user message (ChatGPT-style). */
+export function deriveSessionTitle(message: string, maxLength = 24): string {
+  const cleaned = message.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "新会话";
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}…` : cleaned;
+}
+
 export function isAgentSessionId(value: unknown): value is string {
   return (
     typeof value === "string" &&
