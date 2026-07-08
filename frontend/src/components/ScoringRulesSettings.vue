@@ -14,7 +14,7 @@ interface ScoringRule {
 interface ScoringThreshold {
   min: number;
   max: number;
-  status: string;
+  level: string; // strong | medium | weak | reject
   label: string;
 }
 interface ScoringRules {
@@ -45,12 +45,38 @@ const rules = ref<ScoringRules>({
   updated_at: "",
 });
 
-const statusOptions = [
-  { value: "qualified", label: "qualified（强匹配）" },
-  { value: "new", label: "new（新线索）" },
-  { value: "human_review", label: "human_review（需人工核验）" },
-  { value: "rejected", label: "rejected（拒绝）" },
+const levelOptions = [
+  { value: "strong", label: "强匹配" },
+  { value: "medium", label: "中匹配" },
+  { value: "weak", label: "弱匹配" },
+  { value: "reject", label: "建议拒绝" },
 ];
+
+// Global (not per-type): when on, strong-match leads skip the 待确认 queue and
+// are auto-confirmed. Persisted via /settings, not the scoring-rules payload.
+const autoConfirmStrong = ref(false);
+async function loadAutoConfirm(): Promise<void> {
+  try {
+    const s = await props.request<{ auto_confirm_strong?: boolean }>("/settings");
+    autoConfirmStrong.value = !!s.auto_confirm_strong;
+  } catch {
+    /* settings.manage may be absent; leave default */
+  }
+}
+async function toggleAutoConfirm(): Promise<void> {
+  const next = !autoConfirmStrong.value;
+  autoConfirmStrong.value = next;
+  try {
+    await props.request("/settings", {
+      method: "PUT",
+      body: JSON.stringify({ auto_confirm_strong: next }),
+    });
+    flash(next ? "已开启：强匹配线索自动确认" : "已关闭：强匹配线索需人工确认");
+  } catch (e) {
+    autoConfirmStrong.value = !next;
+    flash(errText(e), "err");
+  }
+}
 
 const weightTotal = computed(() => rules.value.weights.reduce((sum, w) => sum + (w.percent || 0), 0));
 
@@ -139,13 +165,16 @@ function removeNegativeRule(index: number): void {
   rules.value.negative_rules.splice(index, 1);
 }
 function addThreshold(): void {
-  rules.value.thresholds.push({ min: 0, max: 39, status: "rejected", label: "" });
+  rules.value.thresholds.push({ min: 0, max: 39, level: "reject", label: "" });
 }
 function removeThreshold(index: number): void {
   rules.value.thresholds.splice(index, 1);
 }
 
-onMounted(load);
+onMounted(() => {
+  void load();
+  void loadAutoConfirm();
+});
 </script>
 
 <template>
@@ -258,21 +287,35 @@ onMounted(load);
       <!-- Thresholds -->
       <section class="sr-card">
         <div class="sr-card-head">
-          <div><strong>分数区间 → 状态</strong><p>最终分数落在哪个区间，线索会被标记为哪种状态。</p></div>
+          <div>
+            <strong>分数区间 → 匹配度</strong>
+            <p>
+              分数决定线索的「匹配度」徽章（强/中/弱）。除「建议拒绝」区间会直接置为「已拒绝」外，
+              其余线索统一进入「待确认」队列，由人工确认——分数只影响匹配度徽章，不再直接决定流程状态。
+            </p>
+          </div>
         </div>
         <div class="sr-rows">
           <div v-for="(t, i) in rules.thresholds" :key="i" class="sr-row sr-row-threshold">
             <input v-model.number="t.min" type="number" min="0" max="100" class="sr-input sr-input-num" />
             <span class="sr-range-sep">–</span>
             <input v-model.number="t.max" type="number" min="0" max="100" class="sr-input sr-input-num" />
-            <select v-model="t.status" class="sr-input sr-input-select">
-              <option v-for="opt in statusOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+            <select v-model="t.level" class="sr-input sr-input-select">
+              <option v-for="opt in levelOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
             <input v-model="t.label" placeholder="展示名称（如 强匹配）" class="sr-input sr-input-label" />
             <button type="button" class="sr-remove" title="删除" @click="removeThreshold(i)"><Trash2 :size="14" /></button>
           </div>
         </div>
         <button type="button" class="sr-add" @click="addThreshold"><Plus :size="14" /> 新增区间</button>
+
+        <label class="sr-autoconfirm">
+          <input type="checkbox" :checked="autoConfirmStrong" @change="toggleAutoConfirm" />
+          <span>
+            <strong>强匹配自动确认</strong>
+            <em>开启后，「强匹配」线索跳过「待确认」直接置为「已确认」；关闭则一律先人工确认。（全局设置，对代理商与 KOL 同时生效）</em>
+          </span>
+        </label>
       </section>
 
       <div class="sr-save-bar">
@@ -349,6 +392,11 @@ onMounted(load);
   border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
 }
 .sr-add:hover { background: #eff6ff; border-color: #2563eb; }
+
+.sr-autoconfirm { display: flex; align-items: flex-start; gap: 10px; margin-top: 4px; padding: 12px 14px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; cursor: pointer; }
+.sr-autoconfirm input { margin-top: 2px; width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
+.sr-autoconfirm strong { font-size: 13px; color: #0f172a; display: block; }
+.sr-autoconfirm em { font-style: normal; font-size: 12px; color: #64748b; line-height: 1.6; display: block; margin-top: 2px; }
 
 .sr-save-bar { display: flex; justify-content: flex-end; }
 .sr-save-btn {

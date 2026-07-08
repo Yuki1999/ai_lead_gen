@@ -156,7 +156,10 @@ class ScoringRule(BaseModel):
 class ScoringThreshold(BaseModel):
     min: int = Field(ge=0, le=100)
     max: int = Field(ge=0, le=100)
-    status: str = Field(min_length=1, max_length=40)
+    # AI match level for this band: strong | medium | weak | reject. `status` is
+    # accepted for backward compatibility with rules saved by older versions.
+    level: str = Field(default="", max_length=40)
+    status: str | None = Field(default=None, max_length=40)
     label: str = Field(min_length=1, max_length=100)
 
 

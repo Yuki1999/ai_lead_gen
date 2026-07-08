@@ -12,7 +12,7 @@
 
 ## 结构
 
-- `backend/`: FastAPI + SQLite API
+- `backend/`: FastAPI + PostgreSQL API
 - `frontend/`: Vue + Vite 操作台
 - `agent/`: Pi/pi-mono Node sidecar，默认加载 `overseas-distributor-prospecting`
 - `skills/overseas-distributor-prospecting/`: 给 agent 使用的拓客 workflow skill
@@ -76,7 +76,7 @@ uv run pytest -v
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-后端默认使用 `backend/medbot-demo.db`。可通过 `MEDBOT_DB_PATH` 指定 SQLite 文件路径。
+后端使用 PostgreSQL（psycopg3 + 连接池）。通过环境变量 `MEDBOT_DATABASE_URL` 指定连接串，例如 `postgresql://medbot:medbot@localhost:5432/medbot`；Docker Compose 部署时由 `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` 自动拼装。
 
 主要接口：
 
@@ -133,7 +133,7 @@ npm run dev -- --host 0.0.0.0
 
 ## Docker Compose 部署
 
-推荐用 Docker Compose 部署，仓库已经包含前端、后端和 Agent sidecar 的容器编排。前端容器用 Nginx 托管静态文件，并把浏览器里的 `/api/*` 同源反代到后端；后端通过容器网络访问 `http://agent:8011`；SQLite 数据持久化在 `medbot-data` volume。
+推荐用 Docker Compose 部署，仓库已经包含前端、后端、Agent sidecar 和 PostgreSQL 的容器编排。前端容器用 Nginx 托管静态文件，并把浏览器里的 `/api/*` 同源反代到后端；后端通过容器网络访问 `http://agent:8011`；PostgreSQL 数据持久化在 `medbot-pgdata` volume。
 
 首次部署：
 

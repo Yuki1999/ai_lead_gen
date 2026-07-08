@@ -2,7 +2,7 @@
 
 Keyed off the same server secret used for JWTs (MEDBOT_AUTH_SECRET or the
 auto-generated settings secret), so there is no extra key to manage. This
-protects against casual leakage of the SQLite file; it is not a substitute
+protects against casual leakage of the database; it is not a substitute
 for filesystem permissions or a real KMS.
 """
 

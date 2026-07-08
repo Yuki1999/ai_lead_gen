@@ -154,9 +154,34 @@ def test_batch_create_leads_derives_status_from_score_thresholds(tmp_path, monke
         )
 
     leads = created.json()["leads"]
-    assert leads[0]["status"] == "qualified"
-    assert leads[1]["status"] == "human_review"
+    # Match level is decoupled from pipeline status: strong & weak both land in the
+    # single "pending" (待确认) queue; only the reject band is auto-rejected. The
+    # score's strength is surfaced via match_level, not the status.
+    assert leads[0]["status"] == "pending"
+    assert leads[0]["match_level"] == "strong"
+    assert leads[1]["status"] == "pending"
+    assert leads[1]["match_level"] == "weak"
     assert leads[2]["status"] == "rejected"
+    assert leads[2]["match_level"] == "reject"
+
+
+def test_auto_confirm_strong_promotes_strong_matches(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.put("/settings", json={"auto_confirm_strong": True})
+        created = client.post(
+            "/leads/batch",
+            json=[
+                {"company_name": "Strong Co", "region": "Europe", "country": "Germany",
+                 "email": "s@strong.example", "score": 90},
+                {"company_name": "Mid Co", "region": "Europe", "country": "Germany",
+                 "email": "m@mid.example", "score": 65},
+            ],
+        )
+    leads = created.json()["leads"]
+    # With the toggle on, a strong match skips 待确认 and is auto-confirmed;
+    # a medium match still waits for a human.
+    assert leads[0]["status"] == "qualified"
+    assert leads[1]["status"] == "pending"
 
 
 def test_batch_create_leads_dedups_against_existing_leads(tmp_path, monkeypatch):
@@ -1295,7 +1320,7 @@ def test_scoring_rules_defaults_match_skill_md(tmp_path, monkeypatch):
     weight_total = sum(w["percent"] for w in rules["weights"])
     assert weight_total == 100
     assert rules["positive_rules"][0] == {"points": 25, "description": "官网确认从事医疗器械分销、进口或渠道销售"}
-    assert rules["thresholds"][0]["status"] == "qualified"
+    assert rules["thresholds"][0]["level"] == "strong"
     assert rules["updated_at"] == ""
 
 
@@ -1318,7 +1343,7 @@ def test_update_scoring_rules_persists_and_requires_settings_manage(tmp_path, mo
         "weights": [{"key": "channel_fit", "label": "渠道匹配度", "percent": 100}],
         "positive_rules": [{"points": 50, "description": "自定义规则"}],
         "negative_rules": [{"points": -50, "description": "自定义扣分"}],
-        "thresholds": [{"min": 0, "max": 100, "status": "new", "label": "全部待核验"}],
+        "thresholds": [{"min": 0, "max": 100, "level": "medium", "label": "全部待核验"}],
     }
     with _client(tmp_path, monkeypatch) as client:
         updated = client.put("/scoring/rules", json=custom).json()
@@ -1356,7 +1381,7 @@ def test_scoring_rules_kol_and_distributor_are_independent(tmp_path, monkeypatch
             "weights": [{"key": "clinical_volume_fit", "label": "临床匹配度", "percent": 100}],
             "positive_rules": [{"points": 50, "description": "自定义KOL规则"}],
             "negative_rules": [{"points": -50, "description": "自定义KOL扣分"}],
-            "thresholds": [{"min": 0, "max": 100, "status": "new", "label": "全部待核验"}],
+            "thresholds": [{"min": 0, "max": 100, "level": "medium", "label": "全部待核验"}],
         }
         client.put("/scoring/rules", params={"lead_type": "kol"}, json=kol_custom)
 
@@ -1422,6 +1447,9 @@ def test_batch_create_leads_infers_and_persists_lead_type_when_unset(tmp_path, m
 
 def test_dashboard_metrics_break_down_leads_by_type(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
+        # "已确认" now means human-confirmed; turn on auto-confirm so strong-match
+        # leads land in 'qualified' and the qualified counters are exercised.
+        client.put("/settings", json={"auto_confirm_strong": True})
         client.post(
             "/leads/batch",
             json=[

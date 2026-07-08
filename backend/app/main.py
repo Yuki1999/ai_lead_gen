@@ -584,11 +584,38 @@ def create_app() -> FastAPI:
             default="desc",
             description="\u6392\u5e8f\u65b9\u5411\uff1aasc \u6216 desc\uff0c\u9ed8\u8ba4 desc\u3002",
         ),
+        page: int = Query(default=1, ge=1, description="\u9875\u7801\uff0c\u4ece 1 \u5f00\u59cb\u3002"),
+        page_size: int = Query(
+            default=50, ge=1, le=500, description="\u6bcf\u9875\u6761\u6570\uff0c1-500\uff0c\u9ed8\u8ba4 50\u3002"
+        ),
     ) -> dict[str, object]:
+        total = db.count_leads(region=region, country=country, status=status, lead_type=lead_type, q=q)
+        total_pages = (total + page_size - 1) // page_size if page_size else 1
+        # Clamp the requested page into range so a stale page number (e.g. after
+        # the last row on the final page was deleted) still returns data rather
+        # than an empty page.
+        if total == 0:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
         leads = db.list_leads(
-            region=region, country=country, status=status, lead_type=lead_type, q=q, sort=sort, order=order
+            region=region,
+            country=country,
+            status=status,
+            lead_type=lead_type,
+            q=q,
+            sort=sort,
+            order=order,
+            limit=page_size,
+            offset=(page - 1) * page_size,
         )
-        return {"total": len(leads), "leads": leads}
+        return {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "leads": leads,
+        }
 
     @app.get("/leads/facets", dependencies=[Depends(require("leads.view"))])
     def lead_facets() -> dict[str, object]:
@@ -1030,6 +1057,8 @@ def create_app() -> FastAPI:
             # LLM-generated with the template/keyword rules only as a fallback.
             "ai_content_generation": settings.get("ai_content_generation", "true") == "true",
             "ai_content_ready": _content_ai_ready(),
+            # When on, strong-match leads skip the 待确认 queue and are auto-confirmed.
+            "auto_confirm_strong": settings.get("auto_confirm_strong", "false") == "true",
             "agent_provider": settings.get("agent_provider", ""),
             "agent_model": settings.get("agent_model", ""),
             "has_agent_key": bool(settings.get("agent_key", "")),
@@ -1049,7 +1078,7 @@ def create_app() -> FastAPI:
         changed: list[str] = []
         for key in (
             "sync_enabled", "sync_interval_minutes", "auto_send_enabled",
-            "ai_content_generation",
+            "ai_content_generation", "auto_confirm_strong",
             "send_daily_cap", "send_min_interval_seconds", "send_per_domain_daily_cap",
             "agent_provider", "agent_model", "agent_key", "backend_base_url",
             "email_server", "email_user", "email_password",

@@ -17,11 +17,10 @@ from app.services import CandidateLead, RenderedEmail, ReplyAnalysis, infer_lead
 # ── Connection pool ────────────────────────────────────
 #
 # The app talks to PostgreSQL through a process-wide connection pool. Every DB
-# helper uses `with connect() as connection:` — the pool hands out a connection,
+# helper uses `with connect() as connection:` - the pool hands out a connection,
 # and on clean block exit the transaction commits (rolls back on exception) and
-# the connection returns to the pool. This mirrors the old sqlite3 `with`
-# semantics while giving proper concurrency for the threadpool FastAPI runs
-# sync endpoints in.
+# the connection returns to the pool. This gives proper concurrency for the
+# threadpool FastAPI runs sync endpoints in.
 
 def _conninfo() -> str:
     """Resolve the PostgreSQL connection string.
@@ -292,6 +291,8 @@ def list_leads(
     q: str | None = None,
     sort: str = "id",
     order: str = "desc",
+    limit: int | None = None,
+    offset: int | None = None,
 ) -> list[dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
@@ -327,6 +328,13 @@ def list_leads(
     order_clause = f"{sort_expr} {sort_dir}"
     if tiebreakers:
         order_clause += ", " + ", ".join(tiebreakers)
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = " LIMIT %(limit)s"
+        params["limit"] = max(0, int(limit))
+        if offset:
+            limit_clause += " OFFSET %(offset)s"
+            params["offset"] = max(0, int(offset))
     with connect() as connection:
         rows = connection.execute(
             f"""SELECT l.*,
@@ -335,10 +343,56 @@ def list_leads(
                    FROM outreach_events
                    WHERE lead_id = l.id AND status IN ('sent', 'queued')) AS last_outreach_at
             FROM leads l
-            {where} ORDER BY {order_clause}""",
+            {where} ORDER BY {order_clause}{limit_clause}""",
             params,
         ).fetchall()
-    return [_row_to_dict(row) for row in rows]
+    result = [_row_to_dict(row) for row in rows]
+    # Attach the AI match-level badge (strong/medium/weak), caching the two rule
+    # sets so a page of leads costs at most two scoring-rule reads.
+    band_cache: dict[str, list[dict[str, Any]]] = {}
+    for d in result:
+        lt = _normalize_scoring_lead_type(d.get("lead_type"))
+        if lt not in band_cache:
+            band_cache[lt] = _thresholds_for(lt)
+        d["match_level"] = _level_from_bands(band_cache[lt], int(d.get("score") or 0))
+    return result
+
+
+def count_leads(
+    *,
+    region: str | None = None,
+    country: str | None = None,
+    status: str | None = None,
+    lead_type: str | None = None,
+    q: str | None = None,
+) -> int:
+    """Total lead count for the same filter set (ignores sort/paging).
+
+    Used so the lead list can render a pager without the caller having to fetch
+    every row. Mirrors the filter clause in `list_leads` - keep them in sync.
+    """
+    filters: list[str] = []
+    params: dict[str, Any] = {}
+    if region:
+        filters.append("region = %(region)s")
+        params["region"] = region
+    if country:
+        filters.append("country = %(country)s")
+        params["country"] = country
+    if status:
+        filters.append("status = %(status)s")
+        params["status"] = status
+    if lead_type:
+        filters.append("lead_type = %(lead_type)s")
+        params["lead_type"] = lead_type
+    if q:
+        filters.append(
+            "(company_name LIKE %(q)s OR email LIKE %(q)s OR country LIKE %(q)s OR category LIKE %(q)s)"
+        )
+        params["q"] = f"%{q}%"
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    with connect() as connection:
+        return _scalar(connection.execute(f"SELECT COUNT(*) FROM leads l {where}", params))
 
 
 def get_lead(
@@ -348,10 +402,16 @@ def get_lead(
 ) -> dict[str, Any] | None:
     if connection is not None:
         row = connection.execute("SELECT * FROM leads WHERE id = %s", (lead_id,)).fetchone()
-        return _row_to_dict(row) if row else None
+        return _finalize_lead(_row_to_dict(row)) if row else None
     with connect() as conn:
         row = conn.execute("SELECT * FROM leads WHERE id = %s", (lead_id,)).fetchone()
-        return _row_to_dict(row) if row else None
+        return _finalize_lead(_row_to_dict(row)) if row else None
+
+
+def _finalize_lead(d: dict[str, Any]) -> dict[str, Any]:
+    """Attach the AI match-level badge to a single lead dict."""
+    d["match_level"] = match_level_for_score(int(d.get("score") or 0), d.get("lead_type"))
+    return d
 
 
 def update_lead(
@@ -1224,10 +1284,10 @@ DEFAULT_SCORING_RULES: dict[str, Any] = {
         {"points": -40, "description": "确认为重复线索"},
     ],
     "thresholds": [
-        {"min": 80, "max": 100, "status": "qualified", "label": "强匹配"},
-        {"min": 60, "max": 79, "status": "new", "label": "中度匹配"},
-        {"min": 40, "max": 59, "status": "human_review", "label": "需人工核验"},
-        {"min": 0, "max": 39, "status": "rejected", "label": "弱匹配/建议拒绝"},
+        {"min": 80, "max": 100, "level": "strong", "label": "强匹配"},
+        {"min": 60, "max": 79, "level": "medium", "label": "中匹配"},
+        {"min": 40, "max": 59, "level": "weak", "label": "弱匹配"},
+        {"min": 0, "max": 39, "level": "reject", "label": "建议拒绝"},
     ],
 }
 
@@ -1259,10 +1319,10 @@ DEFAULT_KOL_SCORING_RULES: dict[str, Any] = {
         {"points": -40, "description": "确认为重复线索"},
     ],
     "thresholds": [
-        {"min": 80, "max": 100, "status": "qualified", "label": "强匹配"},
-        {"min": 60, "max": 79, "status": "new", "label": "中度匹配"},
-        {"min": 40, "max": 59, "status": "human_review", "label": "需人工核验"},
-        {"min": 0, "max": 39, "status": "rejected", "label": "弱匹配/建议拒绝"},
+        {"min": 80, "max": 100, "level": "strong", "label": "强匹配"},
+        {"min": 60, "max": 79, "level": "medium", "label": "中匹配"},
+        {"min": 40, "max": 59, "level": "weak", "label": "弱匹配"},
+        {"min": 0, "max": 39, "level": "reject", "label": "建议拒绝"},
     ],
 }
 
@@ -1291,22 +1351,66 @@ def get_scoring_rules(lead_type: str | None = None) -> dict[str, Any]:
     return parsed
 
 
-def status_for_score(score: int, lead_type: str | None = None) -> str:
-    """Map a lead score to its initial status using the admin-configured
-    thresholds for that lead type, falling back to defaults if none/invalid
-    are configured."""
+# Legacy threshold configs stored a pipeline `status` per band; the model now
+# stores a match `level` (strong/medium/weak/reject) that is decoupled from the
+# pipeline status. Map old values so previously-saved custom rules keep working.
+_LEGACY_STATUS_TO_LEVEL = {
+    "qualified": "strong",
+    "new": "medium",
+    "human_review": "weak",
+    "rejected": "reject",
+}
+
+
+def _thresholds_for(lead_type: str | None) -> list[dict[str, Any]]:
     normalized = _normalize_scoring_lead_type(lead_type)
-    thresholds = get_scoring_rules(normalized).get("thresholds") or DEFAULT_SCORING_RULES_BY_TYPE[normalized]["thresholds"]
+    return get_scoring_rules(normalized).get("thresholds") or DEFAULT_SCORING_RULES_BY_TYPE[normalized]["thresholds"]
+
+
+def _level_from_bands(thresholds: list[dict[str, Any]], score: int) -> str:
+    """Return the match level ('strong'|'medium'|'weak'|'reject') for a score."""
     for rule in thresholds:
         try:
             lo, hi = int(rule["min"]), int(rule["max"])
         except (KeyError, TypeError, ValueError):
             continue
         if lo <= score <= hi:
-            status = str(rule.get("status") or "").strip()
-            if status:
-                return status
-    return "new"
+            level = str(rule.get("level") or "").strip()
+            return level or _LEGACY_STATUS_TO_LEVEL.get(str(rule.get("status") or "").strip(), "")
+    return ""
+
+
+def match_level_for_score(score: int, lead_type: str | None = None) -> str:
+    """AI match-strength badge, independent of pipeline status.
+
+    Returns 'strong' | 'medium' | 'weak' | 'reject' | '' — surfaced in the UI as
+    a 匹配度 tag so the score still informs the user without masquerading as a
+    workflow state.
+    """
+    return _level_from_bands(_thresholds_for(lead_type), int(score))
+
+
+def _auto_confirm_strong() -> bool:
+    return get_setting("auto_confirm_strong", "false") == "true"
+
+
+def status_for_score(score: int, lead_type: str | None = None) -> str:
+    """Map a score to an initial PIPELINE status — decoupled from match level.
+
+    Scoring only ever produces three pipeline states:
+      • 'rejected'  — score falls in the reject band
+      • 'qualified' — strong match AND the 强匹配自动确认 toggle is on
+      • 'pending'   — everything else, awaiting human confirmation
+
+    The strong/medium/weak distinction is carried by match_level_for_score, not
+    the status, so users see a single 待确认 queue instead of two look-alike
+    "needs review" statuses (the old 'new' + 'human_review')."""
+    level = match_level_for_score(score, lead_type)
+    if level == "reject":
+        return "rejected"
+    if level == "strong" and _auto_confirm_strong():
+        return "qualified"
+    return "pending"
 
 
 def set_scoring_rules(rules: dict[str, Any], lead_type: str | None = None) -> dict[str, Any]:

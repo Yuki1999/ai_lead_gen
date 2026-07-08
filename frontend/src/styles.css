@@ -1298,6 +1298,10 @@ textarea::placeholder {
 
 .lh-stat-distributor .lh-dot { background: var(--primary); }
 .lh-stat-kol .lh-dot { background: var(--accent); }
+.lh-stat-core .lh-dot { background: #6b7280; }
+.lh-stat-interested .lh-dot { background: #16a34a; }
+.lh-stat-sent .lh-dot { background: #2563eb; }
+.lh-stat-review .lh-dot { background: #d97706; }
 
 .lh-stat b {
   font-size: 14px;
@@ -1516,6 +1520,23 @@ textarea::placeholder {
 .empty-state strong {
   color: var(--text);
   font-size: 17px;
+}
+
+.lead-list-pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-wrap: wrap;
+}
+
+.lead-list-pager .pager-summary {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-right: auto;
 }
 
 .lead-row {

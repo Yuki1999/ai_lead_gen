@@ -49,6 +49,7 @@ import {
   NIcon,
   NInput,
   NInputNumber,
+  NPagination,
   NSelect,
   NTag,
   type ConfigProviderProps,
@@ -93,6 +94,7 @@ interface Lead {
   source: string;
   score: number;
   status: string;
+  match_level?: string; // AI 匹配度徽章：strong | medium | weak | reject
   notes: string;
   lead_type?: string;
   reply_count?: number;
@@ -119,6 +121,9 @@ interface SearchResponse {
 
 interface LeadListResponse {
   total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
   leads: Lead[];
 }
 
@@ -413,12 +418,12 @@ const { message } = createDiscreteApi(["message"], {
 });
 const statusFilterOptions: SelectOption[] = [
   { label: "全部", value: "" },
-  { label: "新线索", value: "new" },
+  { label: "待确认", value: "pending" },
+  { label: "已确认", value: "qualified" },
   { label: "已邮件", value: "emailed" },
   { label: "有兴趣", value: "interested" },
   { label: "转人工", value: "human_review" },
-  { label: "已确认", value: "qualified" },
-  { label: "拒绝", value: "rejected" },
+  { label: "已拒绝", value: "rejected" },
 ];
 const leadTypeFilterOptions: SelectOption[] = [
   { label: "全部类型", value: "" },
@@ -476,6 +481,8 @@ const sortFieldOptions: SelectOption[] = [
   { label: "回复数", value: "reply_count" },
   { label: "公司名", value: "company_name" },
   { label: "国家", value: "country" },
+  { label: "地区", value: "region" },
+  { label: "类别", value: "category" },
   { label: "状态", value: "status" },
 ];
 const providerOptions: SelectOption[] = [
@@ -585,6 +592,10 @@ const leadFacets = ref<{
 const query = ref("");
 const sortField = ref("id");
 const sortDir = ref<"asc" | "desc">("desc");
+const leadPage = ref(1);
+const leadPageSize = ref(50);
+const leadTotal = ref(0);
+const leadTotalPages = ref(1);
 const sortDropdownOpen = ref(false);
 const sourcePreview = ref<SourcePreview | null>(null);
 const sourcePreviewLead = ref<Lead | null>(null);
@@ -894,6 +905,8 @@ async function loadDashboard(): Promise<void> {
   if (query.value) params.set("q", query.value);
   params.set("sort", sortField.value);
   params.set("order", sortDir.value);
+  params.set("page", String(leadPage.value));
+  params.set("page_size", String(leadPageSize.value));
 
   const [leadPayload, metricPayload] = await Promise.all([
     request<LeadListResponse>(`/leads?${params.toString()}`),
@@ -902,6 +915,13 @@ async function loadDashboard(): Promise<void> {
   ]);
 
   leads.value = leadPayload.leads;
+  leadTotal.value = leadPayload.total;
+  leadTotalPages.value = leadPayload.total_pages ?? 1;
+  // The backend clamps an out-of-range page to the last valid page; mirror
+  // that here so the pager stays in sync (e.g. after deleting the last row).
+  if (leadPayload.page && leadPayload.page !== leadPage.value) {
+    leadPage.value = leadPayload.page;
+  }
   metrics.value = metricPayload;
   await loadDrafts();
 }
@@ -1425,7 +1445,7 @@ async function reactivateLead(leadId: number): Promise<void> {
   await runAction("qualify", async () => {
     await request<Lead>(`/leads/${leadId}`, {
       method: "PATCH",
-      body: JSON.stringify({ status: "new", notes: "重新激活" }),
+      body: JSON.stringify({ status: "pending", notes: "重新激活" }),
     });
     message.success("线索已重新激活");
     await loadDashboard();
@@ -1542,16 +1562,37 @@ function toggleSelectAll(checked: boolean): void {
   }
 }
 
+/** Reload the lead list after a filter/sort/search change, always starting
+ * from page 1 so the user lands on the top of the new result set. */
+function reloadLeadsFromFirstPage(): void {
+  leadPage.value = 1;
+  runAction("dashboard", loadDashboard);
+}
+
+function onLeadPageChange(page: number): void {
+  if (page === leadPage.value) return;
+  leadPage.value = page;
+  runAction("dashboard", loadDashboard);
+}
+
+function onLeadPageSizeChange(size: number): void {
+  if (size === leadPageSize.value) return;
+  leadPageSize.value = size;
+  // Keep the top item roughly in view when switching page size.
+  leadPage.value = 1;
+  runAction("dashboard", loadDashboard);
+}
+
 function selectSortField(field: string): void {
   sortDropdownOpen.value = false;
   if (sortField.value === field) return;
   sortField.value = field;
-  runAction("dashboard", loadDashboard);
+  reloadLeadsFromFirstPage();
 }
 
 function toggleSortDir(): void {
   sortDir.value = sortDir.value === "asc" ? "desc" : "asc";
-  runAction("dashboard", loadDashboard);
+  reloadLeadsFromFirstPage();
 }
 
 function toggleSortDropdown(): void {
@@ -1629,11 +1670,12 @@ async function runAction(
 
 function formatStatus(status: string): string {
   const labels: Record<string, string> = {
-    new: "新线索",
+    pending: "待确认",
+    new: "待确认", // legacy leads created before the status/match-level split
     emailed: "已邮件",
     interested: "有兴趣",
     human_review: "转人工",
-    rejected: "拒绝",
+    rejected: "已拒绝",
     needs_review: "待复核",
     qualified: "已确认",
   };
@@ -1642,6 +1684,23 @@ function formatStatus(status: string): string {
 
 function statusClass(status: string): string {
   return `status status-${status.replace("_", "-")}`;
+}
+
+// AI 匹配度徽章：与线索状态解耦，仅表达“AI 觉得这条有多匹配”。
+// reject / 空 不显示（状态已是「已拒绝」，无需重复）。
+function matchLevelMeta(
+  level?: string,
+): { label: string; type: "default" | "success" | "warning" | "error" } | null {
+  switch (level) {
+    case "strong":
+      return { label: "强匹配", type: "success" };
+    case "medium":
+      return { label: "中匹配", type: "warning" };
+    case "weak":
+      return { label: "弱匹配", type: "default" };
+    default:
+      return null;
+  }
 }
 
 // A lead that's been emailed but hasn't replied yet is "awaiting reply"; past a
@@ -1661,12 +1720,12 @@ function outreachAgeDays(lead: Lead): number | null {
 // rejected. Agent-confirmed (`qualified`) leads belong here too — they're the
 // prime targets to send to, so they get the same per-row 外联 button.
 function canOutreach(status: string): boolean {
-  return status === "new" || status === "qualified";
+  return status === "pending" || status === "new" || status === "qualified";
 }
 
 function statusTagType(status: string): "default" | "info" | "success" | "warning" | "error" {
   if (["interested", "qualified"].includes(status)) return "success";
-  if (["human_review", "needs_review"].includes(status)) return "warning";
+  if (["pending", "new", "human_review", "needs_review"].includes(status)) return "warning";
   if (status === "rejected") return "error";
   if (status === "emailed") return "info";
   return "default";
@@ -2955,14 +3014,14 @@ onBeforeUnmount(() => {
               v-model="query"
               placeholder="搜索公司、邮箱、国家..."
               class="toolbar-search-input"
-              @keyup.enter="runAction('dashboard', loadDashboard)"
+              @keyup.enter="reloadLeadsFromFirstPage()"
             />
             <button
               v-if="query"
               class="toolbar-search-clear"
               type="button"
               aria-label="清除搜索"
-              @click="query = ''; runAction('dashboard', loadDashboard)"
+              @click="query = ''; reloadLeadsFromFirstPage()"
             >
               <X :size="13" />
             </button>
@@ -2973,21 +3032,21 @@ onBeforeUnmount(() => {
               v-model="filterStatus"
               :options="statusSelectOptions"
               placeholder="全部状态"
-              @change="runAction('dashboard', loadDashboard)"
+              @change="reloadLeadsFromFirstPage()"
             />
             <FilterSelect
               v-model="filterLeadType"
               :options="leadTypeSelectOptions"
               placeholder="全部类型"
               :icon="Tag"
-              @change="runAction('dashboard', loadDashboard)"
+              @change="reloadLeadsFromFirstPage()"
             />
             <FilterSelect
               v-model="filterRegion"
               :options="regionSelectOptions"
               placeholder="全部地区"
               :icon="Globe2"
-              @change="runAction('dashboard', loadDashboard)"
+              @change="reloadLeadsFromFirstPage()"
             />
             <FilterSelect
               v-model="filterCountry"
@@ -2996,7 +3055,7 @@ onBeforeUnmount(() => {
               :icon="MapPin"
               searchable
               search-placeholder="搜索国家…"
-              @change="runAction('dashboard', loadDashboard)"
+              @change="reloadLeadsFromFirstPage()"
             />
           </div>
 
@@ -3061,6 +3120,22 @@ onBeforeUnmount(() => {
                 <p>公司、邮箱、公开来源证据、评分和管线状态</p>
               </div>
               <div class="lh-type-stats" aria-label="线索分类统计">
+                <span class="lh-stat lh-stat-core" :title="'全部线索总数'">
+                  <i class="lh-dot"></i>线索总数
+                  <b>{{ metrics.total_leads ?? 0 }}</b>
+                </span>
+                <span class="lh-stat lh-stat-interested" :title="'状态为有意向的线索数'">
+                  <i class="lh-dot"></i>有意向
+                  <b>{{ metrics.interested_leads ?? 0 }}</b>
+                </span>
+                <span class="lh-stat lh-stat-sent" :title="'已发送的外联邮件数'">
+                  <i class="lh-dot"></i>已发邮件
+                  <b>{{ metrics.sent_emails ?? 0 }}</b>
+                </span>
+                <span class="lh-stat lh-stat-review" :title="'待人工审核的线索数'">
+                  <i class="lh-dot"></i>待人工
+                  <b>{{ metrics.human_review ?? 0 }}</b>
+                </span>
                 <span class="lh-stat lh-stat-distributor">
                   <i class="lh-dot"></i>代理商
                   <b>{{ metrics.distributor_leads ?? 0 }}</b>
@@ -3099,7 +3174,7 @@ onBeforeUnmount(() => {
                   取消
                 </n-button>
               </template>
-              <span v-else>{{ leads.length }} 条</span>
+              <span v-else>{{ leadTotal }} 条</span>
             </div>
           </div>
 
@@ -3135,6 +3210,15 @@ onBeforeUnmount(() => {
                 <n-tag :type="statusTagType(lead.status)" size="small" round :bordered="false">
                   {{ formatStatus(lead.status) }}
                 </n-tag>
+                <n-tag
+                  v-if="matchLevelMeta(lead.match_level)"
+                  :type="matchLevelMeta(lead.match_level)!.type"
+                  size="small"
+                  round
+                  :bordered="false"
+                >
+                  {{ matchLevelMeta(lead.match_level)!.label }}
+                </n-tag>
                 <n-tag :type="lead.lead_type === 'kol' ? 'warning' : 'info'" size="small" round :bordered="false">
                   {{ leadTypeLabel(lead.lead_type) }}
                 </n-tag>
@@ -3161,11 +3245,25 @@ onBeforeUnmount(() => {
             <div class="lead-tools" @click.stop>
               <button v-if="canOutreach(lead.status)" class="lead-action-btn primary" @click="sendOutreachSingle(lead.id)"><Send :size="13" />外联</button>
               <button v-if="lead.status === 'emailed' && (lead.reply_count || 0) > 0" class="lead-action-btn" @click="goToReplyForLead(lead.id)"><MailCheck :size="13" />回复</button>
-              <button v-if="['new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
+              <button v-if="['pending', 'new', 'emailed', 'interested', 'human_review', 'needs_review'].includes(lead.status)" class="lead-action-btn" @click="markQualified(lead.id)"><UserCheck :size="13" />确认</button>
               <button v-if="lead.status === 'rejected'" class="lead-action-btn" @click="reactivateLead(lead.id)"><RefreshCw :size="13" />激活</button>
               <button class="lead-action-btn danger" @click="deleteLead(lead.id)"><Trash2 :size="13" /></button>
             </div>
           </article>
+
+          <div v-if="leadTotal > 0" class="lead-list-pager">
+            <span class="pager-summary">共 {{ leadTotal }} 条</span>
+            <n-pagination
+              :page="leadPage"
+              :page-size="leadPageSize"
+              :item-count="leadTotal"
+              :page-sizes="[20, 50, 100, 200]"
+              show-size-picker
+              :disabled="loading"
+              @update:page="onLeadPageChange"
+              @update:page-size="onLeadPageSizeChange"
+            />
+          </div>
         </section>
 
         <div
