@@ -619,8 +619,6 @@ const detailOutreach = ref<EmailEvent[]>([]);
 const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
 // Manual "paste a reply and analyze it" for the open lead (detail modal).
-const detailReplyText = ref("");
-const detailReplyBusy = ref(false);
 const agentPrompt = ref("");
 const agentSessionId = ref("default");
 const agentSessions = ref<AgentSessionRecord[]>([]);
@@ -1111,31 +1109,6 @@ async function syncReplies(): Promise<void> {
   });
 }
 
-// Analyze a reply the operator pasted into the open lead's detail panel.
-async function analyzeDetailReply(): Promise<void> {
-  const leadId = detailLeadId.value;
-  const text = detailReplyText.value.trim();
-  if (leadId === null || !text || detailReplyBusy.value) return;
-  detailReplyBusy.value = true;
-  try {
-    const result = await request<ReplyAnalysis>("/replies/analyze", {
-      method: "POST",
-      body: JSON.stringify({ lead_id: leadId, reply_text: text }),
-    });
-    detailReplyText.value = "";
-    message.success(
-      `已分析：${result.requires_human ? "转人工" : formatStatus(result.intent)}`,
-    );
-    await loadDashboard(); // refresh the lead list first so the panel reads new status
-    await openLeadDetail(leadId); // then reload reply/outreach history + status
-
-  } catch (caught) {
-    message.error(errorDetail(caught));
-  } finally {
-    detailReplyBusy.value = false;
-  }
-}
-
 async function sendAgentPrompt(): Promise<void> {
   const message = agentPrompt.value.trim();
   const sessionKey = agentSessionId.value;
@@ -1531,7 +1504,6 @@ function closeLeadDetail(): void {
   detailLeadId.value = null;
   detailOutreach.value = [];
   detailReplies.value = [];
-  detailReplyText.value = "";
 }
 
 // Outreach from the detail panel: close it first so the preview modal isn't
@@ -3412,27 +3384,6 @@ onBeforeUnmount(() => {
                         删除
                       </n-button>
                     </div>
-                  </div>
-
-                  <div class="ld-card ld-reply-card">
-                    <p class="ld-card-title"><MessageSquare :size="14" aria-hidden="true" /> 分析收到的回复</p>
-                    <span class="ld-card-sub">把对方的邮件回复粘贴进来，由 AI 判断意向并更新线索状态。</span>
-                    <n-input
-                      v-model:value="detailReplyText"
-                      type="textarea"
-                      :autosize="{ minRows: 3, maxRows: 8 }"
-                      placeholder="粘贴对方的回复原文…"
-                    />
-                    <n-button
-                      class="primary-button ld-reply-btn"
-                      type="primary"
-                      :loading="detailReplyBusy"
-                      :disabled="!detailReplyText.trim() || detailReplyBusy"
-                      @click="analyzeDetailReply"
-                    >
-                      <template #icon><n-icon><MessageSquare /></n-icon></template>
-                      {{ detailReplyBusy ? "分析中…" : "AI 分析回复" }}
-                    </n-button>
                   </div>
                 </div>
 
