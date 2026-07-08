@@ -58,7 +58,13 @@ import AdminPanel from "./components/AdminPanel.vue";
 import FilterSelect from "./components/FilterSelect.vue";
 import ScoringRulesSettings from "./components/ScoringRulesSettings.vue";
 import UsageReport from "./components/UsageReport.vue";
-import { STANDARD_REGIONS, labelForCountry, labelForRegion } from "./geo";
+import {
+  STANDARD_REGIONS,
+  COUNTRY_TO_REGION,
+  countryGroupsByRegion,
+  labelForCountry,
+  labelForRegion,
+} from "./geo";
 import {
   activateAgentSession,
   createNextAgentSession,
@@ -675,6 +681,21 @@ const outreachPreviews = ref<Array<{ lead_id: number; company_name: string; emai
 const showCreateLead = ref(false);
 const createError = ref("");
 const newLead = ref({ company_name: "", region: "", country: "", website: "", contact_name: "", email: "", category: "medical device distributor" });
+
+// Add-lead form: standard enum dropdowns (mirrors backend/app/geo.py taxonomy).
+const regionFormOptions = STANDARD_REGIONS.map((r) => ({ label: r.label, value: r.value }));
+// Countries grouped by region for an n-select with group headers.
+const countryFormOptions = countryGroupsByRegion().map((g) => ({
+  type: "group" as const,
+  label: g.label,
+  key: g.region,
+  children: g.countries,
+}));
+// Picking a country auto-fills its standard region (still user-overridable).
+function onNewLeadCountryChange(country: string): void {
+  const region = COUNTRY_TO_REGION[country];
+  if (region) newLead.value.region = region;
+}
 const activePage = ref<"workspace" | "agent" | "settings" | "admin" | "usage">("workspace");
 const usageReportRef = ref<InstanceType<typeof UsageReport> | null>(null);
 const editingSessionId = ref("");
@@ -3483,10 +3504,25 @@ onBeforeUnmount(() => {
         <div class="create-lead-body">
           <div class="create-lead-row">
             <label class="field"><span>公司名称 *</span><n-input v-model:value="newLead.company_name" /></label>
-            <label class="field"><span>国家 *</span><n-input v-model:value="newLead.country" /></label>
+            <label class="field"><span>国家 *</span>
+              <n-select
+                v-model:value="newLead.country"
+                :options="countryFormOptions"
+                filterable
+                placeholder="选择国家"
+                @update:value="onNewLeadCountryChange"
+              />
+            </label>
           </div>
           <div class="create-lead-row">
-            <label class="field"><span>地区 *</span><n-input v-model:value="newLead.region" placeholder="如 Southeast Asia" /></label>
+            <label class="field"><span>地区 *</span>
+              <n-select
+                v-model:value="newLead.region"
+                :options="regionFormOptions"
+                filterable
+                placeholder="选择地区（选国家后自动填充）"
+              />
+            </label>
             <label class="field"><span>网站</span><n-input v-model:value="newLead.website" placeholder="https://" /></label>
           </div>
           <div class="create-lead-row">
