@@ -17,14 +17,19 @@ import {
   FileText,
   Globe2,
   Home,
+  Inbox,
   Link2,
   Loader2,
+  Mail,
   MailCheck,
   MapPin,
   Tag,
   Maximize2,
   MessageSquare,
   Pencil,
+  Sparkles,
+  Star,
+  User,
   Plus,
   RefreshCw,
   Save,
@@ -1466,6 +1471,38 @@ async function markQualified(leadId: number): Promise<void> {
 const detailLead = computed(() =>
   detailLeadId.value ? leads.value.find((l) => l.id === detailLeadId.value) ?? null : null
 );
+
+// Two-letter monogram for the detail-modal avatar.
+const detailInitials = computed(() => {
+  const name = (detailLead.value?.company_name || "").trim();
+  if (!name) return "—";
+  const parts = name.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return name.slice(0, 2).toUpperCase();
+});
+
+// Unified, newest-first timeline merging outreach events and reply analyses so
+// the modal reads as "what has happened with this lead" rather than two lists.
+type TimelineItem =
+  | { key: string; kind: "outreach"; at: string; ev: EmailEvent }
+  | { key: string; kind: "reply"; at: string; r: ReplyAnalysis };
+const detailTimeline = computed<TimelineItem[]>(() => {
+  const items: TimelineItem[] = [];
+  for (const ev of detailOutreach.value) items.push({ key: `o${ev.id}`, kind: "outreach", at: ev.created_at || "", ev });
+  for (const r of detailReplies.value) items.push({ key: `r${r.id}`, kind: "reply", at: r.created_at || "", r });
+  return items.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+});
+
+function outreachStatusMeta(s: string): { label: string; type: "success" | "error" | "warning" | "info" | "default" } {
+  switch (s) {
+    case "sent": return { label: "已发送", type: "success" };
+    case "send_failed": return { label: "发送失败", type: "error" };
+    case "queued": return { label: "排队中", type: "warning" };
+    case "suppressed": return { label: "已抑制", type: "error" };
+    case "draft": return { label: "草稿", type: "default" };
+    default: return { label: "已记录", type: "info" };
+  }
+}
 
 async function openLeadDetail(leadId: number): Promise<void> {
   detailLeadId.value = leadId;
@@ -3278,131 +3315,167 @@ onBeforeUnmount(() => {
             aria-modal="true"
             aria-labelledby="lead-detail-title"
           >
-            <header class="modal-header">
-              <div>
-                <p class="panel-label">线索管理</p>
-                <h2 id="lead-detail-title">{{ detailLead?.company_name }}</h2>
-                <span class="detail-meta">{{ detailLead?.country === detailLead?.region ? detailLead?.country : `${detailLead?.country} · ${detailLead?.region}` }} · {{ detailLead?.email }}</span>
+            <header class="ld-header">
+              <div class="ld-ident">
+                <div class="ld-avatar" aria-hidden="true">{{ detailInitials }}</div>
+                <div class="ld-ident-main">
+                  <h2 id="lead-detail-title">{{ detailLead?.company_name }}</h2>
+                  <div class="ld-badges">
+                    <n-tag :type="statusTagType(detailLead?.status || '')" size="small" round :bordered="false">
+                      {{ formatStatus(detailLead?.status || '') }}
+                    </n-tag>
+                    <n-tag
+                      v-if="matchLevelMeta(detailLead?.match_level)"
+                      :type="matchLevelMeta(detailLead?.match_level)!.type"
+                      size="small"
+                      round
+                      :bordered="false"
+                    >
+                      {{ matchLevelMeta(detailLead?.match_level)!.label }}
+                    </n-tag>
+                    <n-tag :type="detailLead?.lead_type === 'kol' ? 'warning' : 'info'" size="small" round :bordered="false">
+                      {{ leadTypeLabel(detailLead?.lead_type) }}
+                    </n-tag>
+                    <span class="ld-score"><Star :size="12" aria-hidden="true" />{{ detailLead?.score ?? '—' }}</span>
+                  </div>
+                  <div class="ld-meta">
+                    <span><MapPin :size="13" aria-hidden="true" />{{ detailLead?.country === detailLead?.region ? detailLead?.country : `${detailLead?.country} · ${detailLead?.region}` }}</span>
+                    <span><Mail :size="13" aria-hidden="true" />{{ detailLead?.email }}</span>
+                    <span v-if="detailLead?.contact_name"><User :size="13" aria-hidden="true" />{{ detailLead?.contact_name }}</span>
+                  </div>
+                </div>
               </div>
-              <button class="icon-only-button" type="button" aria-label="关闭详情" @click="closeLeadDetail">
-                <X :size="20" aria-hidden="true" />
+              <button class="ld-close" type="button" aria-label="关闭详情" @click="closeLeadDetail">
+                <X :size="18" aria-hidden="true" />
               </button>
             </header>
 
-            <div class="detail-summary">
-              <div class="detail-summary-row">
-                <span class="detail-summary-label">匹配理由</span>
-                <span>{{ detailLead?.match_reason }}</span>
-              </div>
-              <div class="detail-summary-row">
-                <span class="detail-summary-label">来源</span>
-                <a :href="detailLead?.source" target="_blank" rel="noreferrer">{{ detailLead?.source }}</a>
-              </div>
-              <div class="detail-summary-row">
-                <span class="detail-summary-label">网站</span>
-                <a :href="detailLead?.website" target="_blank" rel="noreferrer">{{ detailLead?.website }}</a>
-              </div>
-              <div class="detail-summary-row">
-                <span class="detail-summary-label">类别</span>
-                <span>{{ detailLead?.category }}</span>
-              </div>
-            </div>
-
-            <div class="detail-grid">
-              <div class="detail-form">
-                <label class="field">
-                  <span>状态</span>
-                  <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
-                </label>
-                <label class="field">
-                  <span>分类</span>
-                  <n-select v-model:value="detailLeadType" :options="leadTypeFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
-                </label>
-                <label class="field">
-                  <span>备注</span>
-                  <n-input
-                    v-model:value="detailNotes"
-                    type="textarea"
-                    :autosize="{ minRows: 2, maxRows: 5 }"
-                    placeholder="添加跟进备注..."
-                    @blur="saveLeadDetail"
-                  />
-                </label>
-                <div class="detail-actions">
-                  <n-button
-                    v-if="detailLead && canOutreach(detailLead.status)"
-                    class="primary-button"
-                    type="primary"
-                    @click="outreachFromDetail"
-                  >
-                    <template #icon><n-icon><Send /></n-icon></template>
-                    发送外联
-                  </n-button>
-                  <n-button class="ghost-button danger-action" secondary @click="deleteLead(detailLeadId!)">
-                    <template #icon><n-icon><Trash2 /></n-icon></template>
-                    删除
-                  </n-button>
+            <div class="ld-body">
+              <div class="ld-info">
+                <div class="ld-reason">
+                  <span class="ld-info-label"><Sparkles :size="13" aria-hidden="true" /> 匹配理由</span>
+                  <p>{{ detailLead?.match_reason || '—' }}</p>
                 </div>
+                <div class="ld-info-links">
+                  <a
+                    v-if="detailLead?.website"
+                    class="ld-link"
+                    :href="detailLead.website"
+                    target="_blank"
+                    rel="noreferrer"
+                  ><Globe2 :size="14" aria-hidden="true" /> 访问官网 <ExternalLink :size="11" aria-hidden="true" /></a>
+                  <a
+                    v-if="detailLead?.source"
+                    class="ld-link"
+                    :href="detailLead.source"
+                    target="_blank"
+                    rel="noreferrer"
+                  ><Link2 :size="14" aria-hidden="true" /> 查看来源 <ExternalLink :size="11" aria-hidden="true" /></a>
+                  <span class="ld-cat"><Tag :size="12" aria-hidden="true" /> {{ detailLead?.category }}</span>
+                </div>
+              </div>
 
-                <div class="detail-reply-analyze">
-                  <div class="detail-reply-head">
-                    <p class="panel-label">分析收到的回复</p>
-                    <span>把对方的邮件回复粘贴进来，由 AI 判断意向并更新线索状态。</span>
+              <div class="ld-grid">
+                <div class="ld-col">
+                  <div class="ld-card">
+                    <p class="ld-card-title">状态与跟进</p>
+                    <label class="field">
+                      <span>状态</span>
+                      <n-select v-model:value="detailStatus" :options="statusFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
+                    </label>
+                    <label class="field">
+                      <span>分类</span>
+                      <n-select v-model:value="detailLeadType" :options="leadTypeFilterOptions.filter(o => o.value !== '')" @update:value="saveLeadDetail" />
+                    </label>
+                    <label class="field">
+                      <span>备注</span>
+                      <n-input
+                        v-model:value="detailNotes"
+                        type="textarea"
+                        :autosize="{ minRows: 2, maxRows: 5 }"
+                        placeholder="添加跟进备注..."
+                        @blur="saveLeadDetail"
+                      />
+                    </label>
+                    <div class="ld-actions">
+                      <n-button
+                        v-if="detailLead && canOutreach(detailLead.status)"
+                        class="primary-button"
+                        type="primary"
+                        @click="outreachFromDetail"
+                      >
+                        <template #icon><n-icon><Send /></n-icon></template>
+                        发送外联
+                      </n-button>
+                      <n-button class="ghost-button danger-action" secondary @click="deleteLead(detailLeadId!)">
+                        <template #icon><n-icon><Trash2 /></n-icon></template>
+                        删除
+                      </n-button>
+                    </div>
                   </div>
-                  <n-input
-                    v-model:value="detailReplyText"
-                    type="textarea"
-                    :autosize="{ minRows: 3, maxRows: 8 }"
-                    placeholder="粘贴对方的回复原文…"
-                  />
-                  <n-button
-                    class="primary-button"
-                    type="primary"
-                    :loading="detailReplyBusy"
-                    :disabled="!detailReplyText.trim() || detailReplyBusy"
-                    @click="analyzeDetailReply"
-                  >
-                    <template #icon><n-icon><MessageSquare /></n-icon></template>
-                    {{ detailReplyBusy ? "分析中…" : "AI 分析回复" }}
-                  </n-button>
-                </div>
-              </div>
 
-              <div class="detail-history">
-                <div v-if="detailOutreach.length > 0">
-                  <p class="panel-label">外联记录</p>
-                  <article v-for="ev in detailOutreach" :key="ev.id" class="history-card">
-                    <div class="history-head">
-                      <n-tag :type="ev.status === 'sent' ? 'success' : ev.status === 'send_failed' ? 'error' : ev.status === 'queued' ? 'warning' : ev.status === 'suppressed' ? 'error' : 'info'" size="small" round :bordered="false">
-                        {{ ev.status === 'sent' ? '已发送' : ev.status === 'send_failed' ? '发送失败' : ev.status === 'queued' ? '排队中' : ev.status === 'suppressed' ? '已抑制' : ev.status === 'draft' ? '草稿' : '已记录' }}
-                      </n-tag>
-                      <small>{{ formatTime(ev.created_at) }}</small>
-                    </div>
-                    <strong>{{ ev.subject }}</strong>
-                    <span>收件人：{{ ev.sent_to }}</span>
-                    <p>{{ ev.body.slice(0, 200) }}{{ ev.body.length > 200 ? '...' : '' }}</p>
-                  </article>
+                  <div class="ld-card ld-reply-card">
+                    <p class="ld-card-title"><MessageSquare :size="14" aria-hidden="true" /> 分析收到的回复</p>
+                    <span class="ld-card-sub">把对方的邮件回复粘贴进来，由 AI 判断意向并更新线索状态。</span>
+                    <n-input
+                      v-model:value="detailReplyText"
+                      type="textarea"
+                      :autosize="{ minRows: 3, maxRows: 8 }"
+                      placeholder="粘贴对方的回复原文…"
+                    />
+                    <n-button
+                      class="primary-button ld-reply-btn"
+                      type="primary"
+                      :loading="detailReplyBusy"
+                      :disabled="!detailReplyText.trim() || detailReplyBusy"
+                      @click="analyzeDetailReply"
+                    >
+                      <template #icon><n-icon><MessageSquare /></n-icon></template>
+                      {{ detailReplyBusy ? "分析中…" : "AI 分析回复" }}
+                    </n-button>
+                  </div>
                 </div>
 
-                <div v-if="detailReplies.length > 0">
-                  <p class="panel-label">回复记录</p>
-                  <article v-for="r in detailReplies" :key="r.id" class="history-card">
-                    <div class="history-head">
-                      <n-tag :type="statusTagType(r.requires_human ? 'human_review' : r.intent)" size="small" round :bordered="false">
-                        {{ r.requires_human ? '转人工' : formatStatus(r.intent) }}
-                      </n-tag>
-                      <small>{{ Math.round(r.confidence * 100) }}% · {{ formatTime(r.created_at) }}</small>
-                    </div>
-                    <blockquote v-if="r.reply_text" class="reply-quote">{{ r.reply_text }}</blockquote>
-                    <p>{{ r.summary }}</p>
-                    <p class="history-next">{{ r.next_action }}</p>
-                  </article>
+                <div class="ld-col ld-col-timeline">
+                  <p class="ld-card-title">互动记录</p>
+                  <div v-if="detailLoading" class="ld-empty">加载中…</div>
+                  <div v-else-if="detailTimeline.length === 0" class="ld-empty">
+                    <Inbox :size="24" aria-hidden="true" />
+                    <span>暂无外联或回复记录</span>
+                  </div>
+                  <ol v-else class="ld-timeline">
+                    <li v-for="item in detailTimeline" :key="item.key" :class="['ld-tl', item.kind]">
+                      <span class="ld-tl-dot" aria-hidden="true">
+                        <MailCheck v-if="item.kind === 'reply'" :size="12" />
+                        <Send v-else :size="11" />
+                      </span>
+                      <div class="ld-tl-card">
+                        <template v-if="item.kind === 'outreach'">
+                          <div class="ld-tl-head">
+                            <n-tag :type="outreachStatusMeta(item.ev.status).type" size="small" round :bordered="false">
+                              {{ outreachStatusMeta(item.ev.status).label }}
+                            </n-tag>
+                            <small>{{ formatTime(item.ev.created_at) }}</small>
+                          </div>
+                          <strong>{{ item.ev.subject }}</strong>
+                          <span class="ld-tl-to">收件人：{{ item.ev.sent_to }}</span>
+                          <p>{{ item.ev.body.slice(0, 180) }}{{ item.ev.body.length > 180 ? '…' : '' }}</p>
+                        </template>
+                        <template v-else>
+                          <div class="ld-tl-head">
+                            <n-tag :type="statusTagType(item.r.requires_human ? 'human_review' : item.r.intent)" size="small" round :bordered="false">
+                              {{ item.r.requires_human ? '转人工' : formatStatus(item.r.intent) }}
+                            </n-tag>
+                            <small>{{ Math.round(item.r.confidence * 100) }}% · {{ formatTime(item.r.created_at) }}</small>
+                          </div>
+                          <blockquote v-if="item.r.reply_text" class="reply-quote">{{ item.r.reply_text }}</blockquote>
+                          <p>{{ item.r.summary }}</p>
+                          <p class="history-next">{{ item.r.next_action }}</p>
+                        </template>
+                      </div>
+                    </li>
+                  </ol>
                 </div>
-
-                <div v-if="detailOutreach.length === 0 && detailReplies.length === 0 && !detailLoading" class="history-empty">
-                  暂无外联或回复记录
-                </div>
-                <div v-if="detailLoading" class="history-empty">加载中...</div>
               </div>
             </div>
           </section>
