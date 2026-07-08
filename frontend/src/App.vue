@@ -684,17 +684,33 @@ const newLead = ref({ company_name: "", region: "", country: "", website: "", co
 
 // Add-lead form: standard enum dropdowns (mirrors backend/app/geo.py taxonomy).
 const regionFormOptions = STANDARD_REGIONS.map((r) => ({ label: r.label, value: r.value }));
-// Countries grouped by region for an n-select with group headers.
-const countryFormOptions = countryGroupsByRegion().map((g) => ({
-  type: "group" as const,
-  label: g.label,
-  key: g.region,
-  children: g.countries,
-}));
+// Country options cascade off the chosen region: with a region selected the
+// list narrows to that region's countries; with no region, all countries show
+// grouped by region.
+const countryFormOptions = computed(() => {
+  const groups = countryGroupsByRegion();
+  if (newLead.value.region) {
+    const group = groups.find((g) => g.region === newLead.value.region);
+    return group ? group.countries : [];
+  }
+  return groups.map((g) => ({
+    type: "group" as const,
+    label: g.label,
+    key: g.region,
+    children: g.countries,
+  }));
+});
 // Picking a country auto-fills its standard region (still user-overridable).
 function onNewLeadCountryChange(country: string): void {
   const region = COUNTRY_TO_REGION[country];
   if (region) newLead.value.region = region;
+}
+// Changing the region narrows the country list — drop a now-out-of-region pick.
+function onNewLeadRegionChange(region: string): void {
+  const current = newLead.value.country;
+  if (current && COUNTRY_TO_REGION[current] !== region) {
+    newLead.value.country = "";
+  }
 }
 const activePage = ref<"workspace" | "agent" | "settings" | "admin" | "usage">("workspace");
 const usageReportRef = ref<InstanceType<typeof UsageReport> | null>(null);
@@ -3521,6 +3537,7 @@ onBeforeUnmount(() => {
                 :options="regionFormOptions"
                 filterable
                 placeholder="选择地区（选国家后自动填充）"
+                @update:value="onNewLeadRegionChange"
               />
             </label>
             <label class="field"><span>网站</span><n-input v-model:value="newLead.website" placeholder="https://" /></label>
