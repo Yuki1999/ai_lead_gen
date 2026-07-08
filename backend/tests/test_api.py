@@ -184,6 +184,22 @@ def test_auto_confirm_strong_promotes_strong_matches(tmp_path, monkeypatch):
     assert leads[1]["status"] == "pending"
 
 
+def test_delete_lead_with_history_succeeds(tmp_path, monkeypatch):
+    """Deleting a lead that has outreach history must remove the FK children
+    first — PostgreSQL enforces the foreign keys, unlike the old SQLite."""
+    with _client(tmp_path, monkeypatch) as client:
+        lead = client.post("/leads", json={
+            "company_name": "Del Co", "region": "Europe", "country": "Germany",
+            "email": "del@co.example", "score": 85,
+        }).json()
+        lid = lead["id"]
+        # Give the lead a child row (outreach event references leads.id).
+        client.post("/campaigns/outreach-records", json={"lead_ids": [lid]})
+        resp = client.delete(f"/leads/{lid}")
+        assert resp.status_code == 200, resp.text
+        assert all(l["id"] != lid for l in client.get("/leads").json()["leads"])
+
+
 def test_batch_create_leads_dedups_against_existing_leads(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         first = client.post(

@@ -649,12 +649,12 @@ def reject_outreach_event(event_id: int) -> dict[str, Any] | None:
 
 def delete_lead(lead_id: int) -> bool:
     with connect() as connection:
-        cursor = connection.execute("DELETE FROM leads WHERE id = %s", (lead_id,))
-        if cursor.rowcount == 0:
-            return False
+        # Delete children first: PostgreSQL enforces the outreach_events /
+        # reply_analyses → leads foreign keys, so the parent row can't go first.
         connection.execute("DELETE FROM outreach_events WHERE lead_id = %s", (lead_id,))
         connection.execute("DELETE FROM reply_analyses WHERE lead_id = %s", (lead_id,))
-        return True
+        cursor = connection.execute("DELETE FROM leads WHERE id = %s", (lead_id,))
+        return cursor.rowcount > 0
 
 
 def metrics() -> dict[str, int]:
