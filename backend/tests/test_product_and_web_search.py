@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import requests
 
 from app.product import extract_product_profile
 from app.web_search import (
@@ -8,6 +9,7 @@ from app.web_search import (
     SeedProspect,
     discover_real_prospects,
     extract_emails,
+    extract_tavily,
     fetch_page_summary,
     search_tavily,
     search_web,
@@ -64,6 +66,11 @@ class FakeHttp:
 
 
 class SeedOnlyFakeHttp:
+    def post(self, url: str, **kwargs):
+        # No Tavily extract in this fake → force fetch_page_summary's direct
+        # (BeautifulSoup) fallback, which is what this fixture exercises.
+        raise requests.RequestException("extract unavailable in fixture")
+
     def get(self, url: str, **kwargs):
         return FakeResponse(
             """
@@ -79,6 +86,11 @@ class SeedOnlyFakeHttp:
 
 
 class ContactPageFakeHttp:
+    def post(self, url: str, **kwargs):
+        # Force the direct-fetch fallback so this test still verifies the
+        # "which page did the email come from" logic against .get pages.
+        raise requests.RequestException("extract unavailable in fixture")
+
     def get(self, url: str, **kwargs):
         if url.rstrip("/").endswith("contact"):
             return FakeResponse(
@@ -121,6 +133,64 @@ def test_fetch_page_summary_records_where_email_was_found():
 
     assert page.email_source_url == "https://contact-page.example/contact"
     assert "bd@contact-page.example" in extract_emails(page.html)
+
+
+class TavilyExtractFakeHttp:
+    """Serves Tavily /extract responses (raw_content) and blows up on any direct
+    .get so a test can prove the extract path is used, not the fallback."""
+
+    def post(self, url: str, **kwargs):
+        assert "api.tavily.com/extract" in url
+        target = kwargs["json"]["urls"][0]
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "url": target,
+                        "raw_content": (
+                            "# Ortho Extract Co\n\n"
+                            "Orthopedic implant distributor for knee arthroplasty.\n"
+                            "Contact bd@ortho-extract.example for business development."
+                        ),
+                    }
+                ],
+                "failed_results": [],
+            },
+        )
+
+    def get(self, url: str, **kwargs):
+        raise AssertionError("direct .get must not run when Tavily extract succeeds")
+
+
+def test_extract_tavily_parses_raw_content(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    out = extract_tavily(["https://ortho-extract.example/"], http=TavilyExtractFakeHttp())
+
+    assert out == {
+        "https://ortho-extract.example/": (
+            "# Ortho Extract Co\n\n"
+            "Orthopedic implant distributor for knee arthroplasty.\n"
+            "Contact bd@ortho-extract.example for business development."
+        )
+    }
+
+
+def test_extract_tavily_raises_without_api_key(monkeypatch):
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    with pytest.raises(SearchProviderError):
+        extract_tavily(["https://ortho-extract.example/"], http=TavilyExtractFakeHttp())
+
+
+def test_fetch_page_summary_prefers_tavily_extract(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    # .get raises if called → this only passes via the Tavily extract path.
+    page = fetch_page_summary("https://ortho-extract.example/", http=TavilyExtractFakeHttp())
+
+    assert page.title == "Ortho Extract Co"  # derived from the markdown H1
+    assert "knee arthroplasty" in page.text
+    assert "bd@ortho-extract.example" in extract_emails(page.html)
+    assert page.email_source_url == "https://ortho-extract.example/"
 
 
 def test_discover_real_prospects_uses_search_result_and_page_email(monkeypatch):

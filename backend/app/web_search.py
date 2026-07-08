@@ -55,6 +55,22 @@ USER_AGENT = "Mozilla/5.0 (compatible; MedbotProspectingDemo/0.1)"
 PAGE_TIMEOUT_SECONDS = 3
 TAVILY_TIMEOUT_SECONDS = 8
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+# Extract (esp. "advanced") fetches and renders pages server-side, so give it a
+# more generous timeout than a plain search call.
+TAVILY_EXTRACT_TIMEOUT_SECONDS = 30
+
+
+def _search_depth() -> str:
+    """Tavily search depth: 'basic' | 'advanced'. Default advanced for better
+    result relevance (override with TAVILY_SEARCH_DEPTH)."""
+    return (os.getenv("TAVILY_SEARCH_DEPTH", "advanced").strip() or "advanced")
+
+
+def _extract_depth() -> str:
+    """Tavily extract depth: 'basic' | 'advanced'. Default advanced for the most
+    complete page content (override with TAVILY_EXTRACT_DEPTH)."""
+    return (os.getenv("TAVILY_EXTRACT_DEPTH", "advanced").strip() or "advanced")
 SEED_PROSPECTS = [
     SeedProspect(
         name="ITS Implant",
@@ -294,7 +310,7 @@ def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8)
             json={
                 "api_key": api_key,
                 "query": query,
-                "search_depth": "basic",
+                "search_depth": _search_depth(),
                 "max_results": limit,
                 "include_answer": False,
                 "include_raw_content": False,
@@ -330,6 +346,66 @@ def search_tavily(query: str, *, http: HttpClient | None = None, limit: int = 8)
     return results
 
 
+def extract_tavily(
+    urls: list[str], *, http: HttpClient | None = None, extract_depth: str | None = None
+) -> dict[str, str]:
+    """Fetch page content via Tavily's /extract service, returning {url: content}.
+
+    Tavily fetches and renders the pages on its own infrastructure, so this works
+    from hosts that can't reach arbitrary foreign sites directly (e.g. behind the
+    GFW) as long as api.tavily.com is reachable. Only the api.tavily.com hop is
+    needed. Raises SearchProviderError on a transport/HTTP failure so callers can
+    decide whether to fall back or surface the error.
+    """
+    api_key = _tavily_api_key()
+    if not api_key:
+        raise SearchProviderError("TAVILY_API_KEY is not configured")
+    clean_urls = [u for u in urls if _is_http_url(u)]
+    if not clean_urls:
+        return {}
+    http = http or requests.Session()
+    try:
+        response = http.post(
+            TAVILY_EXTRACT_URL,
+            json={
+                "api_key": api_key,
+                "urls": clean_urls,
+                "extract_depth": extract_depth or _extract_depth(),
+                "format": "markdown",
+            },
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=TAVILY_EXTRACT_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise SearchProviderError(f"Tavily extract failed: {exc}") from exc
+    if response.status_code >= 400:
+        raise SearchProviderError(f"Tavily extract returned HTTP {response.status_code}")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise SearchProviderError("Tavily extract returned a non-JSON response") from exc
+
+    out: dict[str, str] = {}
+    for item in data.get("results", []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        content = str(item.get("raw_content", "") or "")
+        if url and content.strip():
+            out[url] = content
+    return out
+
+
+def _title_from_markdown(md: str) -> str:
+    """Best-effort page title from extracted markdown: the first non-empty line
+    (usually the page's H1), with leading markdown heading markers stripped."""
+    for line in md.splitlines():
+        stripped = line.strip().lstrip("#").strip()
+        if stripped:
+            return stripped[:200]
+    return ""
+
+
 @dataclass(frozen=True)
 class PageSummary:
     url: str
@@ -340,6 +416,40 @@ class PageSummary:
 
 
 def fetch_page_summary(url: str, *, http: HttpClient | None = None) -> PageSummary:
+    """Read a page's content + emails, preferring Tavily Extract (server-side
+    fetch, GFW-resilient) and falling back to a direct fetch only if extract is
+    unavailable or returns nothing usable."""
+    http = http or requests.Session()
+    candidates = _candidate_contact_urls(url)[:2]
+    try:
+        extracted = extract_tavily(candidates, http=http)
+    except SearchProviderError:
+        extracted = {}
+
+    if extracted:
+        title = ""
+        text = ""
+        html = ""
+        email_source_url = ""
+        for candidate_url in candidates:
+            content = extracted.get(candidate_url, "")
+            if not content:
+                continue
+            html += "\n" + content
+            text += "\n" + content[:80_000]
+            if not title:
+                title = _title_from_markdown(content)
+            if not email_source_url and extract_emails(content):
+                email_source_url = candidate_url
+        if text.strip():
+            return PageSummary(url=url, title=title, text=text, html=html, email_source_url=email_source_url)
+
+    return _fetch_page_summary_direct(url, http=http)
+
+
+def _fetch_page_summary_direct(url: str, *, http: HttpClient | None = None) -> PageSummary:
+    """Legacy direct fetch (requests + BeautifulSoup). Best-effort fallback for
+    when Tavily Extract is unavailable; unreliable from GFW-restricted hosts."""
     http = http or requests.Session()
     html = ""
     title = ""
