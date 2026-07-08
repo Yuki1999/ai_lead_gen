@@ -200,6 +200,42 @@ def test_delete_lead_with_history_succeeds(tmp_path, monkeypatch):
         assert all(l["id"] != lid for l in client.get("/leads").json()["leads"])
 
 
+def test_leads_pagination_and_page_clamp(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post(
+            "/leads/batch",
+            json=[
+                {"company_name": f"Page Co {i}", "region": "Europe", "country": "Germany",
+                 "email": f"p{i}@page.example", "score": 70}
+                for i in range(3)
+            ],
+        )
+        # 3 leads, page_size 2 → 2 pages.
+        p1 = client.get("/leads", params={"page_size": 2, "page": 1}).json()
+        assert p1["total"] == 3
+        assert p1["total_pages"] == 2
+        assert p1["page"] == 1
+        assert len(p1["leads"]) == 2
+
+        p2 = client.get("/leads", params={"page_size": 2, "page": 2}).json()
+        assert p2["page"] == 2
+        assert len(p2["leads"]) == 1
+
+        # Pages don't overlap (deterministic ordering).
+        assert {l["id"] for l in p1["leads"]}.isdisjoint({l["id"] for l in p2["leads"]})
+
+        # A stale / out-of-range page clamps back to the last valid page instead
+        # of returning an empty page.
+        p99 = client.get("/leads", params={"page_size": 2, "page": 99}).json()
+        assert p99["page"] == 2
+        assert len(p99["leads"]) == 1
+
+        # page_size / page bounds are validated by the endpoint.
+        assert client.get("/leads", params={"page_size": 0}).status_code == 422
+        assert client.get("/leads", params={"page_size": 1000}).status_code == 422
+        assert client.get("/leads", params={"page": 0}).status_code == 422
+
+
 def test_batch_create_leads_dedups_against_existing_leads(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         first = client.post(

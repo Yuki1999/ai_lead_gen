@@ -146,9 +146,12 @@ export class BackendClient {
     appendQueryParam(params, "status", input.status);
     appendQueryParam(params, "lead_type", input.lead_type);
     appendQueryParam(params, "q", input.q);
-    const query = params.toString();
+    // /leads paginates (default 50). The Agent needs the full library for
+    // situational awareness, so request the endpoint's max page size rather
+    // than silently seeing only the first page.
+    params.set("page_size", "500");
 
-    return this.#request("GET", query ? `/leads?${query}` : "/leads", undefined, options);
+    return this.#request("GET", `/leads?${params.toString()}`, undefined, options);
   }
 
   createOutreachRecords(
