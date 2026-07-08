@@ -1343,10 +1343,10 @@ def _reply_already_synced(message_id: str) -> bool:
         return False
     with db.connect() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM reply_analyses WHERE message_id = ?",
+            "SELECT COUNT(*) AS n FROM reply_analyses WHERE message_id = %s",
             (message_id,),
         ).fetchone()
-        return bool(row and row[0] > 0)
+        return bool(row and row["n"] > 0)
 
 
 def _filter_existing_leads(candidates: list[CandidateLead]) -> list[CandidateLead]:

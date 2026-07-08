@@ -7,16 +7,17 @@ services:
     env_file:
       - .env
     environment:
-      MEDBOT_DB_PATH: /data/medbot.db
+      MEDBOT_DATABASE_URL: "postgresql://${POSTGRES_USER:-medbot}:${POSTGRES_PASSWORD:-medbot}@postgres:5432/${POSTGRES_DB:-medbot}"
       AGENT_BASE_URL: http://agent:8011
       AGENT_ENV_PATH: /app/agent/.env
       MEDBOT_SERVICE_TOKEN: "${MEDBOT_SERVICE_TOKEN:-}"
       PYTHONUNBUFFERED: "1"
     volumes:
-      - medbot-data:/data
       - ./agent/.env:/app/agent/.env
     depends_on:
       agent:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     ports:
       - "${BACKEND_PORT:-8000}:8000"
@@ -32,6 +33,22 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-medbot}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-medbot}"
+      POSTGRES_DB: "${POSTGRES_DB:-medbot}"
+    volumes:
+      - medbot-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-medbot} -d ${POSTGRES_DB:-medbot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   agent:
@@ -77,4 +94,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  medbot-data:
+  medbot-pgdata:

@@ -1202,19 +1202,19 @@ def test_admin_reset_forces_user_change(tmp_path, monkeypatch):
 
 
 def test_secret_settings_encrypted_at_rest(tmp_path, monkeypatch):
-    import sqlite3
+    from app import db as dbmod
     with _client(tmp_path, monkeypatch) as client:
         client.put("/settings", json={"agent_provider": "bailian", "agent_key": "sk-secret-123456"})
         # Raw DB value is ciphertext, not the plaintext key
-        conn = sqlite3.connect(str(tmp_path / "medbot-demo.db"))
-        raw = conn.execute("SELECT value FROM settings WHERE key='agent_key'").fetchone()[0]
-        conn.close()
+        with dbmod.connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = %s", ("agent_key",)
+            ).fetchone()
+        raw = row["value"]
         assert raw.startswith("enc:v1:")
         assert "sk-secret-123456" not in raw
-    # And it decrypts back transparently
-    from app import db as dbmod
-    monkeypatch.setenv("MEDBOT_DB_PATH", str(tmp_path / "medbot-demo.db"))
-    assert dbmod.get_setting("agent_key") == "sk-secret-123456"
+        # And it decrypts back transparently
+        assert dbmod.get_setting("agent_key") == "sk-secret-123456"
 
 
 # ── #2 Send queue, throttle, bounce ───────────────────────────────────────────
