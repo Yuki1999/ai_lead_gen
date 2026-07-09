@@ -396,13 +396,28 @@ def extract_tavily(
     return out
 
 
+_NAV_TITLE_JUNK = {
+    "skip to content",
+    "skip to main content",
+    "menu",
+    "toggle navigation",
+    "search",
+}
+
+
 def _title_from_markdown(md: str) -> str:
-    """Best-effort page title from extracted markdown: the first non-empty line
-    (usually the page's H1), with leading markdown heading markers stripped."""
-    for line in md.splitlines():
-        stripped = line.strip().lstrip("#").strip()
-        if stripped:
-            return stripped[:200]
+    """Best-effort page title from extracted markdown: the first meaningful line,
+    skipping heading markers, pure-image lines (![alt](url)), navigation links
+    ("Skip to content"), and unwrapping markdown links to their visible text."""
+    for raw in md.splitlines():
+        line = raw.strip().lstrip("#").strip()
+        if not line or line.startswith("!["):
+            continue
+        # Unwrap markdown links/images: [text](url) / ![alt](url) → text/alt.
+        line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line).strip()
+        if not line or line.lower() in _NAV_TITLE_JUNK:
+            continue
+        return line[:200]
     return ""
 
 
@@ -524,7 +539,11 @@ def _candidate_from_result(
     evidence = f"{result.title} {result.snippet} {page.text[:3000]}".lower()
     category = _category_from_evidence(evidence)
     score = _score(evidence=evidence, email=email, product_profile=product_profile)
-    company_name = _clean_company_name(page.title, fallback=result.title)
+    # Prefer the search engine's page title for the company name: it's a clean
+    # <title>, whereas Tavily's markdown often starts with a "Skip to content"
+    # nav link or a logo image. Fall back to the extracted title only if the
+    # search title is empty/generic.
+    company_name = _clean_company_name(result.title, fallback=page.title)
 
     # Reject dictionary/encyclopedia/wiki/journal/error-page style titles.
     if _is_low_value_title(company_name) or _is_low_value_title(result.title):

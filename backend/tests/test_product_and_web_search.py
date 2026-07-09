@@ -163,6 +163,17 @@ class TavilyExtractFakeHttp:
         raise AssertionError("direct .get must not run when Tavily extract succeeds")
 
 
+def test_title_from_markdown_skips_nav_and_images():
+    from app.web_search import _title_from_markdown
+
+    md = (
+        "[Skip to content](https://x.example/#content)\n\n"
+        "![ITS logo](https://x.example/logo.png)\n\n"
+        "# ITS Implant\n\nOrthopedic implants for knee arthroplasty."
+    )
+    assert _title_from_markdown(md) == "ITS Implant"
+
+
 def test_extract_tavily_parses_raw_content(monkeypatch):
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
     out = extract_tavily(["https://ortho-extract.example/"], http=TavilyExtractFakeHttp())
