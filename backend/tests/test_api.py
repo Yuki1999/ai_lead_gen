@@ -236,6 +236,42 @@ def test_leads_pagination_and_page_clamp(tmp_path, monkeypatch):
         assert client.get("/leads", params={"page": 0}).status_code == 422
 
 
+def test_followup_creates_draft_after_interval(tmp_path, monkeypatch):
+    from app import db
+    from app.main import _process_followups
+    from app.services import RenderedEmail
+
+    with _client(tmp_path, monkeypatch) as client:
+        lead = client.post("/leads", json={
+            "company_name": "Followup Co", "region": "Europe", "country": "Germany",
+            "email": "f@followup.example", "score": 80,
+        }).json()
+        lid = lead["id"]
+        # Simulate an initial email delivered long ago (status → emailed).
+        ev = db.insert_outreach_event(
+            lid,
+            RenderedEmail(sent_to="f@followup.example", subject="s", body="b", region="Europe"),
+            status="sent",
+        )
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE outreach_events SET sent_at = %s WHERE id = %s",
+                ("2000-01-01T00:00:00+00:00", ev["id"]),
+            )
+        db.set_setting("followup_enabled", "true")
+        db.set_setting("followup_interval_days", "5")
+        db.set_setting("followup_max", "2")
+
+        # Auto-send off → the follow-up is created as a draft for manual approval.
+        assert _process_followups() == 1
+        followups = [e for e in db.list_outreach_events(lid) if e.get("source") == "followup"]
+        assert len(followups) == 1
+        assert followups[0]["status"] == "draft"
+
+        # A pending draft blocks stacking another follow-up.
+        assert _process_followups() == 0
+
+
 def test_batch_create_leads_dedups_against_existing_leads(tmp_path, monkeypatch):
     with _client(tmp_path, monkeypatch) as client:
         first = client.post(

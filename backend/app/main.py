@@ -69,6 +69,7 @@ from app.services import (
     bounce_reply_analysis,
     generate_candidate_leads,
     render_email,
+    render_followup_email,
 )
 from app.web_search import SearchProviderError, discover_real_prospects, fetch_source_preview, search_web
 
@@ -79,10 +80,11 @@ def create_app() -> FastAPI:
         db.init_db()
         bg_task = asyncio.create_task(_auto_sync_loop())
         send_task = asyncio.create_task(_send_dispatch_loop())
+        followup_task = asyncio.create_task(_followup_loop())
         try:
             yield
         finally:
-            for task in (bg_task, send_task):
+            for task in (bg_task, send_task, followup_task):
                 task.cancel()
                 try:
                     await task
@@ -1059,6 +1061,12 @@ def create_app() -> FastAPI:
             "ai_content_ready": _content_ai_ready(),
             # When on, strong-match leads skip the 待确认 queue and are auto-confirmed.
             "auto_confirm_strong": settings.get("auto_confirm_strong", "false") == "true",
+            # Attach the product brochure PDF to outbound outreach emails.
+            "attach_brochure": settings.get("attach_brochure", "false") == "true",
+            # Automated follow-up sequence for emailed leads with no reply.
+            "followup_enabled": settings.get("followup_enabled", "false") == "true",
+            "followup_interval_days": int(settings.get("followup_interval_days", "5") or "5"),
+            "followup_max": int(settings.get("followup_max", "2") or "2"),
             "agent_provider": settings.get("agent_provider", ""),
             "agent_model": settings.get("agent_model", ""),
             "has_agent_key": bool(settings.get("agent_key", "")),
@@ -1078,7 +1086,8 @@ def create_app() -> FastAPI:
         changed: list[str] = []
         for key in (
             "sync_enabled", "sync_interval_minutes", "auto_send_enabled",
-            "ai_content_generation", "auto_confirm_strong",
+            "ai_content_generation", "auto_confirm_strong", "attach_brochure",
+            "followup_enabled", "followup_interval_days", "followup_max",
             "send_daily_cap", "send_min_interval_seconds", "send_per_domain_daily_cap",
             "agent_provider", "agent_model", "agent_key", "backend_base_url",
             "email_server", "email_user", "email_password",
@@ -1250,7 +1259,12 @@ def _dispatch_due_email() -> bool:
         if domain and db.count_sent_since(today, domain=domain) >= cfg["per_domain_cap"]:
             continue  # this domain hit its daily cap; try another recipient
 
-        result = send_email(to=to, subject=str(event["subject"]), body=str(event["body"]))
+        result = send_email(
+            to=to,
+            subject=str(event["subject"]),
+            body=str(event["body"]),
+            attach_brochure=db.get_setting("attach_brochure", "false") == "true",
+        )
         if result.success:
             db.mark_outreach_sent(int(event["id"]), message_id=result.message_id)
             db.add_audit(actor="dispatch", action="email.sent", target_type="lead", target_id=event["lead_id"], detail=to)
@@ -1323,6 +1337,73 @@ async def _auto_sync_loop() -> None:
         except Exception:
             _logger.exception("Auto-sync error, retrying in 5 min")
             await asyncio.sleep(300)
+
+
+def _process_followups() -> int:
+    """Queue/draft one follow-up per eligible lead (emailed, no reply, past the
+    configured interval, under the max-follow-ups cap). Respects auto_send_enabled
+    (queued vs draft) and the suppression list. Returns how many were created."""
+    if db.get_setting("followup_enabled", "false") != "true":
+        return 0
+    from datetime import UTC, datetime, timedelta
+
+    interval_days = int(db.get_setting("followup_interval_days", "5") or "5")
+    max_followups = int(db.get_setting("followup_max", "2") or "2")
+    auto_send = db.get_setting("auto_send_enabled", "false") == "true"
+    cutoff = (datetime.now(UTC) - timedelta(days=max(1, interval_days))).isoformat()
+
+    created = 0
+    for lead in db.leads_awaiting_followup():
+        sent_count = int(lead.get("sent_count") or 0)
+        last_sent = str(lead.get("last_sent") or "")
+        # Only follow up after the initial send and up to the configured cap,
+        # and only once the interval has elapsed since the last delivery.
+        if not (1 <= sent_count <= max_followups):
+            continue
+        if not last_sent or last_sent >= cutoff:
+            continue
+        email = str(lead.get("email", "")).strip()
+        if not email or db.is_suppressed(email):
+            continue
+
+        candidate = CandidateLead(
+            company_name=str(lead["company_name"]),
+            region=str(lead["region"]),
+            country=str(lead["country"]),
+            website=str(lead.get("website", "")),
+            contact_name=str(lead.get("contact_name", "")),
+            email=email,
+            category=str(lead.get("category", "")),
+            match_reason=str(lead.get("match_reason", "")),
+            source=str(lead.get("source", "")),
+            score=int(lead.get("score", 0) or 0),
+            status=str(lead.get("status", "emailed")),
+            notes=str(lead.get("notes", "")),
+            lead_type=str(lead.get("lead_type", "") or ""),
+        )
+        rendered = render_followup_email(candidate, followup_number=sent_count)
+        status = "queued" if auto_send else "draft"
+        db.insert_outreach_event(int(lead["id"]), rendered, status=status, source="followup")
+        db.add_audit(
+            actor="followup", action="followup.created", target_type="lead",
+            target_id=lead["id"], detail=f"#{sent_count} {status}",
+        )
+        created += 1
+    return created
+
+
+async def _followup_loop() -> None:
+    """Background worker: creates due follow-ups on a slow cadence (day-scale)."""
+    while True:
+        try:
+            n = await asyncio.to_thread(_process_followups)
+            if n:
+                _logger.info("Follow-up: created %d follow-up(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("Follow-up error, retrying in 10 min")
+        await asyncio.sleep(3600)  # hourly is ample for a day-scale cadence
 
 
 def _match_reply_to_lead(sender_email: str) -> dict[str, object] | None:

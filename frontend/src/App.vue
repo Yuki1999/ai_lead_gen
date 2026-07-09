@@ -238,6 +238,10 @@ interface SettingsResponse {
   send_daily_cap: number;
   send_min_interval_seconds: number;
   send_per_domain_daily_cap: number;
+  attach_brochure: boolean;
+  followup_enabled: boolean;
+  followup_interval_days: number;
+  followup_max: number;
   ai_content_generation: boolean;
   ai_content_ready: boolean;
   agent_provider: string;
@@ -662,6 +666,10 @@ const settings = ref<SettingsResponse>({
   send_daily_cap: 200,
   send_min_interval_seconds: 20,
   send_per_domain_daily_cap: 25,
+  attach_brochure: false,
+  followup_enabled: false,
+  followup_interval_days: 5,
+  followup_max: 2,
   ai_content_generation: true,
   ai_content_ready: false,
   agent_provider: "deepseek",
@@ -1816,6 +1824,10 @@ async function saveSettings(): Promise<void> {
       send_daily_cap: settings.value.send_daily_cap,
       send_min_interval_seconds: settings.value.send_min_interval_seconds,
       send_per_domain_daily_cap: settings.value.send_per_domain_daily_cap,
+      attach_brochure: settings.value.attach_brochure,
+      followup_enabled: settings.value.followup_enabled,
+      followup_interval_days: settings.value.followup_interval_days,
+      followup_max: settings.value.followup_max,
       ai_content_generation: settings.value.ai_content_generation,
       agent_provider: agentProviderName.value,
       agent_model: agentModelName.value,
@@ -3517,6 +3529,18 @@ onBeforeUnmount(() => {
 
             <div class="settings-card-head" style="margin-top: 24px;">
               <div>
+                <p class="panel-label">彩页附件</p>
+                <h3>外联邮件附带产品彩页</h3>
+                <p>开启后，发出的外联邮件会附带 Skywalker 产品彩页 PDF。关闭则只发正文（默认，避免触发垃圾邮件过滤）。</p>
+              </div>
+              <n-tag :type="settings.attach_brochure ? 'success' : 'default'" size="small" round :bordered="false">
+                {{ settings.attach_brochure ? '带附件' : '不带附件' }}
+              </n-tag>
+            </div>
+            <label class="toggle-field"><n-checkbox v-model:checked="settings.attach_brochure">外联邮件附带产品彩页 PDF</n-checkbox></label>
+
+            <div class="settings-card-head" style="margin-top: 24px;">
+              <div>
                 <p class="panel-label">发送节流</p>
                 <h3>发送队列与速率限制</h3>
                 <p>外联邮件不会瞬时群发，而是进入队列按速率发出，避免触发垃圾邮件过滤、保护域名声誉。退订/退信地址自动跳过。</p>
@@ -3533,6 +3557,23 @@ onBeforeUnmount(() => {
             <label class="field"><span>发送最小间隔（秒）</span><n-input-number v-model:value="settings.send_min_interval_seconds" :min="1" :max="3600" /></label>
             <label class="field"><span>同一域名每日上限（封）</span><n-input-number v-model:value="settings.send_per_domain_daily_cap" :min="1" :max="1000" /></label>
             <p class="setting-hint">推荐：起步阶段间隔 20–60 秒、每日 100–200 封、单域名 ≤25 封，随着域名信誉建立再逐步放宽。</p>
+
+            <div class="settings-card-head" style="margin-top: 24px;">
+              <div>
+                <p class="panel-label">自动跟进</p>
+                <h3>无回复自动跟进</h3>
+                <p>已发送但超过间隔天数仍无回复的线索，自动生成跟进邮件（第 1 封为“是否收到”提醒，之后为价值补充）。开启“自动发送”时直接进入发送队列，否则存为草稿等人工批准。对方一旦回复即停止跟进。</p>
+              </div>
+              <n-tag :type="settings.followup_enabled ? 'success' : 'default'" size="small" round :bordered="false">
+                {{ settings.followup_enabled ? '已开启' : '已关闭' }}
+              </n-tag>
+            </div>
+            <label class="toggle-field"><n-checkbox v-model:checked="settings.followup_enabled">启用无回复自动跟进</n-checkbox></label>
+            <template v-if="settings.followup_enabled">
+              <label class="field"><span>跟进间隔（天）</span><n-input-number v-model:value="settings.followup_interval_days" :min="1" :max="60" /></label>
+              <label class="field"><span>最多跟进次数</span><n-input-number v-model:value="settings.followup_max" :min="1" :max="5" /></label>
+              <p class="setting-hint">距上一封发出满 {{ settings.followup_interval_days }} 天且仍无回复时发下一封，最多 {{ settings.followup_max }} 次。</p>
+            </template>
           </section>
 
           <section v-if="settingsTab === 'agent' && can('agent.config')" class="settings-card">

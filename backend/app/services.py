@@ -115,13 +115,15 @@ DIFFERENTIATORS_CN = (
 _CN_MARKETS = ("china", "中国", "中國", "taiwan", "台湾", "台灣", "hong kong", "香港", "macau", "澳门", "澳門")
 
 _DISTRIBUTOR_KEYWORDS = (
-    "distributor", "dealer", "reseller", "channel", "trading", "import", "importer",
-    "agent", "agency", "supply", "supplier", "medtech partners",
+    "distributor", "distribution", "dealer", "reseller", "channel", "channel partner",
+    "trading", "import", "importer", "agent", "agency", "supply", "supplier",
+    "medtech partners", "business development", "bd director", "bd manager",
     "经销", "代理", "渠道", "分销", "贸易", "供应",
 )
 _KOL_KEYWORDS = (
     "dr.", "dr ", "prof", "professor", "md,", " md", "surgeon", "orthopedic", "orthopaedic",
     "hospital", "clinic", "university", "chief", "head of", "department", "consultant",
+    "procurement", "operating room", "or manager",
     "医生", "医师", "教授", "主任", "医院", "诊所", "骨科", "采购",
 )
 
@@ -255,6 +257,67 @@ def _render_template_email(lead: CandidateLead) -> RenderedEmail:
                 f"Sincerely,\n{SIGNATURE_EN}"
             )
 
+    return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
+
+
+def render_followup_email(lead: CandidateLead, followup_number: int) -> RenderedEmail:
+    """Render a short follow-up for an emailed lead that hasn't replied.
+
+    followup_number 1 = gentle "did you receive it" nudge; 2+ = a value-add note
+    with a clinical highlight. Keeps the approved CTA (reply → dedicated person,
+    no call), unified signature, and no price/cert/exclusivity — consistent with
+    the first-touch template."""
+    lead_type = infer_lead_type(lead)
+    lang = _email_language(lead)
+    market = lead.country or lead.region or ("目标市场" if lang == "cn" else "your market")
+    name = lead.contact_name or ("Sir/Madam" if lang == "en" else "您好")
+    base_subject = _email_subject(lead_type, lang, market)
+    subject = base_subject if base_subject.lower().startswith("re:") else f"Re: {base_subject}"
+    topic_cn = "分销合作" if lead_type == "distributor" else "这项技术"
+    topic_en = "a distribution partnership" if lead_type == "distributor" else "the technology"
+
+    if lang == "cn":
+        if followup_number <= 1:
+            body = (
+                f"尊敬的 {name}：\n\n"
+                "前几日我们就 MEDBOT NaviBot Skywalker 骨科手术机器人向您发去了一封介绍邮件，"
+                "不知是否已送达。\n\n"
+                f"如您对{topic_cn}有任何疑问，欢迎随时回复本邮件，我们将安排专人与您对接。\n\n"
+                "感谢您的时间。\n\n"
+                f"此致\n{SIGNATURE_CN}"
+            )
+        else:
+            body = (
+                f"尊敬的 {name}：\n\n"
+                "再次打扰。补充一点 Skywalker 系统的临床亮点供您参考："
+                "个性化术前规划、实时精度补偿，且无需打开股骨髓腔——出血更少、恢复更快、感染风险更低。\n\n"
+                "如有意向，欢迎回复本邮件，我们将有专人与您对接。\n\n"
+                "感谢您的时间。\n\n"
+                f"此致\n{SIGNATURE_CN}"
+            )
+    else:
+        if followup_number <= 1:
+            body = (
+                f"Dear {name},\n\n"
+                "I reached out a few days ago about the MEDBOT NaviBot Skywalker surgical robotics "
+                "platform, and wanted to make sure my message reached you.\n\n"
+                f"If you have any questions about {topic_en}, simply reply to this email and a "
+                "dedicated person will be glad to follow up.\n\n"
+                "Thank you for your time.\n\n"
+                f"Best regards,\n{SIGNATURE_EN}"
+            )
+        else:
+            body = (
+                f"Dear {name},\n\n"
+                "Following up once more with a quick clinical highlight of the Skywalker system: "
+                "personalized preoperative planning, real-time accuracy compensation, and a design "
+                "that avoids opening the femoral canal — for less bleeding, faster recovery, and low "
+                "infection risk.\n\n"
+                "If this is of interest, just reply to this email and a dedicated person will contact "
+                "you.\n\n"
+                "Thank you for your time.\n\n"
+                f"Best regards,\n{SIGNATURE_EN}"
+            )
     return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
 
 

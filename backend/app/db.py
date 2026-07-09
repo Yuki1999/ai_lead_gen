@@ -570,6 +570,29 @@ def last_sent_at() -> str:
     return value or ""
 
 
+def leads_awaiting_followup() -> list[dict[str, Any]]:
+    """Leads that were emailed, haven't replied, and have no pending outreach —
+    candidates for a follow-up. Each row carries `sent_count` (delivered touches)
+    and `last_sent` (most recent delivery) so the caller can apply the configured
+    interval / max-follow-ups without extra queries."""
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT l.*,
+                (SELECT COUNT(*) FROM outreach_events WHERE lead_id = l.id AND status = 'sent') AS sent_count,
+                (SELECT MAX(sent_at) FROM outreach_events WHERE lead_id = l.id AND status = 'sent') AS last_sent
+            FROM leads l
+            WHERE l.status = 'emailed'
+              AND (SELECT COUNT(*) FROM reply_analyses WHERE lead_id = l.id) = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM outreach_events
+                  WHERE lead_id = l.id AND status IN ('queued', 'draft')
+              )
+            """
+        ).fetchall()
+    return [_row_to_dict(row) for row in rows]
+
+
 def mark_outreach_sent(event_id: int, *, message_id: str = "") -> dict[str, Any] | None:
     now = _now()
     with connect() as connection:

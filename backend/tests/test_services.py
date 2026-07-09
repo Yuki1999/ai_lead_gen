@@ -75,6 +75,25 @@ def test_render_email_kol_template_for_surgeon():
     assert "reply to this email" in email.body.lower()
 
 
+def test_render_followup_email_nudge_then_value_add():
+    from app.services import CandidateLead, render_followup_email
+
+    lead = CandidateLead(
+        company_name="Ortho Dist", region="Europe", country="Germany", website="",
+        contact_name="Dr. Weber", email="w@ortho.example", category="distributor",
+        match_reason="", source="", score=80, lead_type="distributor",
+    )
+    f1 = render_followup_email(lead, followup_number=1)
+    assert f1.subject.startswith("Re:")
+    assert "reply to this email" in f1.body.lower()
+    assert "Skywalker Sales Team" in f1.body
+    # A follow-up promises nothing commercial, same as the first touch.
+    assert not any(w in f1.body.lower() for w in ("price", "exclusiv", "fda", "contract"))
+
+    f2 = render_followup_email(lead, followup_number=2)
+    assert "femoral canal" in f2.body.lower()  # value-add clinical highlight
+
+
 # ── Reply analysis is LLM-only: no keyword fallback, error when unavailable ───
 
 def test_analyze_reply_raises_without_llm():

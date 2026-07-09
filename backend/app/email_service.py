@@ -20,16 +20,38 @@ import hmac
 import os
 from dataclasses import dataclass, field
 
+from pathlib import Path
+
 from exchangelib import (
     Account,
     Configuration,
     Credentials,
     DELEGATE,
     ExtendedProperty,
+    FileAttachment,
     HTMLBody,
     Mailbox,
     Message,
 )
+
+
+def _brochure_path() -> Path:
+    """Path to the product brochure PDF attached when 'attach_brochure' is on.
+    Override with MEDBOT_BROCHURE_PATH; defaults to the international brochure at
+    the project root (copied into the image)."""
+    configured = os.getenv("MEDBOT_BROCHURE_PATH", "").strip()
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[2] / "SkyWalker-Surgical-Robot-Sales-Brochure-International.pdf"
+
+
+def _brochure_attachment() -> "FileAttachment | None":
+    path = _brochure_path()
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return None
+    return FileAttachment(name=path.name, content=content)
 
 
 # RFC 8058 one-click unsubscribe headers. Exchange maps MAPI named properties
@@ -219,6 +241,7 @@ def send_email(
     body: str,
     html: bool = False,
     cc: list[str] | None = None,
+    attach_brochure: bool = False,
 ) -> SendResult:
     """Send a single email via Exchange EWS.
 
@@ -255,6 +278,10 @@ def send_email(
             kwargs["cc_recipients"] = cc
 
         msg = Message(**kwargs)
+        if attach_brochure:
+            attachment = _brochure_attachment()
+            if attachment is not None:
+                msg.attach(attachment)
         msg.send()
 
         return SendResult(
