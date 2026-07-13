@@ -114,6 +114,75 @@ DIFFERENTIATORS_CN = (
 # Markets that should receive Chinese-language outreach. Everything else → English.
 _CN_MARKETS = ("china", "中国", "中國", "taiwan", "台湾", "台灣", "hong kong", "香港", "macau", "澳门", "澳門")
 
+# Approved template bodies given to the LLM as a structural/tonal REFERENCE (fill
+# the [placeholders]; the exact four differentiators and signature come from the
+# hard requirements, so they're left as markers here to avoid duplication).
+_TEMPLATE_REFERENCE = {
+    ("distributor", "en"): (
+        "Dear [Name],\n"
+        "We understand you have strong relationships with high-volume orthopedic centers and KOLs "
+        "in [Target Market] – which is exactly why we are reaching out.\n"
+        "We are seeking regional distribution partners to introduce our flagship surgical robotics "
+        "platform, the MEDBOT NaviBot Skywalker, into the [Target Market] market. The system is "
+        "designed for joint reconstruction and offers a highly compatible, efficient solution for surgeons.\n"
+        "A few key differentiators of our system include:\n<<FOUR DIFFERENTIATORS>>\n"
+        "We are committed to making surgery safer, easier, and less invasive.\n"
+        "If you are interested, please reply to this email and a dedicated person will contact you. We can "
+        "then learn about the current joint replacement landscape in [Target Market], your clinical training "
+        "workflows and KOL networks, and explore potential distribution or collaboration models.\n"
+        "Thank you for your time.\nBest regards,\n<<SIGNATURE>>"
+    ),
+    ("distributor", "cn"): (
+        "尊敬的 [Name]：\n"
+        "我们了解到，您与 [Target Market] 地区的高手术量骨科中心及关键意见领袖（KOL）有着深厚的合作关系——这正是我们联系您的原因。\n"
+        "我们正在寻找区域分销合作伙伴，将我们的旗舰手术机器人平台 MEDBOT NaviBot Skywalker 引入 [Target Market] 市场。"
+        "该系统专为关节置换设计，为外科医生提供高兼容性、高效率的解决方案。\n"
+        "我们系统的几个关键差异化优势包括：\n<<FOUR DIFFERENTIATORS>>\n"
+        "我们致力于让手术更安全、更简单、更微创。\n"
+        "如您有意向，麻烦回复本邮件，我们将有专人与您对接。我们可以了解 [Target Market] 当前关节置换市场情况、"
+        "您的临床培训流程及 KOL 网络，并探讨潜在的分销或合作模式。\n"
+        "感谢您的时间。\n此致\n<<SIGNATURE>>"
+    ),
+    ("kol", "en"): (
+        "Dear [Name],\n"
+        "We are reaching out to you because of your esteemed reputation as a high-volume specialist and "
+        "digital innovator in the field of orthopedics. [Personalized Intro] We deeply respect your clinical "
+        "expertise and your role as a critical academic validator in the orthopedic community.\n"
+        "We would like to introduce you to our MEDBOT NaviBot platform, featuring the Skywalker Total Knee "
+        "System. We believe our technology can serve as a highly compatible and efficient addition to your practice.\n"
+        "A few key differentiators of our system include:\n<<FOUR DIFFERENTIATORS>>\n"
+        "We are committed to making surgery safer, easier, and less invasive. We would welcome the opportunity "
+        "to discuss how the Skywalker system's personalized preoperative planning and real-time accuracy "
+        "compensation might align with your ongoing clinical and academic objectives.\n"
+        "If you are interested, please reply to this email and a dedicated person will contact you.\n"
+        "Thank you for your time.\nSincerely,\n<<SIGNATURE>>"
+    ),
+    ("kol", "cn"): (
+        "尊敬的 [Name]：\n"
+        "我们联系您，是因为了解到您在骨科领域享有盛誉——作为高手术量的专科医生和数字化创新的先行者。[Personalized Intro] "
+        "我们非常尊重您的临床专业能力以及您在骨科领域作为重要学术验证者的角色。\n"
+        "我们想向您介绍我们的 MEDBOT NaviBot 平台，特别是 Skywalker 全膝关节置换系统。"
+        "我们相信，这项技术可以作为您现有临床工作的高兼容性、高效率补充。\n"
+        "我们系统的几个关键差异化优势包括：\n<<FOUR DIFFERENTIATORS>>\n"
+        "我们致力于让手术更安全、更简单、更微创。我们非常希望能与您沟通，探讨 Skywalker 系统的个性化术前规划和实时精度补偿"
+        "如何与您当前的临床及学术目标相结合。\n"
+        "如您有意向，麻烦回复本邮件，我们将有专人与您对接。\n"
+        "感谢您的时间。\n此致\n<<SIGNATURE>>"
+    ),
+}
+
+# Verbatim [Personalized Intro] paragraphs from the leader-approved gold-standard
+# KOL samples — used ONLY as a STYLE anchor (few-shot). The LLM must mimic the
+# sentence pattern/tone but never reuse the names, institutions, or achievements,
+# and must take the signature/CTA from the hard requirements (the samples used a
+# different signature and a "schedule a call" CTA that the approved V2 overrides).
+_KOL_INTRO_EXAMPLES = (
+    "We highly commend your achievement of performing Africa's first Mako TKA in 2019, your impressive "
+    "high-volume track record, and your role as a consultant trainer who is highly reliant on CT-based 3D modeling.",
+    "We highly commend your leadership in driving the first robotic TKA in East/Central Africa, and your focus "
+    "on patient-specific 3D planning and establishing local clinical safety standards to curb medical tourism.",
+)
+
 _DISTRIBUTOR_KEYWORDS = (
     "distributor", "distribution", "dealer", "reseller", "channel", "channel partner",
     "trading", "import", "importer", "agent", "agency", "supply", "supplier",
@@ -599,11 +668,37 @@ def _build_email_prompt(lead: CandidateLead, lead_type: str, lang: str) -> str:
             "optional for distributors — keep the opening simple.\n"
         )
 
+    # Approved template body as a concrete structural/tonal reference (fill in the
+    # actual differentiators + signature so the model sees the full approved shape).
+    reference = (
+        _TEMPLATE_REFERENCE[(lead_type, lang)]
+        .replace("<<FOUR DIFFERENTIATORS>>", differentiators)
+        .replace("<<SIGNATURE>>", signature)
+    )
+    reference_block = (
+        "Approved reference template — follow this structure, flow, and tone closely; "
+        "replace the [bracketed placeholders] with THIS lead's specifics:\n"
+        f"\"\"\"\n{reference}\n\"\"\"\n"
+    )
+
+    # KOL only: a couple of leader-approved [Personalized Intro] examples as a
+    # STYLE anchor — mimic the pattern, never the facts.
+    fewshot_block = ""
+    if lead_type == "kol":
+        examples = "\n".join(f"  - {ex}" for ex in _KOL_INTRO_EXAMPLES)
+        fewshot_block = (
+            "Gold-standard [Personalized Intro] STYLE examples (mimic the sentence pattern and tone ONLY; "
+            "NEVER reuse their names, hospitals, countries, or achievements — use this lead's own evidence; "
+            "and IGNORE their signature/closing, which differ from the required ones below):\n"
+            f"{examples}\n\n"
+        )
+
     return f"""Compose ONE outreach email using the approved MEDBOT Skywalker template.
 
 {lead_facts}
 
-{role_instructions}
+{reference_block}
+{fewshot_block}{role_instructions}
 Hard requirements:
 - Subject line MUST be exactly: {subject}
 - Greeting addresses the recipient by name when available.

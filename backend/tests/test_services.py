@@ -94,6 +94,38 @@ def test_render_followup_email_nudge_then_value_add():
     assert "femoral canal" in f2.body.lower()  # value-add clinical highlight
 
 
+def test_email_prompt_includes_reference_template_and_kol_fewshot():
+    from app.services import CandidateLead, _build_email_prompt
+
+    kol = CandidateLead(
+        company_name="Netcare Hospital", region="Africa", country="South Africa", website="",
+        contact_name="Dr. McCready", email="dr@x.example", category="orthopedic surgeon / KOL",
+        match_reason="First robotic TKA in 2019; high-volume CT-based planning.", source="",
+        score=88, lead_type="kol",
+    )
+    prompt = _build_email_prompt(kol, "kol", "en")
+    # Approved template body is provided as a reference (with placeholders).
+    assert "Approved reference template" in prompt
+    assert "[Personalized Intro]" in prompt
+    # Gold-standard style examples are injected, with the do-not-reuse guardrail.
+    assert "STYLE examples" in prompt
+    assert "NEVER reuse their names" in prompt
+    assert "Africa's first Mako TKA" in prompt
+    # The required subject/signature are still pinned (samples' differ).
+    assert "Skywalker Sales Team" in prompt
+    assert "Advancing Robotic Arthroplasty" in prompt
+
+    dist = CandidateLead(
+        company_name="Euro Dist", region="Europe", country="Germany", website="",
+        contact_name="Mr. Weber", email="w@y.example", category="distributor", match_reason="",
+        source="", score=80, lead_type="distributor",
+    )
+    dprompt = _build_email_prompt(dist, "distributor", "en")
+    assert "Approved reference template" in dprompt
+    assert "STYLE examples" not in dprompt  # KOL-only few-shot
+    assert "Distribution Partnership Opportunity" in dprompt
+
+
 # ── Reply analysis is LLM-only: no keyword fallback, error when unavailable ───
 
 def test_analyze_reply_raises_without_llm():
