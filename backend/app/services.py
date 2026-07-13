@@ -387,6 +387,84 @@ def _record_llm_usage(*, source: str, provider: str, model: str, data: object) -
         pass
 
 
+def _llm_endpoint(provider: str, model: str) -> tuple[str, str]:
+    """Resolve the OpenAI-compatible chat endpoint + effective model name."""
+    if provider == "deepseek":
+        if "v4" in model or "pro" in model:
+            model = "deepseek-chat"
+        return "https://api.deepseek.com/v1/chat/completions", model
+    if provider == "openai":
+        return "https://api.openai.com/v1/chat/completions", model
+    if provider in ("bailian", "dashscope", "qwen"):
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", model
+    return "https://api.deepseek.com/v1/chat/completions", "deepseek-chat"
+
+
+def ai_company_name(
+    *, title: str, snippet: str, page_text: str, domain: str, email: str
+) -> str | None:
+    """Infer a clean company name from multiple page signals via the LLM.
+
+    Given the domain, page title, search snippet, a page-text excerpt, and the
+    contact email, return the real company/brand name — not an SEO phrase
+    ("No.1 / Top ... Manufacturer in India"), a page-section label
+    ("Product By Category"), or leaked markdown. Returns None when no LLM is
+    configured or the call fails, so callers can fall back to a heuristic."""
+    try:
+        resolved = resolve_content_ai(respect_toggle=False)
+        if resolved is None:
+            return None
+        provider, api_key, model = resolved
+        api_url, model = _llm_endpoint(provider, model)
+
+        import requests
+
+        system = (
+            "You extract the proper company or organization name from web-page signals. "
+            "Return ONLY the real name (brand or legal name) — never an SEO/marketing phrase "
+            "like 'No.1/Top/Best/Leading ... Manufacturer/Company in <country>', never a tagline, "
+            "never a page-section label ('Products', 'Contact', 'Product By Category', 'Home'), "
+            "never a person's name, never markdown. If the title is generic or unhelpful, infer the "
+            "name from the domain and page text (e.g. sharmaortho.com -> 'Sharma Ortho'). "
+            'Respond with JSON only: {"company_name": "..."}.'
+        )
+        user = (
+            f"domain: {domain}\n"
+            f"contact email: {email}\n"
+            f"page title: {title}\n"
+            f"search snippet: {snippet}\n"
+            f"page text (excerpt): {page_text[:1500]}"
+        )
+        resp = requests.post(
+            api_url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 60,
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        _record_llm_usage(source="company_name", provider=provider, model=model, data=data)
+        import json as _json
+        import re as _re
+
+        content = data["choices"][0]["message"]["content"].strip()
+        content = _re.sub(r"^```(?:json)?\s*", "", content)
+        content = _re.sub(r"\s*```$", "", content)
+        name = str(_json.loads(content).get("company_name", "")).strip()
+        return name[:120] or None
+    except Exception:
+        return None
+
+
 def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
     """Generate email using the configured AI agent. Returns None on failure."""
     try:

@@ -545,6 +545,28 @@ def _candidate_from_result(
     # search title is empty/generic.
     company_name = _clean_company_name(result.title, fallback=page.title)
 
+    # The mechanical name is often an SEO phrase ("No.1 ... Manufacturer in
+    # India"), a page-section label ("Product By Category"), or leaked markdown.
+    # When it looks weak, ask the LLM to infer the real name from multiple
+    # signals (domain + title + snippet + page text + email); fall back to a
+    # domain-derived name if no LLM is configured.
+    if _name_looks_weak(company_name):
+        from app.services import ai_company_name
+
+        ai_name = ai_company_name(
+            title=result.title,
+            snippet=result.snippet,
+            page_text=page.text,
+            domain=_domain(result.url),
+            email=email,
+        )
+        if ai_name and not _name_looks_weak(ai_name):
+            company_name = ai_name
+        else:
+            domain_name = _company_name_from_domain(result.url)
+            if domain_name:
+                company_name = domain_name
+
     # Reject dictionary/encyclopedia/wiki/journal/error-page style titles.
     if _is_low_value_title(company_name) or _is_low_value_title(result.title):
         return None
@@ -756,6 +778,44 @@ def _clean_company_name(title: str, *, fallback: str = "") -> str:
     if cleaned.lower() in {"", "contact", "contact us", "products", "home", "about us"}:
         cleaned = fallback.strip()
     return cleaned[:120] or "Unknown Prospect"
+
+
+_WEAK_NAME_LABELS = {
+    "unknown prospect", "products", "product", "product by category", "categories",
+    "contact", "contact us", "contact-us", "home", "about", "about us", "services",
+    "welcome", "index",
+}
+_WEAK_NAME_SEO_RE = re.compile(
+    r"\b(no\.?\s*1|#\s*1|top|best|leading|largest)\b.*"
+    r"\b(manufacturer|manufacturers|supplier|suppliers|company|companies|distributor|distributors|implants?)\b"
+    r"|\bmanufacturers?\s+in\s+\w",
+    re.IGNORECASE,
+)
+
+
+def _name_looks_weak(name: str) -> bool:
+    """True when a mechanically-derived company name is an SEO phrase, a
+    page-section label, leaked markdown, or generic — worth re-deriving via the
+    LLM from richer signals."""
+    if not name:
+        return True
+    lowered = name.strip().lower()
+    if lowered in _WEAK_NAME_LABELS:
+        return True
+    if "![" in name or "](" in name:  # markdown image/link leaked into the title
+        return True
+    return bool(_WEAK_NAME_SEO_RE.search(name))
+
+
+def _company_name_from_domain(url: str) -> str:
+    """Last-resort name from the domain root (e.g. xlo.in -> 'Xlo'). Crude for
+    concatenated domains; only used when the LLM is unavailable."""
+    domain = _domain(url)
+    if not domain:
+        return ""
+    root = domain.split(".")[0]
+    cleaned = re.sub(r"[^a-z0-9]+", " ", root, flags=re.IGNORECASE).strip()
+    return cleaned.title()[:120] if cleaned else ""
 
 
 def _domain(url: str) -> str:

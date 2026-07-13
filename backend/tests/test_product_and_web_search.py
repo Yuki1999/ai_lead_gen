@@ -547,6 +547,86 @@ def test_discover_real_prospects_rejects_market_consultancy(monkeypatch):
     assert leads == []
 
 
+def test_name_looks_weak_detects_seo_labels_and_markdown():
+    from app.web_search import _name_looks_weak
+
+    assert _name_looks_weak("Product By Category")
+    assert _name_looks_weak("No.1 Orthopedic Implants Manufacturer in India")
+    assert _name_looks_weak("Top Orthopedic Implants Manufacturer")
+    assert _name_looks_weak("![Fragment care logo](https://orthocare.example/)")
+    assert _name_looks_weak("Orthopaedic Implant Manufacturer in India")
+    assert _name_looks_weak("Unknown Prospect")
+    # Real company names are not weak.
+    assert not _name_looks_weak("ITS Implant")
+    assert not _name_looks_weak("United Orthopedic Europe")
+    assert not _name_looks_weak("Adler Ortho")
+
+
+class WeakNameFakeHttp:
+    """A real company page whose title is a page-section label ('Product By
+    Category') — the LLM should recover the real name from the other signals."""
+
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Product By Category",
+                        "url": "https://sharmaortho.example/contactus",
+                        "content": "Sharma Orthopedic — orthopedic implant distributor for joint replacement and TKA.",
+                    }
+                ]
+            },
+        )
+
+    def get(self, url: str, **kwargs):
+        return FakeResponse(
+            """
+            <html><head><title>Product By Category</title></head>
+            <body>Sharma Orthopedic is an orthopedic implant distributor.
+            Contact account@sharmaortho.example.</body></html>
+            """
+        )
+
+
+def test_ai_company_name_fixes_weak_title(monkeypatch):
+    import requests
+
+    import app.web_search as web_search
+    from app import db
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
+    db.set_setting("agent_provider", "deepseek")
+    db.set_setting("agent_key", "test-key")
+
+    class _LLMResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": '{"company_name": "Sharma Ortho"}'}}],
+                "usage": {"total_tokens": 10},
+            }
+
+    # ai_company_name uses requests.post; the search/fetch fakes use the injected
+    # http, so this only stubs the LLM call.
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _LLMResp())
+    profile = extract_product_profile(Path(__file__).resolve().parents[2])
+
+    leads = discover_real_prospects(
+        target_regions=["South Asia"],
+        product_profile=profile,
+        max_results=1,
+        require_email=True,
+        http=WeakNameFakeHttp(),
+    )
+
+    assert len(leads) == 1
+    assert leads[0].company_name == "Sharma Ortho"
+
+
 # ── Tavily is the only search provider. There is no scraping fallback: a ────
 # missing key or a failed call must raise, not silently degrade. ────────────
 
