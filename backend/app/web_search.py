@@ -561,6 +561,11 @@ def _candidate_from_result(
     if not _has_topical_relevance(evidence):
         return None
 
+    # Reject directory / listicle / ranking pages and market-research /
+    # consultancy pages — they're about companies, not a channel to sell to.
+    if _looks_like_aggregator(title=result.title, page_title=page.title, evidence=evidence):
+        return None
+
     country = region
     match_reason = (
         f"Live web match for {product_profile.procedure}: {result.snippet or result.title}. "
@@ -627,6 +632,13 @@ def _candidate_contact_urls(url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+_FREE_EMAIL_PROVIDERS = {
+    "gmail.com", "yahoo.com", "yahoo.co.in", "hotmail.com", "outlook.com",
+    "aol.com", "163.com", "126.com", "qq.com", "sina.com", "hongkong.com",
+    "yandex.com", "gmx.com", "mail.com", "protonmail.com", "rediffmail.com",
+}
+
+
 def _choose_email(emails: list[str], url: str) -> str:
     if not emails:
         return ""
@@ -635,8 +647,13 @@ def _choose_email(emails: list[str], url: str) -> str:
         domain_parts = domain.split(".")
         root_domain = ".".join(domain_parts[-2:]) if len(domain_parts) >= 2 else domain
         for email in emails:
-            if email.endswith(root_domain):
+            if email.endswith(root_domain):  # same-domain corporate email wins
                 return email
+    # No same-domain match: prefer a corporate address over a free-provider one
+    # (directory pages often expose a scraped gmail/hongkong.com etc.).
+    for email in emails:
+        if email.rsplit("@", 1)[-1] not in _FREE_EMAIL_PROVIDERS:
+            return email
     return emails[0]
 
 
@@ -696,6 +713,42 @@ def _has_topical_relevance(evidence: str) -> bool:
     having an email was otherwise the only real acceptance criterion.
     """
     return any(term in evidence for term in _TOPICAL_TERMS)
+
+
+# Directory / listicle / ranking pages ("Top 10 Orthopedic Companies in India",
+# "Orthopedic Implant Manufacturers in India", supplier directories) announce
+# themselves in the title. These are pages ABOUT companies, not a company's own
+# site, and were polluting the lead list with scraped listing emails.
+_LISTICLE_TITLE_RE = re.compile(
+    r"top\s*\d+"
+    r"|\d+\s+(?:best|leading|largest|top)\b"
+    r"|best\s+[\w\s/&-]{0,40}\b(?:companies|manufacturers|suppliers|distributors)\b"
+    r"|list of\b"
+    r"|companies list"
+    r"|\b(?:companies|manufacturers|suppliers|distributors|exporters|vendors)\s+(?:list|directory)\b"
+    r"|\b(?:companies|manufacturers|suppliers|distributors|exporters)\s+in\s+\w"
+    r"|directory of\b"
+    r"|十大|排行|排名|名录",
+    re.IGNORECASE,
+)
+# Market-research / consultancy / advisory pages (e.g. a "market entry advisory
+# firm" publishing a report about distributors) — topical but not a channel.
+_CONSULTANCY_TERMS = (
+    "market entry", "advisory firm", "consulting firm", "consultancy",
+    "market report", "market research", "market analysis", "market size",
+    "research report", "industry report", "industry analysis",
+    "市场分析", "市场研究", "研究报告", "行业分析", "市场报告", "咨询公司",
+)
+
+
+def _looks_like_aggregator(*, title: str, page_title: str, evidence: str) -> bool:
+    """True for directory/listicle/ranking pages and market-research/consultancy
+    pages — content that reads as being *about* companies rather than a single
+    company's own site."""
+    for candidate_title in (title, page_title):
+        if candidate_title and _LISTICLE_TITLE_RE.search(candidate_title):
+            return True
+    return any(term in evidence for term in _CONSULTANCY_TERMS)
 
 
 def _clean_company_name(title: str, *, fallback: str = "") -> str:

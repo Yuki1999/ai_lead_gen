@@ -455,6 +455,98 @@ def test_discover_real_prospects_rejects_topically_unrelated_business(monkeypatc
     assert leads == []
 
 
+class DirectoryListicleFakeHttp:
+    """A 'Top N companies' listicle: topical and has an email, but it's a page
+    ABOUT companies, not a distributor's own site — must be rejected."""
+
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Top 10 Orthopedic Implant Companies in India (2026)",
+                        "url": "https://blog.example/top-10-orthopedic-implant-companies",
+                        "content": "Ranking the best orthopedic implant manufacturers for joint replacement and TKA.",
+                    }
+                ]
+            },
+        )
+
+    def get(self, url: str, **kwargs):
+        return FakeResponse(
+            """
+            <html><head><title>Top 10 Orthopedic Implant Companies in India</title></head>
+            <body>1. Ortho A — knee arthroplasty implants. Contact info@listco.example.
+            2. Ortho B — surgical robotics.</body></html>
+            """
+        )
+
+
+def test_discover_real_prospects_rejects_directory_listicle(monkeypatch):
+    import app.web_search as web_search
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
+    profile = extract_product_profile(Path(__file__).resolve().parents[2])
+
+    leads = discover_real_prospects(
+        target_regions=["South Asia"],
+        product_profile=profile,
+        max_results=1,
+        require_email=True,
+        http=DirectoryListicleFakeHttp(),
+    )
+
+    assert leads == []
+
+
+class MarketConsultancyFakeHttp:
+    """A market-entry advisory firm's report about distributors — topical but a
+    consultancy, not a channel."""
+
+    def post(self, url: str, **kwargs):
+        return FakeResponse(
+            "",
+            json_data={
+                "results": [
+                    {
+                        "title": "Romania Orthopaedic Implants Importer-Distributors — FRD Center",
+                        "url": "https://frdcenter.example/report",
+                        "content": "As one of the pioneer market entry advisory firms, our analysis of orthopedic distributors.",
+                    }
+                ]
+            },
+        )
+
+    def get(self, url: str, **kwargs):
+        return FakeResponse(
+            """
+            <html><head><title>FRD Center — Market Entry Advisory</title></head>
+            <body>Orthopedic implants distributor market research report. Contact europa@frdcenter.example.
+            As one of the pioneer market entry advisory firms, we help with market entry.</body></html>
+            """
+        )
+
+
+def test_discover_real_prospects_rejects_market_consultancy(monkeypatch):
+    import app.web_search as web_search
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test-key")
+    monkeypatch.setattr(web_search, "SEED_PROSPECTS", [])
+    profile = extract_product_profile(Path(__file__).resolve().parents[2])
+
+    leads = discover_real_prospects(
+        target_regions=["Europe"],
+        product_profile=profile,
+        max_results=1,
+        require_email=True,
+        http=MarketConsultancyFakeHttp(),
+    )
+
+    assert leads == []
+
+
 # ── Tavily is the only search provider. There is no scraping fallback: a ────
 # missing key or a failed call must raise, not silently degrade. ────────────
 
