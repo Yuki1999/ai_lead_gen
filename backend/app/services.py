@@ -1,5 +1,10 @@
+import re
 from dataclasses import dataclass
 from itertools import cycle
+
+# A template-style placeholder like [Name], [Target Market], [Personalized Intro]
+# — bracketed letters/spaces. Deliberately does NOT match "[1]" numeric citations.
+_PLACEHOLDER_RE = re.compile(r"\[[A-Za-z][A-Za-z ]{1,30}\]")
 
 
 @dataclass(frozen=True)
@@ -596,6 +601,21 @@ def _try_ai_email(lead: CandidateLead) -> RenderedEmail | None:
         subject = str(parsed.get("subject", "")).strip()
         body = str(parsed.get("body", "")).strip()
         if not subject or not body:
+            return None
+
+        # Safeguard: the reference template carries [placeholders]. Deterministically
+        # fill the simple ones, then reject the result if ANY template-style
+        # placeholder leaked through — never send "Dear [Name]" / an unfilled
+        # [Personalized Intro] to a prospect; fall back to the static template.
+        market = lead.country or lead.region or ("目标市场" if lang == "cn" else "your market")
+        name = lead.contact_name or ("您好" if lang == "cn" else "Sir/Madam")
+        for placeholder, value in (
+            ("[Name]", name), ("[name]", name),
+            ("[Target Market]", market), ("[target market]", market),
+        ):
+            subject = subject.replace(placeholder, value)
+            body = body.replace(placeholder, value)
+        if _PLACEHOLDER_RE.search(subject) or _PLACEHOLDER_RE.search(body):
             return None
 
         return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)

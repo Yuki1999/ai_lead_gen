@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.services import (
@@ -124,6 +126,51 @@ def test_email_prompt_includes_reference_template_and_kol_fewshot():
     assert "Approved reference template" in dprompt
     assert "STYLE examples" not in dprompt  # KOL-only few-shot
     assert "Distribution Partnership Opportunity" in dprompt
+
+
+def test_ai_email_placeholder_safeguard(monkeypatch):
+    import requests
+
+    from app import db
+    from app.services import CandidateLead, _try_ai_email
+
+    db.init_db()
+    db.set_setting("agent_provider", "deepseek")
+    db.set_setting("agent_key", "test-key")
+
+    lead = CandidateLead(
+        company_name="Netcare", region="Africa", country="South Africa", website="",
+        contact_name="Dr. A", email="a@x.org", category="KOL", match_reason="", source="",
+        score=80, lead_type="kol",
+    )
+
+    def _resp(body: str):
+        subject = "Advancing Robotic Arthroplasty in South Africa - Introduction from MEDBOT Skywalker"
+
+        class _R:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "choices": [{"message": {"content": json.dumps({"subject": subject, "body": body})}}],
+                    "usage": {"total_tokens": 10},
+                }
+
+        return _R()
+
+    # A leaked [Personalized Intro] must reject the AI result (→ template fallback).
+    monkeypatch.setattr(requests, "post",
+                        lambda *a, **k: _resp("Dear Dr. A, [Personalized Intro] ... Skywalker Sales Team"))
+    assert _try_ai_email(lead) is None
+
+    # [Name] / [Target Market] are filled deterministically; if nothing else leaks
+    # the email is accepted.
+    monkeypatch.setattr(requests, "post",
+                        lambda *a, **k: _resp("Dear [Name], welcome to [Target Market]. Skywalker Sales Team"))
+    email = _try_ai_email(lead)
+    assert email is not None
+    assert "[Name]" not in email.body and "[Target Market]" not in email.body
+    assert "Dr. A" in email.body and "South Africa" in email.body
 
 
 # ── Reply analysis is LLM-only: no keyword fallback, error when unavailable ───
