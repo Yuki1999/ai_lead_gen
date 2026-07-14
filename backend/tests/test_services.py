@@ -77,6 +77,63 @@ def test_render_email_kol_template_for_surgeon():
     assert "reply to this email" in email.body.lower()
 
 
+def test_render_reply_draft_interested_references_brochure():
+    from app.services import CandidateLead, render_reply_draft
+
+    lead = CandidateLead(
+        company_name="Ortho Dist", region="Europe", country="Germany", website="",
+        contact_name="Dr. Weber", email="w@ortho.example", category="distributor",
+        match_reason="", source="", score=80, lead_type="distributor",
+    )
+    draft = render_reply_draft(
+        lead,
+        reply_text="We are interested, please send more details.",
+        kind="interested",
+        original_subject="Skywalker partnership in Germany",
+    )
+    assert draft.sent_to == "w@ortho.example"
+    assert draft.subject == "Re: Skywalker partnership in Germany"
+    assert "Dr. Weber" in draft.body
+    assert "brochure" in draft.body.lower()
+    # A reply never leaks an unfilled [placeholder].
+    import re
+    assert not re.search(r"\[[A-Za-z][A-Za-z ]{1,30}\]", draft.body)
+
+
+def test_render_reply_draft_holding_makes_no_commitments():
+    from app.services import CandidateLead, render_reply_draft
+
+    lead = CandidateLead(
+        company_name="Ortho Dist", region="Europe", country="Germany", website="",
+        contact_name="Dr. Weber", email="w@ortho.example", category="distributor",
+        match_reason="", source="", score=80, lead_type="distributor",
+    )
+    draft = render_reply_draft(
+        lead,
+        reply_text="What is the price and can we get exclusive distribution?",
+        kind="holding",
+        original_subject="Skywalker partnership",
+    )
+    assert draft.subject.startswith("Re:")
+    body = draft.body.lower()
+    # A holding reply promises a follow-up but commits to nothing commercial.
+    assert "follow up" in body
+    assert not any(w in body for w in ("price", "exclusiv", "fda", "ce mark", "contract", "$"))
+
+
+def test_render_reply_draft_defaults_subject_without_original():
+    from app.services import CandidateLead, render_reply_draft
+
+    lead = CandidateLead(
+        company_name="Ortho Dist", region="Europe", country="Germany", website="",
+        contact_name="", email="w@ortho.example", category="distributor",
+        match_reason="", source="", score=80, lead_type="distributor",
+    )
+    draft = render_reply_draft(lead, reply_text="hi", kind="interested")
+    assert draft.subject.startswith("Re:")
+    assert draft.body  # a generic greeting is used when no contact name is known
+
+
 def test_render_followup_email_nudge_then_value_add():
     from app.services import CandidateLead, render_followup_email
 

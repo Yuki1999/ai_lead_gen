@@ -53,6 +53,22 @@ class ReplyAnalysisRequest(BaseModel):
     lead_id: int | None = None
 
 
+class ReplyDraftRequest(BaseModel):
+    """Human-composed reply to a prospect (e.g. from a 'needs_review' lead)."""
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=20000)
+    attach_brochure: bool = False
+    # "draft" saves for later approval; "send" queues it for delivery immediately.
+    action: str = Field(default="draft", pattern="^(draft|send)$")
+
+
+class DraftUpdateRequest(BaseModel):
+    """Edit a pending draft's content before it is sent."""
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=20000)
+    attach_brochure: bool | None = None
+
+
 class AgentChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     session_id: str | None = Field(default=None, max_length=160)

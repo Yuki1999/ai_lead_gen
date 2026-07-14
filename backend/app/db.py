@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS outreach_events (
     status TEXT NOT NULL,
     message_id TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'manual',
+    attach_brochure INTEGER NOT NULL DEFAULT 0,
     sent_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     FOREIGN KEY (lead_id) REFERENCES leads(id)
@@ -192,6 +193,9 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
     actor TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- Idempotent migration for DBs created before per-event brochure flags existed.
+ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS attach_brochure INTEGER NOT NULL DEFAULT 0;
 """
 
 # Tables in dependency order — used by reset_for_tests()'s TRUNCATE.
@@ -440,6 +444,11 @@ def update_lead(
         return get_lead(lead_id, connection=connection)
 
 
+# Outreach sources that are REPLIES to a prospect's inbound message (not first-touch
+# or follow-up cold outreach). Delivering one must not flip the lead to 'emailed'.
+_REPLY_SOURCES = {"reply_draft", "reply_manual"}
+
+
 def insert_outreach_event(
     lead_id: int,
     email: RenderedEmail,
@@ -447,18 +456,21 @@ def insert_outreach_event(
     status: str = "recorded",
     message_id: str = "",
     source: str = "manual",
+    attach_brochure: bool = False,
 ) -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, message_id, source, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO outreach_events (lead_id, subject, body, sent_to, region, status, message_id, source, attach_brochure, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            (lead_id, email.subject, email.body, email.sent_to, email.region, status, message_id, source, _now()),
+            (lead_id, email.subject, email.body, email.sent_to, email.region, status, message_id, source, int(attach_brochure), _now()),
         )
         event_id = _scalar(cursor)
-        if status == "sent":
+        # Replies keep the lead's reply-derived status (interested/human_review/…);
+        # only first-touch/follow-up cold outreach flips the lead to 'emailed'.
+        if status == "sent" and source not in _REPLY_SOURCES:
             connection.execute(
                 "UPDATE leads SET status = %s, updated_at = %s WHERE id = %s",
                 ("emailed", _now(), lead_id),
@@ -605,10 +617,13 @@ def mark_outreach_sent(event_id: int, *, message_id: str = "") -> dict[str, Any]
             "UPDATE outreach_events SET status = 'sent', message_id = %s, sent_at = %s WHERE id = %s",
             (message_id, now, event_id),
         )
-        connection.execute(
-            "UPDATE leads SET status = %s, updated_at = %s WHERE id = %s",
-            ("emailed", now, row["lead_id"]),
-        )
+        # A delivered REPLY must not reset the lead to 'emailed' — it stays in its
+        # reply-derived status (interested / human_review / needs_review).
+        if row["source"] not in _REPLY_SOURCES:
+            connection.execute(
+                "UPDATE leads SET status = %s, updated_at = %s WHERE id = %s",
+                ("emailed", now, row["lead_id"]),
+            )
         updated = connection.execute(
             "SELECT * FROM outreach_events WHERE id = %s", (event_id,)
         ).fetchone()
@@ -668,6 +683,69 @@ def reject_outreach_event(event_id: int) -> dict[str, Any] | None:
             "SELECT * FROM outreach_events WHERE id = %s", (event_id,)
         ).fetchone()
         return _row_to_dict(updated)
+
+
+def update_draft_event(
+    event_id: int,
+    *,
+    subject: str,
+    body: str,
+    attach_brochure: bool | None = None,
+) -> dict[str, Any] | None:
+    """Edit a pending draft's subject/body (and optionally the brochure flag) in
+    place. Only drafts can be edited; returns None if the event isn't a draft."""
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = %s AND status = 'draft'",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if attach_brochure is None:
+            connection.execute(
+                "UPDATE outreach_events SET subject = %s, body = %s WHERE id = %s",
+                (subject, body, event_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE outreach_events SET subject = %s, body = %s, attach_brochure = %s WHERE id = %s",
+                (subject, body, int(attach_brochure), event_id),
+            )
+        updated = connection.execute(
+            "SELECT * FROM outreach_events WHERE id = %s", (event_id,)
+        ).fetchone()
+        return _row_to_dict(updated)
+
+
+def has_pending_reply_draft(lead_id: int) -> bool:
+    """True if the lead already has a reply draft awaiting send (draft or queued),
+    so auto-generation doesn't pile up duplicate reply drafts on repeated syncs."""
+    with connect() as connection:
+        count = _scalar(connection.execute(
+            """
+            SELECT COUNT(*) FROM outreach_events
+            WHERE lead_id = %s
+              AND source IN ('reply_draft', 'reply_manual')
+              AND status IN ('draft', 'queued')
+            """,
+            (lead_id,),
+        ))
+    return int(count) > 0
+
+
+def latest_outreach_subject(lead_id: int) -> str | None:
+    """Subject of the lead's most recent first-touch/follow-up email, for building
+    a `Re: …` reply subject. Ignores prior replies."""
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT subject FROM outreach_events
+            WHERE lead_id = %s AND source NOT IN ('reply_draft', 'reply_manual')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (lead_id,),
+        ).fetchone()
+    return str(row["subject"]) if row else None
 
 
 def delete_lead(lead_id: int) -> bool:

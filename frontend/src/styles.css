@@ -1769,6 +1769,34 @@ textarea::placeholder {
   border-color: color-mix(in srgb, var(--warning) 28%, var(--border));
 }
 
+/* ── Reply handling (auto/human reply drafts + composer) ── */
+.ld-reply {
+  border: 1px solid color-mix(in srgb, var(--primary) 22%, var(--border));
+  border-radius: 12px; background: color-mix(in srgb, var(--primary) 4%, #fff);
+  padding: 14px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 10px;
+}
+.ld-reply-hint { margin: -4px 0 0; color: var(--text-muted); font-size: 12px; font-weight: 640; }
+.ld-reply-draft {
+  border: 1px solid var(--border); border-radius: 10px; background: #fff;
+  padding: 11px 13px; display: flex; flex-direction: column; gap: 8px;
+}
+.ld-reply-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ld-reply-head small { color: var(--text-muted); font-size: 11.5px; font-weight: 760; }
+.ld-reply-toggle {
+  margin-left: auto; border: none; background: none; cursor: pointer;
+  color: var(--primary); font-size: 12px; font-weight: 800; padding: 0;
+}
+.ld-reply-subject { color: var(--text); font-size: 13.5px; line-height: 1.35; }
+.ld-reply-preview { margin: 0; color: #334155; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; }
+.ld-reply-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ld-reply-compose { border: 1px dashed var(--border-strong); border-radius: 10px; padding: 10px 13px; background: #fff; }
+.ld-reply-compose > summary {
+  cursor: pointer; color: var(--primary); font-size: 12.5px; font-weight: 850;
+  list-style: none; user-select: none;
+}
+.ld-reply-compose > summary::-webkit-details-marker { display: none; }
+.ld-reply-compose > summary::before { content: "✎ "; }
+
 /* ── Interaction timeline (merged outreach + replies) ── */
 .ld-col-timeline { min-width: 0; }
 .ld-timeline { list-style: none; margin: 0; padding: 6px 0 0; position: relative; }

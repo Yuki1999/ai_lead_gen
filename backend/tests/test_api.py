@@ -522,6 +522,118 @@ def test_complex_reply_sets_human_review_status(tmp_path, monkeypatch):
     assert lead["status"] == "human_review"
 
 
+def _make_lead(client, **overrides) -> int:
+    payload = {
+        "company_name": "Reply Co", "region": "Europe", "country": "Germany",
+        "email": "r@reply.example", "score": 80,
+    }
+    payload.update(overrides)
+    return client.post("/leads", json=payload).json()["id"]
+
+
+def test_interested_reply_auto_drafts_reply_with_brochure(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "We are interested, who can we talk to?"})
+
+        drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
+        assert len(drafts) == 1
+        assert drafts[0]["status"] == "draft"
+        assert bool(drafts[0]["attach_brochure"]) is True
+        # Auto-drafting must not change the reply-derived status.
+        assert db.get_lead(lid)["status"] == "interested"
+
+
+def test_human_review_reply_auto_drafts_holding_no_brochure(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="complex", requires_human=True)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "What is the price and exclusivity?"})
+
+        drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
+        assert len(drafts) == 1
+        assert bool(drafts[0]["attach_brochure"]) is False
+        assert db.get_lead(lid)["status"] == "human_review"
+
+
+def test_rejected_and_needs_review_replies_create_no_draft(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="rejected", requires_human=False)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Not interested, no fit."})
+        assert [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"] == []
+
+
+def test_reply_draft_not_duplicated_on_repeated_analysis(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Interested!"})
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Still interested!"})
+        drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
+        assert len(drafts) == 1
+
+
+def test_manual_reply_endpoint_drafts_and_sends(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        lid = _make_lead(client)
+        # Save a manual reply draft.
+        r1 = client.post(f"/leads/{lid}/reply", json={"subject": "Re: Hello", "body": "Manual reply body.", "action": "draft"})
+        assert r1.status_code == 201 and r1.json()["queued"] is False
+        drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_manual"]
+        assert len(drafts) == 1 and drafts[0]["status"] == "draft"
+
+        # Queue one for delivery.
+        r2 = client.post(f"/leads/{lid}/reply", json={"subject": "Re: Hello 2", "body": "Send this now.", "action": "send"})
+        assert r2.json()["queued"] is True
+        queued = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_manual" and e["status"] == "queued"]
+        assert len(queued) == 1
+
+
+def test_edit_draft_updates_content(tmp_path, monkeypatch):
+    from app import db
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Interested!"})
+        draft = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"][0]
+
+        resp = client.put(f"/campaigns/drafts/{draft['id']}", json={"subject": "Re: edited", "body": "Edited body.", "attach_brochure": False})
+        assert resp.status_code == 200
+        updated = db.list_outreach_events(lid)[0]
+        assert updated["subject"] == "Re: edited"
+        assert updated["body"] == "Edited body."
+        assert bool(updated["attach_brochure"]) is False
+
+
+def test_delivered_reply_keeps_lead_status(tmp_path, monkeypatch):
+    """A reply's delivery must NOT reset an interested/human_review lead to emailed."""
+    from app import db
+    from app.services import RenderedEmail
+
+    with _client(tmp_path, monkeypatch) as client:
+        lid = _make_lead(client)
+        db.update_lead(lid, status="interested")
+        ev = db.insert_outreach_event(
+            lid, RenderedEmail(sent_to="r@reply.example", subject="Re: x", body="b", region="Europe"),
+            status="queued", source="reply_draft",
+        )
+        db.mark_outreach_sent(int(ev["id"]))
+        assert db.get_lead(lid)["status"] == "interested"
+
+
 def test_reply_analysis_errors_without_llm(tmp_path, monkeypatch):
     # No LLM configured (AGENT_ENV_PATH isolated by fixture): the endpoint must
     # error rather than fall back to keyword rules.

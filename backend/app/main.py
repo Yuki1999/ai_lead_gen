@@ -40,12 +40,14 @@ from app.schemas import (
     AgentChatRequest,
     AgentChatResponse,
     ChangePasswordRequest,
+    DraftUpdateRequest,
     EmailTestRequest,
     LeadCreateRequest,
     LeadUpdateRequest,
     LoginRequest,
     OutreachRequest,
     ReplyAnalysisRequest,
+    ReplyDraftRequest,
     ResetPasswordRequest,
     RoleCreateRequest,
     RoleUpdateRequest,
@@ -70,6 +72,7 @@ from app.services import (
     generate_candidate_leads,
     render_email,
     render_followup_email,
+    render_reply_draft,
 )
 from app.web_search import SearchProviderError, discover_real_prospects, fetch_source_preview, search_web
 
@@ -752,6 +755,54 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="Draft not found")
         return {"ok": True, "event": event}
 
+    @app.put("/campaigns/drafts/{event_id}", dependencies=[Depends(require("outreach.send"))])
+    def edit_draft(event_id: int, request: DraftUpdateRequest) -> dict[str, object]:
+        """Edit a pending draft's subject/body (and optionally its brochure flag)
+        before it is approved and sent."""
+        event = db.update_draft_event(
+            event_id,
+            subject=request.subject,
+            body=request.body,
+            attach_brochure=request.attach_brochure,
+        )
+        if event is None:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return {"ok": True, "event": event}
+
+    @app.post("/leads/{lead_id}/reply", status_code=201)
+    def compose_reply(lead_id: int, request: ReplyDraftRequest, principal: Principal = Depends(require("outreach.send"))) -> dict[str, object]:
+        """Human-composed reply to a prospect. `action='draft'` saves it for later
+        approval; `action='send'` queues it for throttled delivery now. Either way
+        it is a REPLY (source 'reply_manual'): delivery keeps the lead's current
+        reply-derived status rather than resetting it to 'emailed'."""
+        lead = db.get_lead(lead_id)
+        if lead is None:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        to = str(lead.get("email", "")).strip()
+        if not to:
+            raise HTTPException(status_code=400, detail="该线索没有邮箱地址")
+
+        rendered = RenderedEmail(
+            sent_to=to, subject=request.subject, body=request.body,
+            region=str(lead.get("region", "")),
+        )
+        if request.action == "send":
+            if db.is_suppressed(to):
+                raise HTTPException(status_code=400, detail="收件人已退订/在抑制名单，未发送")
+            event = db.insert_outreach_event(
+                lead_id, rendered, status="queued", source="reply_manual",
+                attach_brochure=request.attach_brochure,
+            )
+            db.add_audit(actor=principal.username, action="reply.send", target_type="lead", target_id=lead_id, detail=to)
+            return {"ok": True, "event": event, "queued": True, "note": "已加入发送队列，将按节流速率发出。"}
+
+        event = db.insert_outreach_event(
+            lead_id, rendered, status="draft", source="reply_manual",
+            attach_brochure=request.attach_brochure,
+        )
+        db.add_audit(actor=principal.username, action="reply.draft", target_type="lead", target_id=lead_id, detail=to)
+        return {"ok": True, "event": event, "queued": False}
+
     @app.post("/campaigns/drafts/approve-all")
     def approve_all_drafts(
         principal: Principal = Depends(require("outreach.send")),
@@ -1000,6 +1051,8 @@ def create_app() -> FastAPI:
                 analysis=analysis,
                 message_id=reply.message_id,
             )
+            # Auto-draft a reply for interested / human-review intents (manual send).
+            drafted = _maybe_create_reply_draft(matched_lead, reply.body, analysis) if not is_auto else False
 
             synced.append({
                 "lead_id": lead_id,
@@ -1009,6 +1062,7 @@ def create_app() -> FastAPI:
                 "intent": analysis.intent,
                 "confidence": analysis.confidence,
                 "auto_reply": is_auto,
+                "reply_drafted": drafted,
                 "analysis_id": record["id"],
             })
 
@@ -1038,11 +1092,16 @@ def create_app() -> FastAPI:
                 request.lead_id,
                 status=_status_for_intent(analysis.intent, analysis.requires_human),
             )
-        return db.insert_reply_analysis(
+        record = db.insert_reply_analysis(
             lead_id=request.lead_id,
             reply_text=request.reply_text,
             analysis=analysis,
         )
+        if request.lead_id is not None:
+            lead_rec = db.get_lead(request.lead_id)
+            if lead_rec is not None:
+                _maybe_create_reply_draft(lead_rec, request.reply_text, analysis)
+        return record
 
     @app.get("/settings", dependencies=[Depends(require("settings.manage"))])
     def get_settings() -> dict[str, object]:
@@ -1259,11 +1318,14 @@ def _dispatch_due_email() -> bool:
         if domain and db.count_sent_since(today, domain=domain) >= cfg["per_domain_cap"]:
             continue  # this domain hit its daily cap; try another recipient
 
+        # Attach the brochure when this event asks for it (reply drafts to interested
+        # prospects always do) or when the global default is on.
+        attach = bool(event.get("attach_brochure")) or db.get_setting("attach_brochure", "false") == "true"
         result = send_email(
             to=to,
             subject=str(event["subject"]),
             body=str(event["body"]),
-            attach_brochure=db.get_setting("attach_brochure", "false") == "true",
+            attach_brochure=attach,
         )
         if result.success:
             db.mark_outreach_sent(int(event["id"]), message_id=result.message_id)
@@ -1319,12 +1381,20 @@ async def _auto_sync_loop() -> None:
                                     int(matched["id"]),
                                     status=_status_for_intent(analysis.intent, analysis.requires_human),
                                 )
+                                # Mirror the manual sync endpoint: an explicit
+                                # opt-out suppresses the address here too.
+                                if analysis.opt_out and reply.sender_email:
+                                    addr = reply.sender_email.lower()
+                                    db.add_suppression(addr, reason="reply-optout", source="inbox")
+                                    db.add_audit(actor="system", action="suppression.add", target_type="email", target_id=addr, detail="reply-optout")
                             db.insert_reply_analysis(
                                 lead_id=int(matched["id"]),
                                 reply_text=reply.body,
                                 analysis=analysis,
                                 message_id=reply.message_id,
                             )
+                            if not is_auto:
+                                _maybe_create_reply_draft(matched, reply.body, analysis)
                             synced += 1
                 if synced:
                     _logger.info("Auto-sync: synced %d new replies", synced)
@@ -1547,6 +1617,45 @@ def _is_auto_reply(subject: str, body: str) -> bool:
         "will not have access to email",
     ]
     return any(ind in lowered for ind in indicators)
+
+
+def _maybe_create_reply_draft(lead_record: dict[str, object], reply_text: str, analysis: object) -> bool:
+    """After a reply is classified, auto-generate a REPLY draft for a human to
+    review and send — for INTERESTED replies (warm, product brochure attached) and
+    HUMAN-REVIEW replies (conservative holding note, no commitments). Never for
+    rejected / needs_review. Sending always stays manual. Returns True if a draft
+    was created (False if the intent isn't draftable or one is already pending)."""
+    if getattr(analysis, "requires_human", False):
+        kind = "holding"
+    elif getattr(analysis, "intent", "") == "interested":
+        kind = "interested"
+    else:
+        return False
+
+    lead_id = int(lead_record["id"])
+    if db.has_pending_reply_draft(lead_id):
+        return False
+    full = db.get_lead(lead_id) or lead_record
+    try:
+        rendered = render_reply_draft(
+            _lead_from_record(full),
+            reply_text=reply_text,
+            kind=kind,
+            original_subject=db.latest_outreach_subject(lead_id),
+        )
+    except Exception:
+        _logger.exception("Reply-draft generation failed for lead %s", lead_id)
+        return False
+
+    db.insert_outreach_event(
+        lead_id, rendered, status="draft", source="reply_draft",
+        attach_brochure=(kind == "interested"),
+    )
+    db.add_audit(
+        actor="system", action="reply_draft.created",
+        target_type="lead", target_id=lead_id, detail=kind,
+    )
+    return True
 
 
 def _status_for_intent(intent: str, requires_human: bool) -> str:

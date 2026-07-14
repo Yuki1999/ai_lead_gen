@@ -143,6 +143,7 @@ interface EmailEvent {
   created_at?: string;
   message_id?: string;
   source?: string;
+  attach_brochure?: number | boolean;
   company_name?: string;
   country?: string;
 }
@@ -622,6 +623,14 @@ const detailNotes = ref("");
 const detailOutreach = ref<EmailEvent[]>([]);
 const detailReplies = ref<ReplyAnalysis[]>([]);
 const detailLoading = ref(false);
+// Reply handling (detail modal): AI/human reply DRAFTS awaiting a manual send,
+// plus an inline "write a reply" composer. Sending is always a human action.
+const replyEdits = reactive<Record<number, { subject: string; body: string; attach: boolean; open: boolean }>>({});
+const replyBusy = ref<number | null>(null);
+const composeSubject = ref("");
+const composeBody = ref("");
+const composeAttach = ref(false);
+const composeBusy = ref(false);
 // Manual "paste a reply and analyze it" for the open lead (detail modal).
 const agentPrompt = ref("");
 const agentSessionId = ref("default");
@@ -1467,12 +1476,44 @@ const detailInitials = computed(() => {
 type TimelineItem =
   | { key: string; kind: "outreach"; at: string; ev: EmailEvent }
   | { key: string; kind: "reply"; at: string; r: ReplyAnalysis };
+const _REPLY_SOURCES = ["reply_draft", "reply_manual"];
+function _isReplyDraft(ev: EmailEvent): boolean {
+  return _REPLY_SOURCES.includes(ev.source || "") && ev.status === "draft";
+}
+
+// Pending reply drafts (auto-generated or human-composed) awaiting a manual send.
+// These get their own actionable card, so they're kept OUT of the read-only timeline.
+const replyDrafts = computed<EmailEvent[]>(() =>
+  detailOutreach.value.filter(_isReplyDraft)
+);
+
+// The reply card shows for any non-rejected lead that has a conversation
+// (a reply arrived, or a reply draft is pending, or an email was sent).
+const showReplyCard = computed<boolean>(() => {
+  const lead = detailLead.value;
+  if (!lead || lead.status === "rejected") return false;
+  return (
+    detailReplies.value.length > 0 ||
+    replyDrafts.value.length > 0 ||
+    ["emailed", "interested", "human_review", "needs_review"].includes(lead.status)
+  );
+});
+
 const detailTimeline = computed<TimelineItem[]>(() => {
   const items: TimelineItem[] = [];
-  for (const ev of detailOutreach.value) items.push({ key: `o${ev.id}`, kind: "outreach", at: ev.created_at || "", ev });
+  // Pending reply drafts live in the reply card, not the read-only timeline.
+  for (const ev of detailOutreach.value) {
+    if (_isReplyDraft(ev)) continue;
+    items.push({ key: `o${ev.id}`, kind: "outreach", at: ev.created_at || "", ev });
+  }
   for (const r of detailReplies.value) items.push({ key: `r${r.id}`, kind: "reply", at: r.created_at || "", r });
   return items.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
 });
+
+function replyDraftKind(ev: EmailEvent): string {
+  if (ev.source === "reply_manual") return "手动回复";
+  return "AI 自动草稿";
+}
 
 function outreachStatusMeta(s: string): { label: string; type: "success" | "error" | "warning" | "info" | "default" } {
   switch (s) {
@@ -1485,13 +1526,7 @@ function outreachStatusMeta(s: string): { label: string; type: "success" | "erro
   }
 }
 
-async function openLeadDetail(leadId: number): Promise<void> {
-  detailLeadId.value = leadId;
-  detailLoading.value = true;
-  const lead = leads.value.find((l) => l.id === leadId);
-  detailStatus.value = lead?.status ?? "";
-  detailLeadType.value = lead?.lead_type ?? "";
-  detailNotes.value = lead?.notes ?? "";
+async function reloadLeadHistory(leadId: number): Promise<void> {
   try {
     const history = await request<{
       lead: Lead;
@@ -1500,11 +1535,130 @@ async function openLeadDetail(leadId: number): Promise<void> {
     }>(`/leads/${leadId}/history`);
     detailOutreach.value = history.outreach_events;
     detailReplies.value = history.reply_analyses;
+    // Seed editable copies for any pending reply drafts.
+    for (const key of Object.keys(replyEdits)) delete replyEdits[Number(key)];
+    for (const ev of detailOutreach.value) {
+      if (_isReplyDraft(ev)) {
+        replyEdits[ev.id] = {
+          subject: ev.subject,
+          body: ev.body,
+          attach: Boolean(ev.attach_brochure),
+          open: false,
+        };
+      }
+    }
   } catch {
     detailOutreach.value = [];
     detailReplies.value = [];
+  }
+}
+
+async function openLeadDetail(leadId: number): Promise<void> {
+  detailLeadId.value = leadId;
+  detailLoading.value = true;
+  const lead = leads.value.find((l) => l.id === leadId);
+  detailStatus.value = lead?.status ?? "";
+  detailLeadType.value = lead?.lead_type ?? "";
+  detailNotes.value = lead?.notes ?? "";
+  // Reset the composer for the newly-opened lead.
+  composeBody.value = "";
+  composeAttach.value = false;
+  try {
+    await reloadLeadHistory(leadId);
+    const latest = detailOutreach.value.find((e) => !_REPLY_SOURCES.includes(e.source || ""));
+    const base = latest?.subject || "";
+    composeSubject.value = base
+      ? (base.toLowerCase().startsWith("re:") ? base : `Re: ${base}`)
+      : "Re: ";
   } finally {
     detailLoading.value = false;
+  }
+}
+
+async function saveReplyDraft(id: number): Promise<void> {
+  const edit = replyEdits[id];
+  if (!edit) return;
+  replyBusy.value = id;
+  try {
+    await request(`/campaigns/drafts/${id}`, {
+      method: "PUT",
+      body: JSON.stringify({ subject: edit.subject, body: edit.body, attach_brochure: edit.attach }),
+    });
+    message.success("草稿已保存");
+    if (detailLeadId.value !== null) await reloadLeadHistory(detailLeadId.value);
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : "保存失败");
+  } finally {
+    replyBusy.value = null;
+  }
+}
+
+async function sendReplyDraft(id: number): Promise<void> {
+  const edit = replyEdits[id];
+  replyBusy.value = id;
+  try {
+    // Persist any inline edits before sending.
+    if (edit) {
+      await request(`/campaigns/drafts/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ subject: edit.subject, body: edit.body, attach_brochure: edit.attach }),
+      });
+    }
+    const res = await request<{ ok: boolean; error?: string }>(`/campaigns/drafts/${id}/approve`, { method: "POST" });
+    if (res.ok === false) {
+      message.warning(res.error || "未发送");
+    } else {
+      message.success("回信已加入发送队列");
+    }
+    if (detailLeadId.value !== null) await reloadLeadHistory(detailLeadId.value);
+    await loadDashboard();
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : "发送失败");
+  } finally {
+    replyBusy.value = null;
+  }
+}
+
+async function rejectReplyDraft(id: number): Promise<void> {
+  replyBusy.value = id;
+  try {
+    await request(`/campaigns/drafts/${id}/reject`, { method: "POST" });
+    message.success("草稿已丢弃");
+    if (detailLeadId.value !== null) await reloadLeadHistory(detailLeadId.value);
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : "操作失败");
+  } finally {
+    replyBusy.value = null;
+  }
+}
+
+async function composeReply(action: "draft" | "send"): Promise<void> {
+  const id = detailLeadId.value;
+  if (id === null) return;
+  if (!composeSubject.value.trim() || !composeBody.value.trim()) {
+    message.warning("请填写主题和正文");
+    return;
+  }
+  composeBusy.value = true;
+  try {
+    const res = await request<{ queued: boolean }>(`/leads/${id}/reply`, {
+      method: "POST",
+      body: JSON.stringify({
+        subject: composeSubject.value,
+        body: composeBody.value,
+        attach_brochure: composeAttach.value,
+        action,
+      }),
+    });
+    message.success(res.queued ? "回信已加入发送队列" : "回信已存为草稿");
+    composeBody.value = "";
+    composeAttach.value = false;
+    await reloadLeadHistory(id);
+    await loadDashboard();
+  } catch (caught) {
+    message.error(caught instanceof Error ? caught.message : "操作失败");
+  } finally {
+    composeBusy.value = false;
   }
 }
 
@@ -3400,6 +3554,58 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div class="ld-col ld-col-timeline">
+                  <div v-if="showReplyCard" class="ld-reply">
+                    <p class="ld-card-title">回复处理</p>
+                    <p class="ld-reply-hint">AI 自动生成回信草稿，发送由人工确认。</p>
+
+                    <div v-for="d in replyDrafts" :key="d.id" class="ld-reply-draft">
+                      <div class="ld-reply-head">
+                        <n-tag size="small" round :bordered="false" :type="d.source === 'reply_manual' ? 'info' : 'warning'">
+                          {{ replyDraftKind(d) }}
+                        </n-tag>
+                        <n-tag v-if="replyEdits[d.id]?.attach" size="small" round :bordered="false" type="success">带彩页</n-tag>
+                        <small>待人工发送</small>
+                        <button
+                          v-if="replyEdits[d.id]"
+                          class="ld-reply-toggle"
+                          type="button"
+                          @click="replyEdits[d.id].open = !replyEdits[d.id].open"
+                        >{{ replyEdits[d.id].open ? '收起' : '编辑' }}</button>
+                      </div>
+                      <template v-if="replyEdits[d.id]">
+                        <template v-if="replyEdits[d.id].open">
+                          <n-input v-model:value="replyEdits[d.id].subject" size="small" placeholder="主题" style="margin-bottom: 6px" />
+                          <n-input v-model:value="replyEdits[d.id].body" type="textarea" :autosize="{ minRows: 4, maxRows: 14 }" placeholder="正文" />
+                          <label class="toggle-field" style="margin-top: 6px"><n-checkbox v-model:checked="replyEdits[d.id].attach">附带产品彩页 PDF</n-checkbox></label>
+                        </template>
+                        <template v-else>
+                          <strong class="ld-reply-subject">{{ replyEdits[d.id].subject }}</strong>
+                          <p class="ld-reply-preview">{{ replyEdits[d.id].body.slice(0, 220) }}{{ replyEdits[d.id].body.length > 220 ? '…' : '' }}</p>
+                        </template>
+                      </template>
+                      <div class="ld-reply-actions">
+                        <n-button size="small" type="primary" class="primary-button" :loading="replyBusy === d.id" @click="sendReplyDraft(d.id)">
+                          <template #icon><n-icon><Send /></n-icon></template>发送
+                        </n-button>
+                        <n-button v-if="replyEdits[d.id]?.open" size="small" secondary :loading="replyBusy === d.id" @click="saveReplyDraft(d.id)">保存</n-button>
+                        <n-button size="small" secondary class="danger-action" :loading="replyBusy === d.id" @click="rejectReplyDraft(d.id)">丢弃</n-button>
+                      </div>
+                    </div>
+
+                    <details class="ld-reply-compose">
+                      <summary>写回复</summary>
+                      <n-input v-model:value="composeSubject" size="small" placeholder="主题" style="margin: 6px 0" />
+                      <n-input v-model:value="composeBody" type="textarea" :autosize="{ minRows: 4, maxRows: 14 }" placeholder="输入回复正文…" />
+                      <label class="toggle-field" style="margin-top: 6px"><n-checkbox v-model:checked="composeAttach">附带产品彩页 PDF</n-checkbox></label>
+                      <div class="ld-reply-actions">
+                        <n-button size="small" type="primary" class="primary-button" :loading="composeBusy" @click="composeReply('send')">
+                          <template #icon><n-icon><Send /></n-icon></template>发送
+                        </n-button>
+                        <n-button size="small" secondary :loading="composeBusy" @click="composeReply('draft')">存草稿</n-button>
+                      </div>
+                    </details>
+                  </div>
+
                   <p class="ld-card-title">互动记录</p>
                   <div v-if="detailLoading" class="ld-empty">加载中…</div>
                   <div v-else-if="detailTimeline.length === 0" class="ld-empty">

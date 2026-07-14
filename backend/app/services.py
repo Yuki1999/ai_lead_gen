@@ -764,6 +764,216 @@ def auto_reply_analysis() -> ReplyAnalysis:
     )
 
 
+def _call_content_llm(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    source: str,
+    max_tokens: int = 700,
+    temperature: float = 0.5,
+) -> str | None:
+    """Single-shot call to the configured content agent. Returns the raw message
+    content, or None on any failure. Mirrors _try_ai_email's provider resolution."""
+    try:
+        resolved = resolve_content_ai()
+        if resolved is None:
+            return None
+        provider, api_key, model = resolved
+        if provider == "deepseek":
+            api_url = "https://api.deepseek.com/v1/chat/completions"
+            if "v4" in model or "pro" in model:
+                model = "deepseek-chat"
+        elif provider == "openai":
+            api_url = "https://api.openai.com/v1/chat/completions"
+        elif provider in ("bailian", "dashscope", "qwen"):
+            api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        else:
+            api_url = "https://api.deepseek.com/v1/chat/completions"
+            model = "deepseek-chat"
+
+        import requests
+        resp = requests.post(
+            api_url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            },
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        _record_llm_usage(source=source, provider=provider, model=model, data=data)
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return None
+
+
+def _reply_system_prompt(lang: str, kind: str) -> str:
+    lang_clause = (
+        "Write the reply in fluent professional Chinese."
+        if lang == "cn"
+        else "Write the reply in fluent professional English."
+    )
+    signature = SIGNATURE_CN if lang == "cn" else SIGNATURE_EN
+    if kind == "holding":
+        task = (
+            "The prospect's reply raises a SENSITIVE commercial or regulatory topic "
+            "(price / quote / budget, exclusive distribution, product registration / "
+            "certification / FDA / CE, tender / bidding, contract / terms, payment, "
+            "clinical efficacy, or a demo/trial unit). You MUST NOT answer it or commit "
+            "to ANY figure, price, timeline, certification, exclusivity, or contract term. "
+            "Write only a brief, warm acknowledgement that you have noted the point they "
+            "raised and that a dedicated colleague from our team will follow up with them "
+            "shortly to address it properly. 3-5 sentences."
+        )
+    else:  # interested
+        task = (
+            "The prospect expressed interest in our outreach. Write a warm, concise reply "
+            "that thanks them for their reply, briefly reaffirms the value of the MEDBOT "
+            "Skywalker orthopedic surgical robot, tells them our product brochure is "
+            "attached to this email for their reference, and invites them to reply so a "
+            "dedicated colleague can follow up. Do NOT discuss price, certification, "
+            "exclusivity, or contract terms. 4-6 sentences."
+        )
+    return (
+        "You are the MEDBOT Skywalker overseas sales assistant, writing a REPLY to a "
+        "prospect who answered our outreach email. "
+        f"{task} {lang_clause} End the message with this exact signature on its own lines:\n"
+        f"{signature}\n"
+        "Never invent clinical claims, pricing, regulatory status, or facts about the "
+        "recipient. Return ONLY a JSON object with a single 'body' field (the full email "
+        "body including greeting and signature)."
+    )
+
+
+def _build_reply_prompt(lead: CandidateLead, *, reply_text: str, lang: str) -> str:
+    market = lead.country or lead.region
+    name = lead.contact_name or "(unknown — use a polite generic greeting)"
+    return (
+        f"Recipient name: {name}\n"
+        f"Organization: {lead.company_name}\n"
+        f"Target market: {market}\n\n"
+        "The prospect's reply to our outreach (verbatim, may be in any language):\n"
+        f"\"\"\"\n{reply_text.strip()[:1500]}\n\"\"\"\n\n"
+        "Write our reply now."
+    )
+
+
+def _render_template_reply(
+    lead: CandidateLead, *, kind: str, lang: str, subject: str, name: str
+) -> RenderedEmail:
+    """Deterministic reply used when the content LLM is unavailable or rejected."""
+    if kind == "holding":
+        if lang == "cn":
+            body = (
+                f"尊敬的 {name}：\n\n"
+                "感谢您的回复。您所提到的事项我们已经记录，我们将安排专人尽快与您对接、妥善跟进。\n\n"
+                "感谢您的关注与宝贵时间。\n\n"
+                f"此致\n{SIGNATURE_CN}"
+            )
+        else:
+            body = (
+                f"Dear {name},\n\n"
+                "Thank you for your reply. We've noted the points you raised, and a dedicated "
+                "colleague from our team will follow up with you shortly to address them properly.\n\n"
+                "We appreciate your interest and your time.\n\n"
+                f"Best regards,\n{SIGNATURE_EN}"
+            )
+    else:  # interested
+        if lang == "cn":
+            body = (
+                f"尊敬的 {name}：\n\n"
+                "感谢您的回复，以及对 MEDBOT NaviBot Skywalker 骨科手术机器人的关注。"
+                "随信附上我们的产品彩页，供您进一步了解该系统。\n\n"
+                "我们很乐意安排专人与您对接，解答任何疑问——您只需回复本邮件即可。\n\n"
+                "再次感谢您的时间。\n\n"
+                f"此致\n{SIGNATURE_CN}"
+            )
+        else:
+            body = (
+                f"Dear {name},\n\n"
+                "Thank you for your reply and for your interest in the MEDBOT NaviBot Skywalker "
+                "orthopedic surgical robot. I've attached our product brochure so you can review "
+                "the system in more detail.\n\n"
+                "We would be glad to have a dedicated colleague follow up and answer any questions "
+                "you may have — simply reply to this email and we'll take it from there.\n\n"
+                "Thank you again for your time.\n\n"
+                f"Best regards,\n{SIGNATURE_EN}"
+            )
+    return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
+
+
+def _try_ai_reply(
+    lead: CandidateLead, *, reply_text: str, kind: str, lang: str, subject: str
+) -> RenderedEmail | None:
+    content = _call_content_llm(
+        _reply_system_prompt(lang, kind),
+        _build_reply_prompt(lead, reply_text=reply_text, lang=lang),
+        source="reply_draft",
+        max_tokens=700,
+    )
+    if not content:
+        return None
+    import json, re
+    stripped = re.sub(r"^```(?:json)?\s*", "", content)
+    stripped = re.sub(r"\s*```$", "", stripped)
+    try:
+        body = str(json.loads(stripped).get("body", "")).strip()
+    except Exception:
+        body = content.strip()
+    if not body:
+        return None
+    market = lead.country or lead.region or ("目标市场" if lang == "cn" else "your market")
+    name = lead.contact_name or ("您好" if lang == "cn" else "Sir/Madam")
+    for placeholder, value in (
+        ("[Name]", name), ("[name]", name),
+        ("[Target Market]", market), ("[target market]", market),
+    ):
+        body = body.replace(placeholder, value)
+    if _PLACEHOLDER_RE.search(body):
+        return None
+    return RenderedEmail(sent_to=lead.email, subject=subject, body=body, region=lead.region)
+
+
+def render_reply_draft(
+    lead: CandidateLead,
+    *,
+    reply_text: str,
+    kind: str,
+    original_subject: str | None = None,
+) -> RenderedEmail:
+    """Draft a REPLY to a prospect's inbound message (never auto-sent).
+
+    ``kind``:
+      - ``"interested"`` — warm reply acknowledging interest; references the product
+        brochure attached to the email; offers to connect a dedicated colleague.
+      - ``"holding"`` — conservative acknowledgement for replies that touch
+        human-review topics (price/contract/exclusivity/registration): notes the
+        point and promises a colleague will follow up, WITHOUT committing to any
+        figure or term.
+
+    AI-first with a deterministic template fallback. The subject is a ``Re:`` of the
+    lead's most recent outreach subject when available."""
+    lang = _email_language(lead)
+    name = lead.contact_name or ("您好" if lang == "cn" else "Sir/Madam")
+    base = original_subject or _email_subject(
+        infer_lead_type(lead), lang, lead.country or lead.region
+    )
+    subject = base if base.lower().startswith("re:") else f"Re: {base}"
+
+    ai = _try_ai_reply(lead, reply_text=reply_text, kind=kind, lang=lang, subject=subject)
+    if ai is not None:
+        return ai
+    return _render_template_reply(lead, kind=kind, lang=lang, subject=subject, name=name)
+
+
 def analyze_reply(reply_text: str) -> ReplyAnalysis:
     """Classify a prospect reply's intent using the LLM.
 
