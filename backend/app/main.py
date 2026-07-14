@@ -84,10 +84,11 @@ def create_app() -> FastAPI:
         bg_task = asyncio.create_task(_auto_sync_loop())
         send_task = asyncio.create_task(_send_dispatch_loop())
         followup_task = asyncio.create_task(_followup_loop())
+        reply_draft_task = asyncio.create_task(_reply_draft_loop())
         try:
             yield
         finally:
-            for task in (bg_task, send_task, followup_task):
+            for task in (bg_task, send_task, followup_task, reply_draft_task):
                 task.cancel()
                 try:
                     await task
@@ -1045,14 +1046,16 @@ def create_app() -> FastAPI:
                     db.add_suppression(sender, reason="reply-optout", source="inbox")
                     db.add_audit(actor="system", action="suppression.add", target_type="email", target_id=sender, detail="reply-optout")
                     opted_out.append(sender)
+            # Flag interested / human-review replies for background reply-draft
+            # generation (kept off the request path so sync stays fast).
+            will_draft = (not is_auto) and _reply_needs_draft(lead_id, analysis)
             record = db.insert_reply_analysis(
                 lead_id=lead_id,
                 reply_text=reply.body,
                 analysis=analysis,
                 message_id=reply.message_id,
+                draft_pending=will_draft,
             )
-            # Auto-draft a reply for interested / human-review intents (manual send).
-            drafted = _maybe_create_reply_draft(matched_lead, reply.body, analysis) if not is_auto else False
 
             synced.append({
                 "lead_id": lead_id,
@@ -1062,7 +1065,7 @@ def create_app() -> FastAPI:
                 "intent": analysis.intent,
                 "confidence": analysis.confidence,
                 "auto_reply": is_auto,
-                "reply_drafted": drafted,
+                "reply_drafted": will_draft,
                 "analysis_id": record["id"],
             })
 
@@ -1087,21 +1090,19 @@ def create_app() -> FastAPI:
             analysis = analyze_reply(request.reply_text)
         except ReplyAnalysisError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        will_draft = False
         if request.lead_id is not None:
             db.update_lead(
                 request.lead_id,
                 status=_status_for_intent(analysis.intent, analysis.requires_human),
             )
-        record = db.insert_reply_analysis(
+            will_draft = _reply_needs_draft(request.lead_id, analysis)
+        return db.insert_reply_analysis(
             lead_id=request.lead_id,
             reply_text=request.reply_text,
             analysis=analysis,
+            draft_pending=will_draft,
         )
-        if request.lead_id is not None:
-            lead_rec = db.get_lead(request.lead_id)
-            if lead_rec is not None:
-                _maybe_create_reply_draft(lead_rec, request.reply_text, analysis)
-        return record
 
     @app.get("/settings", dependencies=[Depends(require("settings.manage"))])
     def get_settings() -> dict[str, object]:
@@ -1387,14 +1388,14 @@ async def _auto_sync_loop() -> None:
                                     addr = reply.sender_email.lower()
                                     db.add_suppression(addr, reason="reply-optout", source="inbox")
                                     db.add_audit(actor="system", action="suppression.add", target_type="email", target_id=addr, detail="reply-optout")
+                            will_draft = (not is_auto) and _reply_needs_draft(int(matched["id"]), analysis)
                             db.insert_reply_analysis(
                                 lead_id=int(matched["id"]),
                                 reply_text=reply.body,
                                 analysis=analysis,
                                 message_id=reply.message_id,
+                                draft_pending=will_draft,
                             )
-                            if not is_auto:
-                                _maybe_create_reply_draft(matched, reply.body, analysis)
                             synced += 1
                 if synced:
                     _logger.info("Auto-sync: synced %d new replies", synced)
@@ -1619,43 +1620,77 @@ def _is_auto_reply(subject: str, body: str) -> bool:
     return any(ind in lowered for ind in indicators)
 
 
-def _maybe_create_reply_draft(lead_record: dict[str, object], reply_text: str, analysis: object) -> bool:
-    """After a reply is classified, auto-generate a REPLY draft for a human to
-    review and send — for INTERESTED replies (warm, product brochure attached) and
-    HUMAN-REVIEW replies (conservative holding note, no commitments). Never for
-    rejected / needs_review. Sending always stays manual. Returns True if a draft
-    was created (False if the intent isn't draftable or one is already pending)."""
-    if getattr(analysis, "requires_human", False):
-        kind = "holding"
-    elif getattr(analysis, "intent", "") == "interested":
-        kind = "interested"
-    else:
-        return False
+def _reply_draft_kind(intent: str, requires_human: bool) -> str | None:
+    """Which auto reply-draft (if any) a classified reply warrants.
+      - "interested": warm reply + brochure.
+      - "holding": conservative acknowledgement for human-review topics.
+      - None: rejected / needs_review → no auto-draft."""
+    if requires_human:
+        return "holding"
+    if intent == "interested":
+        return "interested"
+    return None
 
-    lead_id = int(lead_record["id"])
-    if db.has_pending_reply_draft(lead_id):
+
+def _reply_needs_draft(lead_id: int, analysis: object) -> bool:
+    """True if this classified reply should be flagged for background reply-draft
+    generation — i.e. it's a draftable intent and the lead has none pending yet."""
+    kind = _reply_draft_kind(getattr(analysis, "intent", ""), getattr(analysis, "requires_human", False))
+    if kind is None:
         return False
-    full = db.get_lead(lead_id) or lead_record
-    try:
-        rendered = render_reply_draft(
-            _lead_from_record(full),
-            reply_text=reply_text,
-            kind=kind,
-            original_subject=db.latest_outreach_subject(lead_id),
+    return not db.has_pending_reply_draft(lead_id)
+
+
+def _generate_pending_reply_drafts(limit: int = 5) -> int:
+    """Background worker step: turn draft-flagged replies into reply DRAFTS a human
+    can review and send. Generation is off the request path so reply classification
+    (and the sync endpoint) return fast; render_reply_draft falls back to a template
+    when the LLM is slow/unavailable, so a draft is always produced. Returns count."""
+    made = 0
+    for a in db.reply_analyses_awaiting_draft(limit=limit):
+        aid = int(a["id"])
+        lead_id = a.get("lead_id")
+        kind = _reply_draft_kind(str(a.get("intent", "")), bool(a.get("requires_human")))
+        # Not (or no longer) draftable, or one is already pending → drop the flag.
+        if not lead_id or kind is None or db.has_pending_reply_draft(int(lead_id)):
+            db.clear_reply_draft_pending(aid)
+            continue
+        lead = db.get_lead(int(lead_id))
+        if lead is None:
+            db.clear_reply_draft_pending(aid)
+            continue
+        try:
+            rendered = render_reply_draft(
+                _lead_from_record(lead),
+                reply_text=str(a.get("reply_text", "")),
+                kind=kind,
+                original_subject=db.latest_outreach_subject(int(lead_id)),
+            )
+        except Exception:
+            # Transient failure — leave the flag set so the next tick retries.
+            _logger.exception("Reply-draft generation failed for analysis %s", aid)
+            continue
+        db.insert_outreach_event(
+            int(lead_id), rendered, status="draft", source="reply_draft",
+            attach_brochure=(kind == "interested"),
         )
-    except Exception:
-        _logger.exception("Reply-draft generation failed for lead %s", lead_id)
-        return False
+        db.add_audit(actor="system", action="reply_draft.created", target_type="lead", target_id=int(lead_id), detail=kind)
+        db.clear_reply_draft_pending(aid)
+        made += 1
+    return made
 
-    db.insert_outreach_event(
-        lead_id, rendered, status="draft", source="reply_draft",
-        attach_brochure=(kind == "interested"),
-    )
-    db.add_audit(
-        actor="system", action="reply_draft.created",
-        target_type="lead", target_id=lead_id, detail=kind,
-    )
-    return True
+
+async def _reply_draft_loop() -> None:
+    """Background worker: generates auto reply-drafts for flagged replies."""
+    while True:
+        try:
+            made = await asyncio.to_thread(_generate_pending_reply_drafts, 5)
+            await asyncio.sleep(2 if made else 5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("Reply-draft loop error, retrying in 30s")
+            await asyncio.sleep(30)
 
 
 def _status_for_intent(intent: str, requires_human: bool) -> str:

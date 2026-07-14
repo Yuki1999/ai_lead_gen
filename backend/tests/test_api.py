@@ -533,27 +533,37 @@ def _make_lead(client, **overrides) -> int:
 
 def test_interested_reply_auto_drafts_reply_with_brochure(tmp_path, monkeypatch):
     from app import db
+    from app.main import _generate_pending_reply_drafts
 
     with _client(tmp_path, monkeypatch) as client:
         _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
         lid = _make_lead(client)
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "We are interested, who can we talk to?"})
 
+        # Generation is async: the reply is flagged now, the draft is produced
+        # off the request path by the background worker.
+        assert bool(db.list_reply_analyses(lid)[0]["draft_pending"]) is True
+        assert [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"] == []
+
+        assert _generate_pending_reply_drafts() == 1
         drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
         assert len(drafts) == 1
         assert drafts[0]["status"] == "draft"
         assert bool(drafts[0]["attach_brochure"]) is True
-        # Auto-drafting must not change the reply-derived status.
+        # Auto-drafting must not change the reply-derived status; flag now cleared.
         assert db.get_lead(lid)["status"] == "interested"
+        assert bool(db.list_reply_analyses(lid)[0]["draft_pending"]) is False
 
 
 def test_human_review_reply_auto_drafts_holding_no_brochure(tmp_path, monkeypatch):
     from app import db
+    from app.main import _generate_pending_reply_drafts
 
     with _client(tmp_path, monkeypatch) as client:
         _mock_reply_llm(monkeypatch, intent="complex", requires_human=True)
         lid = _make_lead(client)
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "What is the price and exclusivity?"})
+        _generate_pending_reply_drafts()
 
         drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
         assert len(drafts) == 1
@@ -563,22 +573,31 @@ def test_human_review_reply_auto_drafts_holding_no_brochure(tmp_path, monkeypatc
 
 def test_rejected_and_needs_review_replies_create_no_draft(tmp_path, monkeypatch):
     from app import db
+    from app.main import _generate_pending_reply_drafts
 
     with _client(tmp_path, monkeypatch) as client:
         _mock_reply_llm(monkeypatch, intent="rejected", requires_human=False)
         lid = _make_lead(client)
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Not interested, no fit."})
+        # Not flagged, and the worker produces nothing.
+        assert bool(db.list_reply_analyses(lid)[0]["draft_pending"]) is False
+        assert _generate_pending_reply_drafts() == 0
         assert [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"] == []
 
 
 def test_reply_draft_not_duplicated_on_repeated_analysis(tmp_path, monkeypatch):
     from app import db
+    from app.main import _generate_pending_reply_drafts
 
     with _client(tmp_path, monkeypatch) as client:
         _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
         lid = _make_lead(client)
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Interested!"})
+        _generate_pending_reply_drafts()
+        # A second reply while a draft is already pending must not flag another.
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Still interested!"})
+        assert bool(db.list_reply_analyses(lid)[0]["draft_pending"]) is False
+        _generate_pending_reply_drafts()
         drafts = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]
         assert len(drafts) == 1
 
@@ -603,11 +622,13 @@ def test_manual_reply_endpoint_drafts_and_sends(tmp_path, monkeypatch):
 
 def test_edit_draft_updates_content(tmp_path, monkeypatch):
     from app import db
+    from app.main import _generate_pending_reply_drafts
 
     with _client(tmp_path, monkeypatch) as client:
         _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
         lid = _make_lead(client)
         client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Interested!"})
+        _generate_pending_reply_drafts()
         draft = [e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"][0]
 
         resp = client.put(f"/campaigns/drafts/{draft['id']}", json={"subject": "Re: edited", "body": "Edited body.", "attach_brochure": False})
@@ -616,6 +637,21 @@ def test_edit_draft_updates_content(tmp_path, monkeypatch):
         assert updated["subject"] == "Re: edited"
         assert updated["body"] == "Edited body."
         assert bool(updated["attach_brochure"]) is False
+
+
+def test_reply_draft_worker_generates_flagged_drafts(tmp_path, monkeypatch):
+    """The background worker turns draft-flagged replies into drafts and is
+    idempotent (a second run with nothing pending is a no-op)."""
+    from app import db
+    from app.main import _generate_pending_reply_drafts
+
+    with _client(tmp_path, monkeypatch) as client:
+        _mock_reply_llm(monkeypatch, intent="interested", requires_human=False)
+        lid = _make_lead(client)
+        client.post("/replies/analyze", json={"lead_id": lid, "reply_text": "Interested!"})
+        assert _generate_pending_reply_drafts() == 1
+        assert _generate_pending_reply_drafts() == 0  # nothing left pending
+        assert len([e for e in db.list_outreach_events(lid) if e["source"] == "reply_draft"]) == 1
 
 
 def test_delivered_reply_keeps_lead_status(tmp_path, monkeypatch):

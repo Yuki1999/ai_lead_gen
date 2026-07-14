@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS reply_analyses (
     next_action TEXT NOT NULL,
     requires_human INTEGER NOT NULL,
     message_id TEXT NOT NULL DEFAULT '',
+    draft_pending INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (lead_id) REFERENCES leads(id)
 );
@@ -194,8 +195,9 @@ CREATE TABLE IF NOT EXISTS token_usage_events (
     created_at TEXT NOT NULL
 );
 
--- Idempotent migration for DBs created before per-event brochure flags existed.
+-- Idempotent migrations for DBs created before these columns existed.
 ALTER TABLE outreach_events ADD COLUMN IF NOT EXISTS attach_brochure INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE reply_analyses ADD COLUMN IF NOT EXISTS draft_pending INTEGER NOT NULL DEFAULT 0;
 """
 
 # Tables in dependency order — used by reset_for_tests()'s TRUNCATE.
@@ -488,15 +490,16 @@ def insert_reply_analysis(
     reply_text: str,
     analysis: ReplyAnalysis,
     message_id: str = "",
+    draft_pending: bool = False,
 ) -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.execute(
             """
             INSERT INTO reply_analyses (
                 lead_id, reply_text, intent, confidence, summary, next_action,
-                requires_human, message_id, created_at
+                requires_human, message_id, draft_pending, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -508,6 +511,7 @@ def insert_reply_analysis(
                 analysis.next_action,
                 int(analysis.requires_human),
                 message_id,
+                int(draft_pending),
                 _now(),
             ),
         )
@@ -541,6 +545,32 @@ def list_reply_analyses(lead_id: int) -> list[dict[str, Any]]:
     for r in results:
         r["requires_human"] = bool(r["requires_human"])
     return results
+
+
+def reply_analyses_awaiting_draft(limit: int = 10) -> list[dict[str, Any]]:
+    """Classified replies flagged for an auto reply-draft that hasn't been
+    generated yet (oldest first). Drives the background reply-draft worker."""
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM reply_analyses
+            WHERE draft_pending = 1 AND lead_id IS NOT NULL
+            ORDER BY id ASC LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+    results = [_row_to_dict(row) for row in rows]
+    for r in results:
+        r["requires_human"] = bool(r["requires_human"])
+    return results
+
+
+def clear_reply_draft_pending(analysis_id: int) -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE reply_analyses SET draft_pending = 0 WHERE id = %s",
+            (analysis_id,),
+        )
 
 
 def enqueue_outreach(lead_id: int, email: RenderedEmail, *, source: str = "manual") -> dict[str, Any]:
