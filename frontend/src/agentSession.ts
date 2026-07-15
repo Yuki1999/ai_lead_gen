@@ -1,6 +1,16 @@
 export const AGENT_SESSION_STORAGE_KEY = "medbot.agent.session_id";
 export const AGENT_SESSIONS_STORAGE_KEY = "medbot.agent.sessions";
 
+/** Agent chat history used to live in localStorage, which meant it never
+ * followed the user to another machine AND leaked to whoever logged in next on
+ * a shared computer. History is server-side now; these keys are purged on load
+ * and on logout so no stale copy lingers on a client machine. */
+export const AGENT_HISTORY_LEGACY_KEYS = [
+  "medbot.agent.history",
+  AGENT_SESSIONS_STORAGE_KEY,
+  AGENT_SESSION_STORAGE_KEY,
+];
+
 interface AgentSessionStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
@@ -11,6 +21,9 @@ export interface AgentSessionRecord {
   title: string;
   createdAt: number;
   updatedAt: number;
+  /** Set for sessions loaded from the server (agent history is team-shared). */
+  createdBy?: string;
+  turnCount?: number;
 }
 
 export interface AgentSessionState {

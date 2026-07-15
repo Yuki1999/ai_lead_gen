@@ -39,6 +39,8 @@ from app.schemas import (
     AgentConfigUpdate,
     AgentChatRequest,
     AgentChatResponse,
+    AgentSessionRename,
+    AgentTurnCreate,
     ChangePasswordRequest,
     DraftUpdateRequest,
     EmailTestRequest,
@@ -456,6 +458,49 @@ def create_app() -> FastAPI:
         except AgentProxyError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         return StreamingResponse(stream, media_type="text/event-stream")
+
+    # ── Agent chat history (team-shared) ──────────────────────────────────────
+    # Stored server-side rather than in each browser's localStorage, so history
+    # follows the deployment: any user, on any machine, sees the same sessions.
+
+    @app.get("/agent/sessions", dependencies=[Depends(require("agent.use"))])
+    def list_agent_sessions_endpoint() -> dict[str, object]:
+        sessions = db.list_agent_sessions()
+        return {"total": len(sessions), "sessions": sessions}
+
+    @app.get("/agent/sessions/{session_id}", dependencies=[Depends(require("agent.use"))])
+    def get_agent_session_endpoint(session_id: str) -> dict[str, object]:
+        session = db.get_agent_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return {"session": session, "turns": db.list_agent_turns(session_id)}
+
+    @app.post("/agent/sessions/{session_id}/turns", status_code=201)
+    def add_agent_turn(
+        session_id: str,
+        request: AgentTurnCreate,
+        principal: Principal = Depends(require("agent.use")),
+    ) -> dict[str, object]:
+        """Append a finished turn. Creates the session on first use and records
+        the author so a shared session shows who said what."""
+        db.upsert_agent_session(session_id, title=request.title, actor=principal.username)
+        return db.insert_agent_turn(session_id, payload=request.payload, author=principal.username)
+
+    @app.put("/agent/sessions/{session_id}", dependencies=[Depends(require("agent.use"))])
+    def rename_agent_session_endpoint(session_id: str, request: AgentSessionRename) -> dict[str, object]:
+        if db.get_agent_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        return db.upsert_agent_session(session_id, title=request.title)
+
+    @app.delete("/agent/sessions/{session_id}")
+    def delete_agent_session_endpoint(
+        session_id: str,
+        principal: Principal = Depends(require("agent.use")),
+    ) -> dict[str, object]:
+        if not db.delete_agent_session(session_id):
+            raise HTTPException(status_code=404, detail="会话不存在")
+        db.add_audit(actor=principal.username, action="agent_session.delete", target_type="agent_session", target_id=session_id)
+        return {"ok": True, "deleted": session_id}
 
     @app.get("/agent/config", response_model=AgentConfigResponse, dependencies=[Depends(require("agent.config"))])
     def agent_config() -> dict[str, object]:

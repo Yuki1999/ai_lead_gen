@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -72,6 +74,17 @@ class DraftUpdateRequest(BaseModel):
 class AgentChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     session_id: str | None = Field(default=None, max_length=160)
+
+
+class AgentTurnCreate(BaseModel):
+    """One finished chat turn, stored verbatim so the UI can rehydrate it."""
+    payload: dict[str, Any] = Field(default_factory=dict)
+    # Sent alongside the first turn so the session gets a meaningful title.
+    title: str | None = Field(default=None, max_length=200)
+
+
+class AgentSessionRename(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 class AgentChatResponse(BaseModel):

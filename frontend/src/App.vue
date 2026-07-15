@@ -72,16 +72,11 @@ import {
   labelForRegion,
 } from "./geo";
 import {
-  activateAgentSession,
-  createNextAgentSession,
-  deleteAgentSession,
+  AGENT_HISTORY_LEGACY_KEYS,
+  createAgentSessionRecord,
   deriveSessionTitle,
   isDefaultSessionTitle,
-  loadAgentSessionState,
-  renameAgentSession,
-  saveAgentSessionId,
   type AgentSessionRecord,
-  type AgentSessionState,
 } from "./agentSession";
 import MarkdownRenderer from "./components/MarkdownRenderer.vue";
 import { parseMarkdown } from "./markdown";
@@ -224,6 +219,8 @@ interface AgentTurn {
   /** Tool-call timeline starts expanded while running, then auto-collapses to
    * a one-line summary once the turn finishes; the user can still toggle it. */
   toolTimelineExpanded?: boolean;
+  /** Who sent this turn — shown because agent history is team-shared. */
+  author?: string;
 }
 
 interface AgentChatResponse {
@@ -355,6 +352,15 @@ function logout(): void {
   me.value = null;
   sidebarUserMenuOpen.value = false;
   activePage.value = "workspace";
+  // Don't leave one user's agent chat on screen (or on disk) for whoever logs
+  // in next on this machine — the next sign-in reloads it from the backend.
+  for (const controller of agentAbortControllers.values()) controller.abort();
+  agentAbortControllers.clear();
+  agentSessions.value = [];
+  for (const key of Object.keys(agentTurnsBySession)) delete agentTurnsBySession[key];
+  for (const key of Object.keys(agentSessionResultTotals)) delete agentSessionResultTotals[key];
+  agentError.value = "";
+  purgeLegacyAgentStorage();
 }
 
 async function fetchMe(): Promise<boolean> {
@@ -829,9 +835,12 @@ const filteredAgentSessions = computed(() => {
   if (!keyword) return agentSessions.value;
 
   return agentSessions.value.filter((session) => {
-    const matchesMeta = [session.title, session.id, shortAgentSessionId(session.id)].some(
-      (value) => value.toLowerCase().includes(keyword),
-    );
+    const matchesMeta = [
+      session.title,
+      session.id,
+      shortAgentSessionId(session.id),
+      session.createdBy ?? "",
+    ].some((value) => value.toLowerCase().includes(keyword));
     if (matchesMeta) return true;
     const turns = agentTurnsBySession[session.id];
     return turns?.some((turn) => turn.text.toLowerCase().includes(keyword)) ?? false;
@@ -860,7 +869,7 @@ const agentNotificationItems = computed(() => [
   },
   {
     label: "会话持久化",
-    detail: `${agentSessions.value.length} 个本地会话已保存`,
+    detail: `${agentSessions.value.length} 个会话已保存（全团队共享）`,
   },
 ]);
 const highlightedSourceText = computed(() => {
@@ -1134,15 +1143,13 @@ async function sendAgentPrompt(): Promise<void> {
   const turns = agentTurnsBySession[sessionKey] ?? (agentTurnsBySession[sessionKey] = []);
   // Auto-name the session from its first message (unless the user already
   // gave it a custom name), the way ChatGPT/Claude title a new chat.
-  if (turns.length === 0) {
-    const session = agentSessions.value.find((item) => item.id === sessionKey);
-    if (session && isDefaultSessionTitle(session.title)) {
-      applyAgentSessionState(
-        renameAgentSession(getAgentStorage(), currentAgentSessionState(), sessionKey, deriveSessionTitle(message)),
-      );
-    }
+  const session = agentSessions.value.find((item) => item.id === sessionKey);
+  let titleForFirstTurn: string | undefined;
+  if (turns.length === 0 && session) {
+    if (isDefaultSessionTitle(session.title)) session.title = deriveSessionTitle(message);
+    titleForFirstTurn = session.title;
   }
-  turns.push({
+  const userTurn: AgentTurn = {
     id: ++agentTurnSeq,
     role: "user",
     text: message,
@@ -1151,7 +1158,11 @@ async function sendAgentPrompt(): Promise<void> {
     error: "",
     stopped: false,
     startedAt: Date.now(),
-  });
+    author: me.value?.username,
+  };
+  turns.push(userTurn);
+  // Save immediately: this also creates the session server-side for the team.
+  void persistAgentTurn(sessionKey, userTurn, titleForFirstTurn);
   agentPrompt.value = "";
   nextTick(() => autoGrowComposer());
   scrollAgentChatToBottom({ force: true });
@@ -1321,6 +1332,9 @@ async function dispatchAssistantResponse(sessionKey: string, message: string): P
     }
     stopAgentElapsedTickerIfIdle();
     if (sessionKey === agentSessionId.value) scrollAgentChatToBottom();
+    // The turn is final now (completed, stopped, or errored) — save it once so
+    // the whole team sees it.
+    void persistAgentTurn(sessionKey, assistantTurn);
   }
 }
 
@@ -2125,21 +2139,22 @@ function fallbackCopyText(text: string): boolean {
 
 function startNewAgentSession(): void {
   // Creating a session never conflicts with a generation running in another
-  // session — each session streams and can be stopped independently.
-  applyAgentSessionState(
-    createNextAgentSession(getAgentStorage(), currentAgentSessionState()),
-  );
+  // session — each session streams and can be stopped independently. The record
+  // is local until its first turn is saved (that's what creates it server-side).
+  const record = createAgentSessionRecord();
+  agentSessions.value = [record, ...agentSessions.value];
+  agentSessionId.value = record.id;
+  agentTurnsBySession[record.id] = [];
   agentError.value = "";
   scrollAgentChatToBottom({ force: true });
   focusComposer();
 }
 
-function switchAgentSession(sessionId: string): void {
+async function switchAgentSession(sessionId: string): Promise<void> {
   if (sessionId === agentSessionId.value) return;
-  applyAgentSessionState(
-    activateAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
-  );
+  agentSessionId.value = sessionId;
   agentError.value = "";
+  await loadAgentSessionTurns(sessionId);
   scrollAgentChatToBottom({ force: true });
   focusComposer();
 }
@@ -2154,25 +2169,31 @@ function cancelEditAgentSession(): void {
   editingSessionTitle.value = "";
 }
 
-function saveAgentSessionTitle(sessionId: string): void {
-  applyAgentSessionState(
-    renameAgentSession(
-      getAgentStorage(),
-      currentAgentSessionState(),
-      sessionId,
-      editingSessionTitle.value,
-    ),
-  );
+async function saveAgentSessionTitle(sessionId: string): Promise<void> {
+  const title = editingSessionTitle.value.trim();
   cancelEditAgentSession();
+  if (!title) return;
+  const session = agentSessions.value.find((item) => item.id === sessionId);
+  if (session) session.title = title;
+  try {
+    // 404 = not saved server-side yet (no turns); the local title is enough —
+    // it gets sent with the first turn.
+    await request(`/agent/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ title }),
+    });
+  } catch {
+    // Keep the local rename; a later turn will carry the title up.
+  }
 }
 
-function removeAgentSession(sessionId: string): void {
+async function removeAgentSession(sessionId: string): Promise<void> {
   const session = agentSessions.value.find((item) => item.id === sessionId);
   const title = session?.title || "当前会话";
   const busy = isSessionBusy(sessionId);
   const confirmMessage = busy
     ? `删除会话"${title}"？该会话正在生成中，将同时停止生成。`
-    : `删除会话"${title}"？`;
+    : `删除会话"${title}"？该会话对全团队可见，删除后所有人都将看不到。`;
   const confirmed = globalThis.confirm?.(confirmMessage) ?? true;
   if (!confirmed) return;
 
@@ -2181,30 +2202,26 @@ function removeAgentSession(sessionId: string): void {
   agentAbortControllers.get(sessionId)?.abort();
   agentAbortControllers.delete(sessionId);
 
-  applyAgentSessionState(
-    deleteAgentSession(getAgentStorage(), currentAgentSessionState(), sessionId),
-  );
+  try {
+    await request(`/agent/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+  } catch {
+    // Never saved server-side (no turns) — just drop it locally.
+  }
+  agentSessions.value = agentSessions.value.filter((item) => item.id !== sessionId);
   delete agentTurnsBySession[sessionId];
   delete agentSessionResultTotals[sessionId];
+  if (agentSessionId.value === sessionId) {
+    if (agentSessions.value.length > 0) {
+      await switchAgentSession(agentSessions.value[0].id);
+    } else {
+      startNewAgentSession();
+    }
+  }
   message.success("已删除 Agent 会话");
 }
 
-function applyAgentSessionState(state: AgentSessionState): void {
-  agentSessionId.value = state.activeId;
-  agentSessions.value = state.sessions;
-}
-
-function currentAgentSessionState(): AgentSessionState {
-  return {
-    activeId: agentSessionId.value,
-    sessions: agentSessions.value,
-  };
-}
-
 function applyIncomingAgentSession(sessionId: string): void {
-  const storage = getAgentStorage();
-  saveAgentSessionId(storage, sessionId);
-  applyAgentSessionState(loadAgentSessionState(storage));
+  if (sessionId && sessionId !== agentSessionId.value) agentSessionId.value = sessionId;
 }
 
 function shortAgentSessionId(sessionId: string): string {
@@ -2231,74 +2248,134 @@ function formatAgentSessionTime(timestamp: number): string {
   }).format(new Date(timestamp));
 }
 
-function getAgentStorage(): Storage | undefined {
+/** Wipe the pre-server-history localStorage copies. They never followed the user
+ * to another machine, and on a shared computer the next person to log in could
+ * read them — so purge on load and on logout. */
+function purgeLegacyAgentStorage(): void {
   try {
-    return globalThis.localStorage;
+    for (const key of AGENT_HISTORY_LEGACY_KEYS) globalThis.localStorage?.removeItem(key);
   } catch {
-    return undefined;
+    // Storage unavailable (private browsing) — nothing to purge.
   }
 }
 
-// ── Chat history persistence (survives page reloads) ─────────────────────────
-const AGENT_HISTORY_STORAGE_KEY = "medbot.agent.history";
-const AGENT_HISTORY_MAX_TURNS_PER_SESSION = 60;
-let agentHistoryPersistTimer: ReturnType<typeof setTimeout> | undefined;
+// ── Chat history: team-shared, server-side ───────────────────────────────────
+// History lives in the backend, not the browser, so every user on every machine
+// sees the same sessions. Turns are written once, when they finish.
 
-function loadAgentHistoryFromStorage(): void {
-  const storage = getAgentStorage();
-  const raw = storage?.getItem(AGENT_HISTORY_STORAGE_KEY);
-  if (!raw) return;
+interface ServerAgentSession {
+  session_id: string;
+  title: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  turn_count?: number;
+}
+interface ServerAgentTurn {
+  id: number;
+  author: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+function mapServerSession(s: ServerAgentSession): AgentSessionRecord {
+  return {
+    id: s.session_id,
+    title: s.title || "新会话",
+    createdAt: Date.parse(s.created_at) || Date.now(),
+    updatedAt: Date.parse(s.updated_at) || Date.now(),
+    createdBy: s.created_by,
+    turnCount: s.turn_count ?? 0,
+  };
+}
+
+/** Strip transient UI state — only what's needed to rebuild the turn is stored. */
+function serializeAgentTurn(turn: AgentTurn): Record<string, unknown> {
+  return {
+    role: turn.role,
+    text: turn.text,
+    toolCalls: turn.toolCalls.map((c) => ({ toolName: c.toolName, status: c.status, detail: c.detail })),
+    error: turn.error,
+    stopped: turn.stopped,
+    startedAt: turn.startedAt,
+    resultSummary: turn.resultSummary,
+  };
+}
+
+function rehydrateAgentTurn(payload: Record<string, unknown>, author: string): AgentTurn {
+  const rawCalls = Array.isArray(payload.toolCalls) ? (payload.toolCalls as AgentToolCall[]) : [];
+  const toolCalls = rawCalls.map((c) => ({
+    // Re-key locally: ids from other browsers would collide as Vue :keys.
+    id: ++agentToolCallSeq,
+    toolName: String(c.toolName ?? ""),
+    status: (c.status === "error" ? "error" : "done") as AgentToolCall["status"],
+    detail: c.detail,
+  }));
+  const error = String(payload.error ?? "");
+  return {
+    id: ++agentTurnSeq,
+    role: payload.role === "user" ? "user" : "assistant",
+    text: String(payload.text ?? ""),
+    toolCalls,
+    pending: false,
+    error,
+    stopped: Boolean(payload.stopped),
+    startedAt: Number(payload.startedAt) || Date.now(),
+    resultSummary: payload.resultSummary as AgentTurn["resultSummary"],
+    // Loaded turns are finished — collapse unless something actually failed.
+    toolTimelineExpanded: Boolean(error) || toolCalls.some((c) => c.status === "error"),
+    author,
+  };
+}
+
+async function loadAgentSessions(): Promise<void> {
   try {
-    const parsed = JSON.parse(raw) as Record<string, AgentTurn[]>;
-    if (typeof parsed !== "object" || parsed === null) return;
-    for (const [sessionId, turns] of Object.entries(parsed)) {
-      if (!Array.isArray(turns)) continue;
-      // A turn still "pending" when the page was closed was never really
-      // finished — surface it as stopped rather than an eternal spinner.
-      agentTurnsBySession[sessionId] = turns.map((turn) => ({
-        ...turn,
-        pending: false,
-        stopped: turn.pending ? true : turn.stopped,
-        // Reloaded turns are already finished — start their tool timelines
-        // collapsed unless something in them actually failed.
-        toolTimelineExpanded:
-          Boolean(turn.error) || turn.toolCalls.some((c) => c.status === "error"),
-      }));
-      let maxTurnId = 0;
-      let maxToolCallId = 0;
-      for (const turn of turns) {
-        maxTurnId = Math.max(maxTurnId, turn.id);
-        for (const call of turn.toolCalls) {
-          maxToolCallId = Math.max(maxToolCallId, call.id);
-        }
+    const payload = await request<{ sessions: ServerAgentSession[] }>("/agent/sessions");
+    const serverSessions = payload.sessions.map(mapServerSession);
+    // A just-created session has no turns yet, so the server doesn't know it —
+    // keep it in the list until its first turn is saved.
+    const unsaved = agentSessions.value.filter(
+      (s) => !serverSessions.some((x) => x.id === s.id) && (agentTurnsBySession[s.id]?.length ?? 0) === 0,
+    );
+    agentSessions.value = [...unsaved, ...serverSessions];
+    if (!agentSessions.value.some((s) => s.id === agentSessionId.value)) {
+      if (agentSessions.value.length > 0) {
+        agentSessionId.value = agentSessions.value[0].id;
+      } else {
+        startNewAgentSession();
+        return;
       }
-      // Reseed both id counters past anything rehydrated from storage so newly
-      // created turns/tool-calls after reload never collide with old :key ids.
-      agentTurnSeq = Math.max(agentTurnSeq, maxTurnId);
-      agentToolCallSeq = Math.max(agentToolCallSeq, maxToolCallId);
     }
+    await loadAgentSessionTurns(agentSessionId.value);
   } catch {
-    // Corrupt/foreign storage payload — start fresh rather than crash.
+    // Not authorized for agent.use, or backend unreachable — leave as-is.
   }
 }
 
-function scheduleAgentHistoryPersist(): void {
-  if (agentHistoryPersistTimer) clearTimeout(agentHistoryPersistTimer);
-  agentHistoryPersistTimer = setTimeout(persistAgentHistoryNow, 400);
-}
-
-function persistAgentHistoryNow(): void {
-  const storage = getAgentStorage();
-  if (!storage) return;
-  const trimmed: Record<string, AgentTurn[]> = {};
-  for (const [sessionId, turns] of Object.entries(agentTurnsBySession)) {
-    trimmed[sessionId] = turns.slice(-AGENT_HISTORY_MAX_TURNS_PER_SESSION);
-  }
+async function loadAgentSessionTurns(sessionId: string, { force = false } = {}): Promise<void> {
+  if (!sessionId) return;
+  if (!force && agentTurnsBySession[sessionId]) return; // already cached
+  // Never clobber a session that's mid-stream in this browser.
+  if (isSessionBusy(sessionId)) return;
   try {
-    storage.setItem(AGENT_HISTORY_STORAGE_KEY, JSON.stringify(trimmed));
+    const payload = await request<{ turns: ServerAgentTurn[] }>(`/agent/sessions/${encodeURIComponent(sessionId)}`);
+    agentTurnsBySession[sessionId] = payload.turns.map((t) => rehydrateAgentTurn(t.payload, t.author));
   } catch {
-    // Storage full or unavailable (e.g. private browsing) — skip silently,
-    // history just won't survive this reload.
+    // Unsaved (no turns yet) or fetch failed — start empty rather than crash.
+    if (!agentTurnsBySession[sessionId]) agentTurnsBySession[sessionId] = [];
+  }
+}
+
+/** Persist one finished turn. `title` is sent with a session's first turn so the
+ * shared list shows something meaningful instead of "新会话". */
+async function persistAgentTurn(sessionId: string, turn: AgentTurn, title?: string): Promise<void> {
+  try {
+    await request(`/agent/sessions/${encodeURIComponent(sessionId)}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ payload: serializeAgentTurn(turn), title }),
+    });
+  } catch {
+    // A failed save must not break the chat — the turn stays on screen.
   }
 }
 
@@ -2462,12 +2539,15 @@ async function bootstrapAfterLogin(): Promise<void> {
     activePage.value = can("agent.use") ? "agent" : "settings";
   }
   if (can("agent.config")) tasks.push(loadAgentConfig());
+  // Team-shared agent history comes from the backend, so it must be (re)loaded
+  // per signed-in user rather than read from this browser.
+  if (can("agent.use")) tasks.push(loadAgentSessions());
   await Promise.all(tasks);
 }
 
 onMounted(async () => {
-  applyAgentSessionState(loadAgentSessionState(getAgentStorage()));
-  loadAgentHistoryFromStorage();
+  // Agent history is server-side now; drop any copy an older build left behind.
+  purgeLegacyAgentStorage();
   if (globalThis.location?.hash === "#agent") {
     activePage.value = "agent";
   } else if (globalThis.location?.hash === "#usage" && can("settings.manage")) {
@@ -2493,10 +2573,7 @@ function handleAgentEscToStop(event: KeyboardEvent): void {
   }
 }
 
-watch(agentTurnsBySession, scheduleAgentHistoryPersist, { deep: true });
-
 onBeforeUnmount(() => {
-  if (agentHistoryPersistTimer) clearTimeout(agentHistoryPersistTimer);
   if (agentElapsedTimer) clearInterval(agentElapsedTimer);
   document.removeEventListener("mousedown", handleSortOutsideClick);
   document.removeEventListener("keydown", handleAgentEscToStop);
@@ -2777,6 +2854,7 @@ onBeforeUnmount(() => {
                         <strong>{{ session.title }}</strong>
                         <small>
                           {{ formatAgentSessionTime(session.updatedAt) }}
+                          <template v-if="session.createdBy"> · {{ session.createdBy }}</template>
                           <i v-if="isSessionBusy(session.id)" class="ag-session-busy-dot" aria-label="生成中"></i>
                         </small>
                       </span>

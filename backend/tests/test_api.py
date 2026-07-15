@@ -670,6 +670,71 @@ def test_delivered_reply_keeps_lead_status(tmp_path, monkeypatch):
         assert db.get_lead(lid)["status"] == "interested"
 
 
+def test_agent_history_is_team_shared_across_users(tmp_path, monkeypatch):
+    """Agent chat history lives server-side, so a DIFFERENT user on a DIFFERENT
+    browser sees the same sessions and turns (the client's actual complaint)."""
+    from fastapi.testclient import TestClient
+
+    from app import db
+    from app.main import create_app
+
+    with _client(tmp_path, monkeypatch) as client:
+        # admin records a turn
+        r = client.post("/agent/sessions/agent-abc/turns", json={
+            "payload": {"role": "user", "text": "找德国的代理商"},
+            "title": "德国代理商",
+        })
+        assert r.status_code == 201
+        assert r.json()["author"] == "admin"
+        client.post("/agent/sessions/agent-abc/turns", json={
+            "payload": {"role": "assistant", "text": "好的，正在搜索…"},
+        })
+
+        # a second user, fresh client (i.e. another machine/browser, no localStorage)
+        db.create_user(
+            username="colleague", password="Str0ngPass!", display_name="同事",
+            is_superadmin=True, must_change_password=False,
+        )
+
+    with TestClient(create_app()) as c2:
+        _authenticate(c2, username="colleague", password="Str0ngPass!")
+        listed = c2.get("/agent/sessions").json()
+        assert listed["total"] == 1
+        assert listed["sessions"][0]["session_id"] == "agent-abc"
+        assert listed["sessions"][0]["title"] == "德国代理商"
+        assert listed["sessions"][0]["created_by"] == "admin"
+        assert listed["sessions"][0]["turn_count"] == 2
+
+        detail = c2.get("/agent/sessions/agent-abc").json()
+        assert [t["payload"]["text"] for t in detail["turns"]] == ["找德国的代理商", "好的，正在搜索…"]
+        assert detail["turns"][0]["author"] == "admin"
+
+
+def test_agent_session_rename_and_delete(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post("/agent/sessions/agent-x/turns", json={"payload": {"role": "user", "text": "hi"}})
+
+        renamed = client.put("/agent/sessions/agent-x", json={"title": "新标题"})
+        assert renamed.status_code == 200
+        assert client.get("/agent/sessions").json()["sessions"][0]["title"] == "新标题"
+
+        assert client.delete("/agent/sessions/agent-x").json()["ok"] is True
+        assert client.get("/agent/sessions").json()["total"] == 0
+        # turns are removed with the session
+        assert client.get("/agent/sessions/agent-x").status_code == 404
+
+
+def test_agent_session_ordering_and_unknown_session(tmp_path, monkeypatch):
+    with _client(tmp_path, monkeypatch) as client:
+        client.post("/agent/sessions/agent-old/turns", json={"payload": {"text": "a"}})
+        client.post("/agent/sessions/agent-new/turns", json={"payload": {"text": "b"}})
+        # most recently active first
+        assert client.get("/agent/sessions").json()["sessions"][0]["session_id"] == "agent-new"
+        assert client.get("/agent/sessions/nope").status_code == 404
+        assert client.put("/agent/sessions/nope", json={"title": "x"}).status_code == 404
+        assert client.delete("/agent/sessions/nope").status_code == 404
+
+
 def test_reply_analysis_errors_without_llm(tmp_path, monkeypatch):
     # No LLM configured (AGENT_ENV_PATH isolated by fixture): the endpoint must
     # error rather than fall back to keyword rules.
