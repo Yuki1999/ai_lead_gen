@@ -670,6 +670,30 @@ def test_delivered_reply_keeps_lead_status(tmp_path, monkeypatch):
         assert db.get_lead(lid)["status"] == "interested"
 
 
+def test_lead_search_is_case_insensitive(tmp_path, monkeypatch):
+    """Postgres LIKE is case-sensitive (SQLite's wasn't), which silently broke the
+    search box after the migration: "Dach" found nothing for "DACH Medical".
+    Search must match regardless of the caller's capitalization — and the paged
+    `total` (count_leads) must agree with the rows returned (list_leads)."""
+    with _client(tmp_path, monkeypatch) as client:
+        _make_lead(client, company_name="DACH Medical Group", email="office@dach-medical.example")
+        _make_lead(client, company_name="metamorphosis GmbH", email="info@meta.example")
+
+        for keyword in ("DACH", "dach", "Dach", "dAcH"):
+            payload = client.get(f"/leads?q={keyword}").json()
+            assert payload["total"] == 1, keyword
+            assert len(payload["leads"]) == 1, keyword
+            assert payload["leads"][0]["company_name"] == "DACH Medical Group", keyword
+
+        # Matching on other searchable columns is case-insensitive too.
+        for keyword in ("METAMORPHOSIS", "Metamorphosis"):
+            assert client.get(f"/leads?q={keyword}").json()["total"] == 1, keyword
+        # email column
+        assert client.get("/leads?q=OFFICE@DACH-MEDICAL.EXAMPLE").json()["total"] == 1
+        # a non-match still returns nothing
+        assert client.get("/leads?q=zzz-nothing").json()["total"] == 0
+
+
 def test_agent_history_is_team_shared_across_users(tmp_path, monkeypatch):
     """Agent chat history lives server-side, so a DIFFERENT user on a DIFFERENT
     browser sees the same sessions and turns (the client's actual complaint)."""

@@ -341,7 +341,10 @@ def list_leads(
         params["lead_type"] = lead_type
     if q:
         filters.append(
-            "(company_name LIKE %(q)s OR email LIKE %(q)s OR country LIKE %(q)s OR category LIKE %(q)s)"
+            # ILIKE, not LIKE: Postgres LIKE is case-sensitive (SQLite's was not),
+            # so plain LIKE made the search box miss "Dach" for "DACH Medical" and
+            # match different rows depending on the caller's capitalization.
+            "(company_name ILIKE %(q)s OR email ILIKE %(q)s OR country ILIKE %(q)s OR category ILIKE %(q)s)"
         )
         params["q"] = f"%{q}%"
 
@@ -418,7 +421,10 @@ def count_leads(
         params["lead_type"] = lead_type
     if q:
         filters.append(
-            "(company_name LIKE %(q)s OR email LIKE %(q)s OR country LIKE %(q)s OR category LIKE %(q)s)"
+            # ILIKE, not LIKE: Postgres LIKE is case-sensitive (SQLite's was not),
+            # so plain LIKE made the search box miss "Dach" for "DACH Medical" and
+            # match different rows depending on the caller's capitalization.
+            "(company_name ILIKE %(q)s OR email ILIKE %(q)s OR country ILIKE %(q)s OR category ILIKE %(q)s)"
         )
         params["q"] = f"%{q}%"
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
