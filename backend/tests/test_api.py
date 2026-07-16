@@ -1804,6 +1804,32 @@ def test_dashboard_metrics_break_down_leads_by_type(tmp_path, monkeypatch):
     assert metrics["distributor_qualified"] >= 1
 
 
+def test_emailed_metric_matches_status_filter_not_email_count(tmp_path, monkeypatch):
+    """The '已邮件' chip must count LEADS in the emailed stage (agreeing with the
+    status filter), NOT raw outreach_events rows. A lead that was emailed and then
+    replied leaves the stage; a draft/reply-draft is not a sent email."""
+    from app import db
+    from app.services import RenderedEmail
+
+    with _client(tmp_path, monkeypatch) as client:
+        a = _make_lead(client, company_name="Emailed A", email="a@ex.example")
+        b = _make_lead(client, company_name="Emailed B", email="b@ex.example")
+        # Two leads actually emailed (status -> emailed).
+        for lid in (a, b):
+            db.insert_outreach_event(lid, RenderedEmail(sent_to="x@ex.example", subject="s", body="b", region="Europe"), status="sent")
+        # A pending draft and a reply-draft: these are NOT sent emails.
+        db.insert_outreach_event(a, RenderedEmail(sent_to="x@ex.example", subject="d", body="d", region="Europe"), status="draft")
+        db.insert_outreach_event(b, RenderedEmail(sent_to="x@ex.example", subject="r", body="r", region="Europe"), status="draft", source="reply_draft")
+
+        assert client.get("/metrics").json()["emailed_leads"] == 2
+        assert client.get("/leads?status=emailed").json()["total"] == 2
+
+        # One replies -> leaves the emailed stage; chip and filter both drop to 1.
+        db.update_lead(a, status="interested")
+        assert client.get("/metrics").json()["emailed_leads"] == 1
+        assert client.get("/leads?status=emailed").json()["total"] == 1
+
+
 def test_leads_sort_multiple_fields(tmp_path, monkeypatch):
     """
     /leads should honour ?sort=&order= for every whitelisted column, fall back

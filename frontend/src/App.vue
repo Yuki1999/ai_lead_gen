@@ -106,7 +106,7 @@ interface Lead {
 interface Metrics {
   total_leads: number;
   interested_leads: number;
-  sent_emails: number;
+  emailed_leads: number;
   human_review: number;
   distributor_leads?: number;
   kol_leads?: number;
@@ -591,7 +591,7 @@ const productProfile = ref<ProductProfile | null>(null);
 const metrics = ref<Metrics>({
   total_leads: 0,
   interested_leads: 0,
-  sent_emails: 0,
+  emailed_leads: 0,
   human_review: 0,
 });
 const selectedLeadIds = ref<number[]>([]);
@@ -3381,9 +3381,9 @@ onBeforeUnmount(() => {
                   <i class="lh-dot"></i>有意向
                   <b>{{ metrics.interested_leads ?? 0 }}</b>
                 </span>
-                <span class="lh-stat lh-stat-sent" :title="'已发送的外联邮件数'">
-                  <i class="lh-dot"></i>已发邮件
-                  <b>{{ metrics.sent_emails ?? 0 }}</b>
+                <span class="lh-stat lh-stat-sent" :title="'当前处于「已邮件」状态（已送达、待回复）的线索数，与状态筛选一致'">
+                  <i class="lh-dot"></i>已邮件
+                  <b>{{ metrics.emailed_leads ?? 0 }}</b>
                 </span>
                 <span class="lh-stat lh-stat-review" :title="'待人工审核的线索数'">
                   <i class="lh-dot"></i>待人工

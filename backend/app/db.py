@@ -825,7 +825,13 @@ def metrics() -> dict[str, int]:
         interested = _scalar(connection.execute(
             "SELECT COUNT(*) FROM leads WHERE status = 'interested'"
         ))
-        sent = _scalar(connection.execute("SELECT COUNT(*) FROM outreach_events"))
+        # Count LEADS currently in the 'emailed' pipeline stage — consistent with
+        # the sibling metrics (interested / human_review) and with the status
+        # filter. (It used to COUNT(*) every outreach_events row, which counted
+        # drafts/queued/reply-drafts as "sent" and never matched the filter.)
+        emailed = _scalar(connection.execute(
+            "SELECT COUNT(*) FROM leads WHERE status = 'emailed'"
+        ))
         human_review = _scalar(connection.execute(
             "SELECT COUNT(*) FROM leads WHERE status = 'human_review'"
         ))
@@ -844,7 +850,7 @@ def metrics() -> dict[str, int]:
     return {
         "total_leads": total_leads,
         "interested_leads": interested,
-        "sent_emails": sent,
+        "emailed_leads": emailed,
         "human_review": human_review,
         "distributor_leads": distributor_leads,
         "kol_leads": kol_leads,
