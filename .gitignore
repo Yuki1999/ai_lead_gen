@@ -20,3 +20,6 @@ dist/
 .zcode/
 # Vite build cache
 frontend/.vite/
+
+# 商务/合同文档(含报价与客户信息,不入库)
+商务文档/
