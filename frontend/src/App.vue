@@ -432,14 +432,22 @@ const { message } = createDiscreteApi(["message"], {
   configProviderProps: configProviderPropsRef,
   messageProviderProps: { placement: "top", duration: 3200, keepAliveOnHover: true },
 });
+// Every lead status, in pipeline order. This one list backs the filter bar, the
+// stat chips and the detail modal's status <select>, and all labels come from
+// formatStatus() — so the filter, the chips and the row badges can never drift
+// apart, and no status can go missing from the filter (needs_review once did).
+const LEAD_STATUSES = [
+  "pending",
+  "qualified",
+  "emailed",
+  "interested",
+  "human_review",
+  "needs_review",
+  "rejected",
+] as const;
 const statusFilterOptions: SelectOption[] = [
   { label: "全部", value: "" },
-  { label: "待确认", value: "pending" },
-  { label: "已确认", value: "qualified" },
-  { label: "已邮件", value: "emailed" },
-  { label: "有兴趣", value: "interested" },
-  { label: "转人工", value: "human_review" },
-  { label: "已拒绝", value: "rejected" },
+  ...LEAD_STATUSES.map((value) => ({ label: formatStatus(value), value })),
 ];
 const leadTypeFilterOptions: SelectOption[] = [
   { label: "全部类型", value: "" },
@@ -3377,16 +3385,16 @@ onBeforeUnmount(() => {
                   <i class="lh-dot"></i>线索总数
                   <b>{{ metrics.total_leads ?? 0 }}</b>
                 </span>
-                <span class="lh-stat lh-stat-interested" :title="'状态为有意向的线索数'">
-                  <i class="lh-dot"></i>有意向
+                <span class="lh-stat lh-stat-interested" :title="'状态为「有兴趣」的线索数，与状态筛选一致'">
+                  <i class="lh-dot"></i>{{ formatStatus('interested') }}
                   <b>{{ metrics.interested_leads ?? 0 }}</b>
                 </span>
                 <span class="lh-stat lh-stat-sent" :title="'当前处于「已邮件」状态（已送达、待回复）的线索数，与状态筛选一致'">
-                  <i class="lh-dot"></i>已邮件
+                  <i class="lh-dot"></i>{{ formatStatus('emailed') }}
                   <b>{{ metrics.emailed_leads ?? 0 }}</b>
                 </span>
-                <span class="lh-stat lh-stat-review" :title="'待人工审核的线索数'">
-                  <i class="lh-dot"></i>待人工
+                <span class="lh-stat lh-stat-review" :title="'状态为「转人工」（回复涉及价格/合同/独家等敏感话题）的线索数，与状态筛选一致'">
+                  <i class="lh-dot"></i>{{ formatStatus('human_review') }}
                   <b>{{ metrics.human_review ?? 0 }}</b>
                 </span>
                 <span class="lh-stat lh-stat-distributor">
